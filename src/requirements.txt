@@ -1,0 +1,9 @@
+boxmot==15.0.9
+numpy==2.3.4
+opencv_python==4.12.0.88
+pymongo==4.15.3
+python-dotenv==1.2.1
+torch==2.9.0
+torch==2.9.0+cu130
+torchvision==0.24.0
+torchvision==0.24.0+cu130
