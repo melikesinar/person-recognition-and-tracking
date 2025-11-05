@@ -235,7 +235,7 @@ def main():
     transform = weights.transforms()
 
     # Initialize the tracker
-    tracker = BoostTrack(reid_weights=Path('osnet_x0_25_msmt17.pt'), device=(0 if device.type == 'cuda' else device), half=False, with_reid=True)
+    tracker = BoostTrack(reid_weights=Path('osnet_x1_0_msmt17.pt'), device=(0 if device.type == 'cuda' else device), half=False, with_reid=True)
 
     if not hasattr(tracker, 'reid_model') or tracker.reid_model is None:
         raise RuntimeError(f"Re-ID model failed to load! Exiting.")
@@ -248,6 +248,14 @@ def main():
     # In-memory buffer for calculating the recent_master_vector (for visible persons)
     # Uses a deque for an efficient rolling list (max 50 items)
     recent_vector_buffers = defaultdict(lambda: deque(maxlen=RECENT_VECTOR_BUFFER_SIZE))
+
+    # Stores the last time (timestamp) we ran incremental_update for a given perm_id
+    last_update_time_for_pid = defaultdict(float)
+    UPDATE_INTERVAL = 1.0  # (in seconds) Run update only once per second per person
+
+    prev_time = 0
+    frame_count = 0
+    DETECTION_INTERVAL = 5  # Run detector every 5 frames
 
     # Standard size the Re-ID model was trained on (usually around this)
     REID_INPUT_SIZE = (128, 256)  # (width, height)
@@ -293,34 +301,46 @@ def main():
     # Video loop
     cap = cv2.VideoCapture(0)
     with torch.inference_mode():
+        # Initialize detections as an empty list before the loop starts
+        detections = np.empty((0, 6), dtype=np.float32)
         while True:
             success, frame = cap.read()
             if not success:
                 break
 
+            frame_count += 1
+
+            current_time = time.time()
+            if prev_time > 0:
+                fps = 1 / (current_time - prev_time)
+            else:
+                fps = 0
+            prev_time = current_time
+
             h, w = frame.shape[:2]
 
             # --- 1. Detection ---
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(torch.uint8)
-            input_tensor = transform(tensor).to(device)
-            output = detector([input_tensor])[0]
+            if frame_count % DETECTION_INTERVAL == 0:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(torch.uint8)
+                input_tensor = transform(tensor).to(device)
+                output = detector([input_tensor])[0]
 
-            scores = output['scores']
-            labels = output['labels']
-            boxes = output['boxes']
+                scores = output['scores']
+                labels = output['labels']
+                boxes = output['boxes']
 
-            # Filter for 'person' class (label=1)
-            person_label = 1
-            score_threshold = 0.7
-            keep_mask = (scores >= score_threshold) & (labels == person_label)
+                person_label = 1
+                score_threshold = 0.7
+                keep_mask = (scores >= score_threshold) & (labels == person_label)
 
-            boxes_filtered = boxes[keep_mask].cpu().numpy()
-            scores_filtered = scores[keep_mask].cpu().numpy()
-            labels_filtered = labels[keep_mask].cpu().numpy()
+                boxes_filtered = boxes[keep_mask].cpu().numpy()
+                scores_filtered = scores[keep_mask].cpu().numpy()
+                labels_filtered = labels[keep_mask].cpu().numpy()
 
-            # --- 2. Tracking ---
-            detections = np.concatenate([boxes_filtered, scores_filtered[:, None], labels_filtered[:, None]], axis=1)
+                # Tespitleri bir sonraki 4 kare için sakla
+                detections = np.concatenate([boxes_filtered, scores_filtered[:, None], labels_filtered[:, None]], axis=1)
+
             res = tracker.update(detections, frame)
 
             if res.shape[0] == 0:
@@ -355,9 +375,22 @@ def main():
                     pid = track_id_to_permanent_id_map[track_id]
                     label_to_display = f"P{pid}"
                     box_color = (0, 255, 0)  # Green (Recognized)
-                    known_persons_db = incremental_update(known_persons_db, pid, current_vector)
+                    current_time_for_update = time.time()
+                    if (current_time_for_update - last_update_time_for_pid[pid]) > UPDATE_INTERVAL:
+
+                        # (A) Sadece şimdi vektör çıkar
+                        vecs = extract_embeddings_from_crops([crop])
+                        if vecs:
+                            current_vector = vecs[0]
+                            # (B) Sadece şimdi veritabanını güncelle
+                            known_persons_db = incremental_update(known_persons_db, pid, current_vector)
+                            # (C) Zaman damgasını güncelle
+                            last_update_time_for_pid[pid] = current_time_for_update
 
                 else:
+                    vecs = extract_embeddings_from_crops([crop])
+                    if not vecs: continue  # Skip if vector extraction failed
+                    current_vector = vecs[0]
                     # Case 2: New person, try to match
                     match_id, match_sim = find_best_match(current_vector, known_persons_db)
                     if match_id is not None:
@@ -404,6 +437,8 @@ def main():
                 if pid and pid in recent_vector_buffers:
                     # Clear the in-memory buffer for the person who left
                     del recent_vector_buffers[pid]
+
+            cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
             cv2.imshow("ReID Vectors (MongoDB)", frame)
 
