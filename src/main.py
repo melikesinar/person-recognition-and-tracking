@@ -1,3 +1,4 @@
+# main_reid_vectors.py
 import os
 import cv2
 import time
@@ -20,17 +21,18 @@ load_dotenv()
 
 
 def main():
-    # Constants
+    """Main function to run the person Re-ID and tracking system."""
+
+    # Constant values
     MONGO_CONNECTION_STRING = os.getenv("MONGO_URI")
     MONGO_DB_NAME = os.getenv("DB_NAME")
-    MONGO_COLLECTION_NAME = os.getenv("COLLECTION3")
+    MONGO_COLLECTION_NAME = os.getenv("COLLECTION")
 
     MIN_ENROLL_FRAMES = 30  # how many vectors to collect before enrolling a new person
-    MATCH_SIMILARITY_THRESHOLD = 0.85  # 0..1 (1 = exact match). 0.7-0.85 is a common range
+    MATCH_SIMILARITY_THRESHOLD = 0.85  # 0..1 (1 = exact match)
 
-    # Stop updating the master vector after this many frames to save power and lock the ID
-    MAX_VECTORS_FOR_UPDATE = 300
-    RECENT_VECTOR_BUFFER_SIZE = 50 # Size of the rolling buffer for the 'recent_master_vector'
+    MAX_VECTORS_FOR_UPDATE = 300  # Stop updating the master vector after this many frames to save power and lock the ID
+    RECENT_VECTOR_BUFFER_SIZE = 50  # Size of the rolling buffer for the 'recent_master_vector'
 
     # Database Connection
     try:
@@ -47,7 +49,6 @@ def main():
         exit()
 
     # Helper functions
-
     def load_db():
         """Loads all persons from MongoDB into a local cache (dictionary)."""
         print("Loading database from MongoDB...")
@@ -85,11 +86,13 @@ def main():
 
     # Vector utils
     def l2_normalize(v):
+        """Normalizes a vector to unit length (L2 norm)."""
         v = np.asarray(v, dtype=np.float32)
         n = np.linalg.norm(v)
         return v if n == 0 else v / n
 
     def cosine_similarity(a, b):
+        """Calculates cosine similarity between two L2-normalized vectors."""
         return float(np.dot(a, b))
 
     # Enrollment / DB functions
@@ -133,7 +136,10 @@ def main():
         return next_id, db, next_id + 1
 
     def incremental_update(db, perm_id, new_vector):
-        """Updates both the all-time master_vector and the recent_master_vector."""
+        """
+        Updates both the all-time master_vector (if not locked)
+        and the recent_master_vector (rolling average).
+        """
         entry = db.get(perm_id)
         if entry is None:
             db[perm_id] = {"master_vector": l2_normalize(new_vector), "count": 1, "created": datetime.now()}
@@ -156,6 +162,7 @@ def main():
         # Update local cache
         entry["recent_master_vector"] = updated_recent_master
 
+        # Only update the all-time master vector if it's not locked
         if n < MAX_VECTORS_FOR_UPDATE:
             master = entry["master_vector"]
             updated_master = (n * master + new_vector) / (n + 1)
@@ -173,6 +180,7 @@ def main():
             if new_count == MAX_VECTORS_FOR_UPDATE:
                 print(f"INFO: Person P{perm_id} has reached {new_count} vectors. Master vector is now locked.")
 
+        # Commit updates to MongoDB
         try:
             persons_collection.update_one(
                 {"permanent_id": perm_id},
@@ -211,6 +219,8 @@ def main():
             return best_id, best_sim
         return None, best_sim
 
+    # --- Main Execution ---
+
     # Load DB
     known_persons_db, next_permanent_id = load_db()
     print(f"Local cache loaded: {len(known_persons_db)} persons. next_id={next_permanent_id}")
@@ -224,6 +234,7 @@ def main():
     detector.to(device).eval()
     transform = weights.transforms()
 
+    # Initialize the tracker
     tracker = BoostTrack(reid_weights=Path('osnet_x0_25_msmt17.pt'), device=0, half=False, with_reid=True)
 
     if not hasattr(tracker, 'reid_model') or tracker.reid_model is None:
@@ -242,6 +253,7 @@ def main():
     REID_INPUT_SIZE = (128, 256)  # (width, height)
 
     def extract_embeddings_from_crops(crops):
+        """Extracts feature embeddings from a list of cropped images."""
         rm = getattr(tracker, "reid_model", None)
 
         if rm is not None and hasattr(rm, 'model') and callable(rm.model):
@@ -249,18 +261,22 @@ def main():
             resized_crops = []
             for crop in crops:
                 if crop.size == 0: continue
+                # Resize crop to the standard input size for the Re-ID model
                 resized = cv2.resize(crop, REID_INPUT_SIZE, interpolation=cv2.INTER_LINEAR)
                 resized_crops.append(resized)
 
             if not resized_crops:
                 return []
 
+            # Convert list of numpy arrays to a single batched PyTorch tensor
             np_batch = np.stack(resized_crops, axis=0)
             tensor_batch = torch.from_numpy(np_batch).permute(0, 3, 1, 2).float().to(device)
-            tensor_batch /= 255.0
+            tensor_batch /= 255.0  # Normalize to 0.0-1.0
 
+            # Get embeddings from the model
             out = rm.model(tensor_batch)
 
+            # Process output
             vecs = []
             for v in out:
                 if torch.is_tensor(v):
@@ -269,6 +285,8 @@ def main():
                 vecs.append(v)
             return vecs
 
+        # Fallback: This should not happen if the model is loaded correctly
+        print("!!!! WARNING: Re-ID model is not callable, returning random vectors! !!!!")
         vec = l2_normalize(np.random.randn(512).astype(np.float32))
         return [vec for _ in crops]
 
@@ -281,6 +299,8 @@ def main():
                 break
 
             h, w = frame.shape[:2]
+
+            # --- 1. Detection ---
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(torch.uint8)
             input_tensor = transform(tensor).to(device)
@@ -290,6 +310,7 @@ def main():
             labels = output['labels']
             boxes = output['boxes']
 
+            # Filter for 'person' class (label=1)
             person_label = 1
             score_threshold = 0.5
             keep_mask = (scores >= score_threshold) & (labels == person_label)
@@ -298,6 +319,7 @@ def main():
             scores_filtered = scores[keep_mask].cpu().numpy()
             labels_filtered = labels[keep_mask].cpu().numpy()
 
+            # --- 2. Tracking ---
             detections = np.concatenate([boxes_filtered, scores_filtered[:, None], labels_filtered[:, None]], axis=1)
             res = tracker.update(detections, frame)
 
@@ -310,35 +332,41 @@ def main():
                 track_id = int(track_id)
                 current_frame_track_ids.add(track_id)
 
+                # Clamp coordinates to be within frame boundaries
                 x1 = max(0, min(w - 1, x1));
                 x2 = max(0, min(w - 1, x2))
                 y1 = max(0, min(h - 1, y1));
                 y2 = max(0, min(h - 1, y2))
-                if x2 <= x1 or y2 <= y1: continue
+                if x2 <= x1 or y2 <= y1: continue  # Skip invalid boxes
 
                 crop = frame[y1:y2, x1:x2]
                 if crop.size == 0: continue
 
+                # --- 3. Re-Identification ---
                 vecs = extract_embeddings_from_crops([crop])
                 if not vecs: continue  # Skip if vector extraction failed
                 current_vector = vecs[0]
 
                 label_to_display = f"T{track_id}"
-                box_color = (0, 165, 255) # Orange (New?)
+                box_color = (0, 165, 255)  # Orange (New?)
 
                 if track_id in track_id_to_permanent_id_map:
+                    # Case 1: Person is already recognized
                     pid = track_id_to_permanent_id_map[track_id]
                     label_to_display = f"P{pid}"
-                    box_color = (0, 255, 0) # Green (Recognized)
+                    box_color = (0, 255, 0)  # Green (Recognized)
                     known_persons_db = incremental_update(known_persons_db, pid, current_vector)
 
                 else:
+                    # Case 2: New person, try to match
                     match_id, match_sim = find_best_match(current_vector, known_persons_db)
                     if match_id is not None:
+                        # Match found!
                         track_id_to_permanent_id_map[track_id] = match_id
                         label_to_display = f"P{match_id} (S:{match_sim:.2f})"
-                        box_color = (0, 255, 0) # Green (Matched and Recognized)
+                        box_color = (0, 255, 0)  # Green (Matched and Recognized)
                     else:
+                        # Case 3: No match, start enrollment process
                         if len(known_persons_db) > 0:  # Only debug if DB is not empty
                             print(f"DEBUG: New person (T{track_id}). Best similarity: {match_sim:.4f}")
 
@@ -348,6 +376,7 @@ def main():
                         buf["last_seen"] = time.time()
                         label_to_display = f"New? T{track_id} ({len(buf['vectors'])})"
 
+                        # If we have collected enough frames, enroll the person
                         if len(buf["vectors"]) >= MIN_ENROLL_FRAMES:
                             new_pid, known_persons_db, next_permanent_id = enroll_person(known_persons_db,
                                                                                          next_permanent_id,
@@ -356,17 +385,20 @@ def main():
                             track_id_to_permanent_id_map[track_id] = new_pid
                             del active_track_buffers[track_id]
 
+                # --- 4. Draw Results ---
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                 cv2.putText(frame, label_to_display, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
 
             # cleanup
             now = time.time()
+            # Clear stale buffers for tracks that disappeared before being enrolled
             stale = [tid for tid, b in active_track_buffers.items() if now - b.get("last_seen", now) > 5.0]
             for tid in stale:
                 del active_track_buffers[tid]
 
+            # Clear temp-to-perm map and recent_vector_buffer for tracks that are no longer visible
             disappeared = [tid for tid in list(track_id_to_permanent_id_map.keys()) if
-                             tid not in current_frame_track_ids]
+                           tid not in current_frame_track_ids]
             for tid in disappeared:
                 pid = track_id_to_permanent_id_map.pop(tid, None)  # Get the permanent ID
                 if pid and pid in recent_vector_buffers:
@@ -407,9 +439,10 @@ def main():
                 for pid, data in known_persons_db.items():
                     created_date = data.get('created', 'N/A')
                     if isinstance(created_date, datetime):
-                        # Tarihi güzel bir string formatına dönüştür
+                        # Convert the datetime object to a readable string format
                         created_date = created_date.strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"  - P{pid}: {data['count']} vectors, Created: {created_date}, Master Signal: {np.sum(data['master_vector']):.4f}")
+                    print(
+                        f"  - P{pid}: {data['count']} vectors, Created: {created_date}, Master Signal: {np.sum(data['master_vector']):.4f}")
 
                 print("------------------ Check MongoDB Compass for the full list of records.\n")
 
