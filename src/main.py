@@ -235,7 +235,7 @@ def main():
     transform = weights.transforms()
 
     # Initialize the tracker
-    tracker = BoostTrack(reid_weights=Path('osnet_x0_25_msmt17.pt'), device=0, half=False, with_reid=True)
+    tracker = BoostTrack(reid_weights=Path('osnet_x0_25_msmt17.pt'), device=(0 if device.type == 'cuda' else device), half=False, with_reid=True)
 
     if not hasattr(tracker, 'reid_model') or tracker.reid_model is None:
         raise RuntimeError(f"Re-ID model failed to load! Exiting.")
@@ -312,7 +312,7 @@ def main():
 
             # Filter for 'person' class (label=1)
             person_label = 1
-            score_threshold = 0.5
+            score_threshold = 0.7
             keep_mask = (scores >= score_threshold) & (labels == person_label)
 
             boxes_filtered = boxes[keep_mask].cpu().numpy()
@@ -407,7 +407,7 @@ def main():
 
             cv2.imshow("ReID Vectors (MongoDB)", frame)
 
-            # Keyboard shortcuts updated
+            # Keyboard shortcuts
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
