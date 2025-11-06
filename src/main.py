@@ -2,8 +2,10 @@
 import os
 import cv2
 import time
+import queue
 import torch
 import pymongo
+import threading
 import numpy as np
 from pathlib import Path
 from boxmot import BoostTrack
@@ -16,11 +18,6 @@ from torchvision.models.detection import (
     fasterrcnn_resnet50_fpn_v2,
     FasterRCNN_ResNet50_FPN_V2_Weights as Weights
 )
-# --- YENİ İÇE AKTARMALAR ---
-import threading
-import queue
-
-# --- YENİ İÇE AKTARMALAR SONU ---
 
 load_dotenv()
 
@@ -37,17 +34,15 @@ def main():
     MATCH_SIMILARITY_THRESHOLD = 0.85
     MAX_VECTORS_FOR_UPDATE = 300
     RECENT_VECTOR_BUFFER_SIZE = 50
-    DETECTION_INTERVAL = 5  # Run detector every 5 frames
+    DETECTION_INTERVAL = 2  # Run detector every 2 frames
     REID_INPUT_SIZE = (128, 256)
 
-    # --- YENİ: THREAD İLETİŞİM KUYRUKLARI ---
-    # Ana iş parçacığından detektör iş parçacığına kareleri göndermek için
-    # maxsize=1: Eğer detektör yavaşsa, eski karelerin birikmesini engeller.
+    # To send frames from the main thread to the detector thread
+    # maxsize=1: Prevents old frames from piling up if the detector is slow.
     frame_queue = queue.Queue(maxsize=1)
 
-    # Detektör iş parçacığından ana iş parçacığına sonuçları göndermek için
+    # To send results from the detector thread to the main thread
     detection_queue = queue.Queue(maxsize=1)
-    # --- YENİ SONU ---
 
     # Database Connection
     try:
@@ -61,7 +56,7 @@ def main():
         print(f"!!!! MongoDB CONNECTION ERROR !!!!: {e}")
         exit()
 
-    # --- YARDIMCI FONKSİYONLAR (DEĞİŞİKLİK YOK) ---
+    # --- Helper functions ---
     def load_db():
         """Loads all persons from MongoDB into a local cache (dictionary)."""
         print("Loading database from MongoDB...")
@@ -190,7 +185,6 @@ def main():
             return best_id, best_sim
         return None, best_sim
 
-    # --- YARDIMCI FONKSİYONLAR SONU ---
 
     # --- Main Execution ---
 
@@ -252,7 +246,7 @@ def main():
         vec = l2_normalize(np.random.randn(512).astype(np.float32))
         return [vec for _ in crops]
 
-    # --- YENİ: DETEKTÖR İŞ PARÇACIĞI (THREAD) ---
+    # --- NEW: DETECTOR THREAD ---
     def detector_worker():
         """
         Runs the slow detector in a separate thread.
@@ -261,18 +255,15 @@ def main():
         """
         print("Detector thread started...")
         while True:
-            # frame_queue.get() bloklayıcıdır, yani yeni kare gelene kadar bekler.
+            # frame_queue.get() is blocking, so it waits until a new frame arrives.
             frame_to_process = frame_queue.get()
-            if frame_to_process is None:  # Kapanış sinyali
+            if frame_to_process is None:  # Shutdown signal
                 print("Detector thread stopping...")
                 break
 
-            # --- DÜZELTME: Bu thread'in kendi inference_mode'una ihtiyacı var ---
-            # Ana thread'deki 'inference_mode'u miras almaz.
             with torch.inference_mode():
-                # --- DÜZELTME SONU ---
 
-                # --- 1. Detection (Yavaş Kısım) ---
+                # --- 1. Detection ---
                 rgb = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)
                 tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(torch.uint8)
                 input_tensor = transform(tensor).to(device)
@@ -286,7 +277,7 @@ def main():
                 score_threshold = 0.7
                 keep_mask = (scores >= score_threshold) & (labels == person_label)
 
-                # Bu .numpy() çağrıları artık güvenli
+                # These .numpy() calls are now safe
                 boxes_filtered = boxes[keep_mask].cpu().numpy()
                 scores_filtered = scores[keep_mask].cpu().numpy()
                 labels_filtered = labels[keep_mask].cpu().numpy()
@@ -294,20 +285,19 @@ def main():
                 new_detections = np.concatenate(
                     [boxes_filtered, scores_filtered[:, None], labels_filtered[:, None]], axis=1)
 
-                # --- 2. Sonuçları Gönder ---
-                # Ana iş parçacığına göndermeden önce eski sonucu temizle
+                # --- 2. Send Results ---
+                # Clear the old result before sending to the main thread
                 try:
                     detection_queue.get_nowait()
                 except queue.Empty:
-                    pass  # Kuyruk zaten boşsa sorun yok
+                    pass  # No problem if the queue is already empty
 
-                # Yeni sonucu kuyruğa koy
+                # Put the new result in the queue
                 detection_queue.put(new_detections)
 
-    # Detektör iş parçacığını başlat
+    # Start the detector thread
     detector_thread = threading.Thread(target=detector_worker, daemon=True)
     detector_thread.start()
-    # --- YENİ THREAD SONU ---
 
     # Video loop
     cap = cv2.VideoCapture(0)
@@ -329,36 +319,34 @@ def main():
 
             h, w = frame.shape[:2]
 
-            # --- 1. Detektör İşlemleri (GÜNCELLENDİ) ---
+            # --- 1. Detector Operations ---
 
-            # Her 5 karede bir, o anki kareyi detektör thread'ine yolla
+            # Every 5 frames, send the current frame to the detector thread
             if frame_count % DETECTION_INTERVAL == 0:
                 try:
-                    # Kopyasını yollamak daha güvenli olabilir
+                    # Sending a copy might be safer
                     frame_copy = frame.copy()
-                    # put_nowait: Eğer kuyruk doluysa (detektör yavaşsa)
-                    # bekleme yapmaz, kareyi atlar ve ana akış devam eder.
+                    # put_nowait: If the queue is full (detector is slow)
+                    # it doesn't wait, skips the frame, and the main stream continues.
                     frame_queue.put_nowait(frame_copy)
                 except queue.Full:
-                    # Detektör yetişemiyor demektir, sorun değil, akışa devam et
+                    # Detector can't keep up, no problem, continue the stream
                     pass
 
-            # Her karede, detektör thread'inden yeni sonuç gelmiş mi diye BEKLEMEDEN kontrol et
+            # Every frame, check if new results have arrived from the detector thread WITHOUT waiting
             try:
-                # get_nowait: Eğer kuyrukta yeni sonuç yoksa hata verir,
-                # varsa alır. Ana akışı ASLA tıkamaz.
+                # get_nowait: Throws an error if there's no new result in the queue,
+                # otherwise gets it. NEVER blocks the main stream.
                 detections = detection_queue.get_nowait()
             except queue.Empty:
-                # Yeni sonuç yok, bir önceki turun sonuçlarıyla devam et
+                # No new result, continue with the results from the previous round
                 pass
 
-            # --- 1. KISIM SONU --- (Yavaş 'detector()' çağrısı buradan kaldırıldı)
-
-            # --- 2. Tracking (HER KAREDE ÇALIŞIR - HIZLI) ---
-            # Takipçi, her zaman eldeki en son 'detections' setini kullanır.
+            # --- 2. Tracking ---
+            # The tracker always uses the latest available 'detections' set.
             res = tracker.update(detections, frame)
 
-            # --- 3. Re-ID ve Çizim (HER KAREDE ÇALIŞIR - HIZLI/SEYRELTİLMİŞ) ---
+            # --- 3. Re-ID and Drawing ---
             if res.shape[0] == 0:
                 pass
 
@@ -386,7 +374,7 @@ def main():
                     label_to_display = f"P{pid}"
                     box_color = (0, 255, 0)  # Green (Recognized)
 
-                    # Re-ID ve DB güncellemesini 1 saniyede bir yap (Seyreltme)
+                    # Do Re-ID and DB update once per second (Throttling)
                     current_time_for_update = time.time()
                     if (current_time_for_update - last_update_time_for_pid[pid]) > UPDATE_INTERVAL:
                         vecs = extract_embeddings_from_crops([crop])
@@ -397,7 +385,7 @@ def main():
 
                 else:
                     # Case 2: New person, try to match
-                    # (Bu da seyreltilebilir, ama yeni kişi için daha sık çalıştırmak iyidir)
+                    # (This can also be throttled, but it's good to run it more often for a new person)
                     vecs = extract_embeddings_from_crops([crop])
                     if not vecs: continue
                     current_vector = vecs[0]
@@ -430,7 +418,7 @@ def main():
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                 cv2.putText(frame, label_to_display, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
 
-            # cleanup (Tüm bu kısım hızlıdır ve ana thread'de kalır)
+            # cleanup (All this part is fast and stays in the main thread)
             now = time.time()
             stale = [tid for tid, b in active_track_buffers.items() if now - b.get("last_seen", now) > 5.0]
             for tid in stale:
@@ -449,7 +437,7 @@ def main():
             # Keyboard shortcuts
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
-                frame_queue.put(None)  # Detektör thread'ine kapanma sinyali yolla
+                frame_queue.put(None)  # Send shutdown signal to detector thread
                 break
 
             elif key == ord('r'):
