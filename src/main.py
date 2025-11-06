@@ -2,6 +2,7 @@
 import os
 import cv2
 import time
+import faiss
 import queue
 import torch
 import pymongo
@@ -36,12 +37,14 @@ def main():
     RECENT_VECTOR_BUFFER_SIZE = 50
     DETECTION_INTERVAL = 2  # Run detector every 2 frames
     REID_INPUT_SIZE = (128, 256)
+    VECTOR_DIMENSION = 512  # osnet_x1_0_msmt17.pt modelinin vektör boyutu
 
-    # To send frames from the main thread to the detector thread
-    # maxsize=1: Prevents old frames from piling up if the detector is slow.
+    faiss_index = None
+    # Faiss'in döndürdüğü 'index' (0, 1, 2...) ile 'permanent_id' (P1, P2...) arasındaki harita
+    index_to_pid_map = []
+
+    # Thread communication queues
     frame_queue = queue.Queue(maxsize=1)
-
-    # To send results from the detector thread to the main thread
     detection_queue = queue.Queue(maxsize=1)
 
     # Database Connection
@@ -56,15 +59,52 @@ def main():
         print(f"!!!! MongoDB CONNECTION ERROR !!!!: {e}")
         exit()
 
+    def rebuild_faiss_index(db_cache):
+        """Rebuilds the in-memory Faiss index from the local DB cache."""
+        nonlocal faiss_index, index_to_pid_map  # Dış scope'taki değişkenleri değiştirmek için
+        print("Rebuilding Faiss index...")
+
+        index_to_pid_map.clear()
+        all_vectors = []
+
+        # Her kişi için 2 vektörü de (master ve recent) indekse ekle
+        # Bu, her iki görünüme karşı da arama yapmamızı sağlar
+        sorted_pids = sorted(db_cache.keys())  # Tutarlılık için ID'leri sırala
+        for pid in sorted_pids:
+            data = db_cache[pid]
+            # Master vektörü ekle
+            all_vectors.append(data['master_vector'])
+            index_to_pid_map.append(pid)
+
+            # Recent vektörü ekle
+            recent_vec = data.get('recent_master_vector', data['master_vector'])
+            all_vectors.append(recent_vec)
+            index_to_pid_map.append(pid)
+
+        if not all_vectors:
+            print("No vectors to index. Faiss index is empty.")
+            faiss_index = None
+            return
+
+        # Vektörleri Faiss'in beklediği formata getir
+        vector_matrix = np.stack(all_vectors, axis=0).astype('float32')
+
+        # L2 normalize edilmiş vektörler için Inner Product (Kosinüs Benzerliği) en hızlı indekstir
+        faiss_index = faiss.IndexFlatIP(VECTOR_DIMENSION)
+        faiss_index.add(vector_matrix)
+        print(f"Faiss index rebuilt successfully with {faiss_index.ntotal} vectors ({len(db_cache)} persons).")
+
+
     # --- Helper functions ---
     def load_db():
-        """Loads all persons from MongoDB into a local cache (dictionary)."""
+        """Loads all persons from MongoDB into a local cache and builds the initial Faiss index."""
         print("Loading database from MongoDB...")
         db_cache = {}
         try:
             all_persons = list(persons_collection.find({}))
             if not all_persons:
                 print("No records found in MongoDB. Starting fresh.")
+                rebuild_faiss_index(db_cache)  # Boş bir indeks oluştur
                 return {}, 1
 
             for doc in all_persons:
@@ -83,8 +123,11 @@ def main():
             next_id = max(db_cache.keys()) + 1
             print(f"Successfully loaded {len(db_cache)} persons from MongoDB. Next ID: {next_id}")
 
+            rebuild_faiss_index(db_cache)
+
         except Exception as e:
             print(f"Error loading DB, creating new one: {e}")
+            rebuild_faiss_index({})  # Hata durumunda boş indeks oluştur
             return {}, 1
 
         return db_cache, next_id
@@ -100,7 +143,7 @@ def main():
         return float(np.dot(a, b))
 
     def enroll_person(db, next_id, vectors):
-        """Enrolls a new person into both the local cache and MongoDB."""
+        """Enrolls a new person and triggers a Faiss index rebuild."""
         if len(vectors) == 0:
             raise ValueError("No vectors provided to enroll.")
         vecs = np.stack(vectors, axis=0)
@@ -127,12 +170,15 @@ def main():
             "count": vecs.shape[0],
             "created": current_dt
         }
+
+        rebuild_faiss_index(db)
+
         return next_id, db, next_id + 1
 
     def incremental_update(db, perm_id, new_vector):
         """
-        Updates both the all-time master_vector (if not locked)
-        and the recent_master_vector (rolling average).
+        Updates vectors in the DB cache. The Faiss index is NOT rebuilt here for performance.
+        It will be updated on the next new enrollment.
         """
         entry = db.get(perm_id)
         if entry is None:
@@ -167,24 +213,34 @@ def main():
         return db
 
     def find_best_match(query_vector, db):
-        """Checks the query_vector against BOTH the master_vector and recent_master_vector."""
-        best_id = None
-        best_sim = -1.0
-        for pid, data in db.items():
-            if 'master_vector' not in data:
-                continue
-            master_vec = data['master_vector']
-            recent_vec = data.get('recent_master_vector', master_vec)
-            sim_master = cosine_similarity(query_vector, master_vec)
-            sim_recent = cosine_similarity(query_vector, recent_vec)
-            sim = max(sim_master, sim_recent)
-            if sim > best_sim:
-                best_sim = sim
-                best_id = pid
-        if best_sim >= MATCH_SIMILARITY_THRESHOLD:
-            return best_id, best_sim
-        return None, best_sim
+        """Performs a fast similarity search using the Faiss index."""
+        nonlocal faiss_index, index_to_pid_map
 
+        # Eğer indeks boşsa veya hiç oluşturulmamışsa, eşleşme olamaz
+        if faiss_index is None or faiss_index.ntotal == 0:
+            return None, -1.0
+
+        try:
+            # Faiss 'search' metodu 2D bir array bekler, bu yüzden vektörü yeniden şekillendiriyoruz
+            query_vector_2d = query_vector.reshape(1, -1).astype('float32')
+
+            # k=1: Sadece en iyi 1 sonucu bul
+            # D: Mesafeler (bizim durumumuzda Inner Product/Benzerlik)
+            # I: En yakın vektörlerin indeksleri
+            D, I = faiss_index.search(query_vector_2d, k=1)
+
+            best_match_index = I[0][0]
+            best_similarity = D[0][0]
+
+            if best_similarity >= MATCH_SIMILARITY_THRESHOLD:
+                # Faiss indeksinden (0, 1, 2...) permanent_id'ye (P1, P2...) geçiş yap
+                matched_pid = index_to_pid_map[best_match_index]
+                return matched_pid, best_similarity
+
+        except Exception as e:
+            print(f"!!!! FAISS SEARCH ERROR !!!!: {e}")
+
+        return None, -1.0  # Hata durumunda veya eşik altında kalırsa
 
     # --- Main Execution ---
 
@@ -243,56 +299,38 @@ def main():
                 vecs.append(v)
             return vecs
         print("!!!! WARNING: Re-ID model is not callable, returning random vectors! !!!!")
-        vec = l2_normalize(np.random.randn(512).astype(np.float32))
+        vec = l2_normalize(np.random.randn(VECTOR_DIMENSION).astype(np.float32))
         return [vec for _ in crops]
 
-    # --- NEW: DETECTOR THREAD ---
+    # --- Detector Thread ---
     def detector_worker():
-        """
-        Runs the slow detector in a separate thread.
-        Waits for frames from 'frame_queue', processes them,
-        and puts results into 'detection_queue'.
-        """
+        """Runs the slow detector in a separate thread."""
         print("Detector thread started...")
         while True:
-            # frame_queue.get() is blocking, so it waits until a new frame arrives.
             frame_to_process = frame_queue.get()
-            if frame_to_process is None:  # Shutdown signal
+            if frame_to_process is None:
                 print("Detector thread stopping...")
                 break
-
             with torch.inference_mode():
-
-                # --- 1. Detection ---
                 rgb = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)
                 tensor = torch.from_numpy(rgb).permute(2, 0, 1).to(torch.uint8)
                 input_tensor = transform(tensor).to(device)
                 output = detector([input_tensor])[0]
-
                 scores = output['scores']
                 labels = output['labels']
                 boxes = output['boxes']
-
                 person_label = 1
                 score_threshold = 0.7
                 keep_mask = (scores >= score_threshold) & (labels == person_label)
-
-                # These .numpy() calls are now safe
                 boxes_filtered = boxes[keep_mask].cpu().numpy()
                 scores_filtered = scores[keep_mask].cpu().numpy()
                 labels_filtered = labels[keep_mask].cpu().numpy()
-
                 new_detections = np.concatenate(
                     [boxes_filtered, scores_filtered[:, None], labels_filtered[:, None]], axis=1)
-
-                # --- 2. Send Results ---
-                # Clear the old result before sending to the main thread
                 try:
                     detection_queue.get_nowait()
                 except queue.Empty:
-                    pass  # No problem if the queue is already empty
-
-                # Put the new result in the queue
+                    pass
                 detection_queue.put(new_detections)
 
     # Start the detector thread
@@ -307,74 +345,46 @@ def main():
             success, frame = cap.read()
             if not success:
                 break
-
             frame_count += 1
-
             current_time = time.time()
             if prev_time > 0:
                 fps = 1 / (current_time - prev_time)
             else:
                 fps = 0
             prev_time = current_time
-
             h, w = frame.shape[:2]
-
-            # --- 1. Detector Operations ---
-
-            # Every 5 frames, send the current frame to the detector thread
             if frame_count % DETECTION_INTERVAL == 0:
                 try:
-                    # Sending a copy might be safer
                     frame_copy = frame.copy()
-                    # put_nowait: If the queue is full (detector is slow)
-                    # it doesn't wait, skips the frame, and the main stream continues.
                     frame_queue.put_nowait(frame_copy)
                 except queue.Full:
-                    # Detector can't keep up, no problem, continue the stream
                     pass
-
-            # Every frame, check if new results have arrived from the detector thread WITHOUT waiting
             try:
-                # get_nowait: Throws an error if there's no new result in the queue,
-                # otherwise gets it. NEVER blocks the main stream.
                 detections = detection_queue.get_nowait()
             except queue.Empty:
-                # No new result, continue with the results from the previous round
                 pass
-
-            # --- 2. Tracking ---
-            # The tracker always uses the latest available 'detections' set.
             res = tracker.update(detections, frame)
 
-            # --- 3. Re-ID and Drawing ---
             if res.shape[0] == 0:
                 pass
-
             current_frame_track_ids = set()
             for *box, track_id, conf, cls, ind in res:
                 x1, y1, x2, y2 = map(int, box)
                 track_id = int(track_id)
                 current_frame_track_ids.add(track_id)
-
                 x1 = max(0, min(w - 1, x1));
                 x2 = max(0, min(w - 1, x2))
                 y1 = max(0, min(h - 1, y1));
                 y2 = max(0, min(h - 1, y2))
                 if x2 <= x1 or y2 <= y1: continue
-
                 crop = frame[y1:y2, x1:x2]
                 if crop.size == 0: continue
-
                 label_to_display = f"T{track_id}"
-                box_color = (0, 165, 255)  # Orange (New?)
-
+                box_color = (0, 165, 255)
                 if track_id in track_id_to_permanent_id_map:
-                    # Case 1: Person is already recognized
                     pid = track_id_to_permanent_id_map[track_id]
                     label_to_display = f"P{pid}"
-                    box_color = (0, 255, 0)  # Green (Recognized)
-
-                    # Do Re-ID and DB update once per second (Throttling)
+                    box_color = (0, 255, 0)
                     current_time_for_update = time.time()
                     if (current_time_for_update - last_update_time_for_pid[pid]) > UPDATE_INTERVAL:
                         vecs = extract_embeddings_from_crops([crop])
@@ -382,22 +392,16 @@ def main():
                             current_vector = vecs[0]
                             known_persons_db = incremental_update(known_persons_db, pid, current_vector)
                             last_update_time_for_pid[pid] = current_time_for_update
-
                 else:
-                    # Case 2: New person, try to match
-                    # (This can also be throttled, but it's good to run it more often for a new person)
                     vecs = extract_embeddings_from_crops([crop])
                     if not vecs: continue
                     current_vector = vecs[0]
-
-                    match_id, match_sim = find_best_match(current_vector, known_persons_db)
+                    match_id, match_sim = find_best_match(current_vector, known_persons_db)  # Artık Faiss kullanıyor
                     if match_id is not None:
-                        # Match found!
                         track_id_to_permanent_id_map[track_id] = match_id
                         label_to_display = f"P{match_id} (S:{match_sim:.2f})"
                         box_color = (0, 255, 0)
                     else:
-                        # Case 3: No match, start enrollment
                         if len(known_persons_db) > 0:
                             print(f"DEBUG: New person (T{track_id}). Best similarity: {match_sim:.4f}")
                         buf = active_track_buffers[track_id]
@@ -405,7 +409,6 @@ def main():
                         buf["crops"].append(crop)
                         buf["last_seen"] = time.time()
                         label_to_display = f"New? T{track_id} ({len(buf['vectors'])})"
-
                         if len(buf["vectors"]) >= MIN_ENROLL_FRAMES:
                             new_pid, known_persons_db, next_permanent_id = enroll_person(known_persons_db,
                                                                                          next_permanent_id,
@@ -413,12 +416,10 @@ def main():
                             print("Enrolled new person:", new_pid, "vectors:", len(buf["vectors"]))
                             track_id_to_permanent_id_map[track_id] = new_pid
                             del active_track_buffers[track_id]
-
-                # --- 4. Draw Results ---
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                 cv2.putText(frame, label_to_display, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
 
-            # cleanup (All this part is fast and stays in the main thread)
+            # --- cleanup ---
             now = time.time()
             stale = [tid for tid, b in active_track_buffers.items() if now - b.get("last_seen", now) > 5.0]
             for tid in stale:
@@ -432,16 +433,15 @@ def main():
                     del recent_vector_buffers[pid]
 
             cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            cv2.imshow("ReID Vectors (MongoDB - Threaded)", frame)
+            cv2.imshow("ReID Vectors (MongoDB - Faiss)", frame)
 
             # Keyboard shortcuts
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
-                frame_queue.put(None)  # Send shutdown signal to detector thread
+                frame_queue.put(None)
                 break
 
             elif key == ord('r'):
-                # 'r' -> RESET MongoDB (Reset)
                 print("RESET: Deleting all entries from MongoDB...")
                 try:
                     persons_collection.delete_many({})
@@ -452,23 +452,23 @@ def main():
                 next_permanent_id = 1
                 active_track_buffers.clear()
                 track_id_to_permanent_id_map.clear()
+                rebuild_faiss_index(known_persons_db)
                 print("Program memory (cache) has been cleared.")
 
             elif key == ord('d'):
-                # 'd' -> Dump Database Status (Dump)
                 print("\n--- DB STATUS (d) (Local Cache) ---")
                 print(f"Persons in cache: {len(known_persons_db)}")
+                print(f"Vectors in Faiss index: {faiss_index.ntotal if faiss_index else 0}")
                 print(f"Next available ID: {next_permanent_id}")
                 for pid, data in known_persons_db.items():
                     created_date = data.get('created', 'N/A')
                     if isinstance(created_date, datetime):
                         created_date = created_date.strftime("%Y-%m-%d %H:%M:%S")
                     print(
-                        f"  - P{pid}: {data['count']} vectors, Created: {created_date}, Master Signal: {np.sum(data['master_vector']):.4f}")
+                        f"  - P{pid}: {data['count']} vectors, Created: {created_date}")
                 print("------------------ Check MongoDB Compass for the full list of records.\n")
 
             elif key == ord('k'):
-                # 'k' -> Kill (delete) the Last Added Person (Kill)
                 if known_persons_db:
                     try:
                         last_id = max(known_persons_db.keys())
@@ -477,6 +477,7 @@ def main():
                         del known_persons_db[last_id]
                         active_track_buffers.clear()
                         track_id_to_permanent_id_map.clear()
+                        rebuild_faiss_index(known_persons_db)
                         print(f"DELETED (k): P{last_id} deleted from local cache. Maps cleared.")
                     except Exception as e:
                         print(f"Error deleting person: {e}")
