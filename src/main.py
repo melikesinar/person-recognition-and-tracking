@@ -395,48 +395,88 @@ class PersonTrackerApp:
                 # --- 1. Detection (Asynchronous) ---
                 if frame_count % DETECTION_INTERVAL == 0:
                     try:
-                        # Send frame to detector thread without blocking main stream
                         self.frame_queue.put_nowait(frame.copy())
                     except queue.Full:
-                        pass  # Skip this frame if the detector can't keep up
+                        pass  # Skip frame if detector is busy
 
                 try:
-                    # Get new result from detector without blocking main stream
                     detections = self.detection_queue.get_nowait()
                 except queue.Empty:
-                    pass  # If no new result, continue with the previous one
+                    pass  # No new detections, use old ones
 
                 # --- 2. Tracking (Fast) ---
                 res = self.tracker.update(detections, frame)
 
-                current_frame_track_ids = set()
+                # --- 3. Batch Re-Identification (NEW EFFICIENT LOGIC) ---
+
+                # Step 1: Collect all valid crops and their track_ids
+                crops_to_process = []
+                track_ids_for_crops = []
+                tracker_results_list = []  # Store all results for the processing loop
+
                 for *box, track_id, conf, cls, ind in res:
                     track_id = int(track_id)
-                    current_frame_track_ids.add(track_id)
                     x1, y1, x2, y2 = map(int, box)
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size == 0: continue
 
+                    # We need the original frame dimensions here
+                    h, w, _ = frame.shape
+                    x1 = max(0, min(w - 1, x1));
+                    x2 = max(0, min(w - 1, x2))
+                    y1 = max(0, min(h - 1, y1));
+                    y2 = max(0, min(h - 1, y2))
+
+                    if x2 <= x1 or y2 <= y1: continue
+
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        crops_to_process.append(crop)
+                        track_ids_for_crops.append(track_id)
+                        # Save the full tracker result for the next loop
+                        tracker_results_list.append((box, track_id, conf, cls, ind, crop))
+
+                # Step 2: Run batch inference *once* for all valid crops
+                all_vectors = []
+                if crops_to_process:
+                    all_vectors = self.extract_embeddings_from_crops(crops_to_process)
+
+                # Step 3: Map the resulting vectors back to their track_ids
+                vector_map = {}
+                if len(all_vectors) == len(track_ids_for_crops):
+                    for i, track_id in enumerate(track_ids_for_crops):
+                        vector_map[track_id] = all_vectors[i]
+                else:
+                    print(
+                        f"!!!! WARNING: Mismatch in batch Re-ID. Crops: {len(crops_to_process)}, Vectors: {len(all_vectors)}")
+
+                # --- 4. Process Results (using pre-computed vectors) ---
+                current_frame_track_ids = set()
+
+                # Loop over the saved tracker results
+                for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
+                    current_frame_track_ids.add(track_id)
+
+                    # Get the vector we pre-computed in the batch
+                    current_vector = vector_map.get(track_id)
+                    if current_vector is None:
+                        # This crop was invalid or failed embedding
+                        continue
+
+                    x1, y1, x2, y2 = map(int, box)  # Get coordinates back
                     label, color = f"T{track_id}", (0, 165, 255)  # Default: Orange (Tracking)
 
-                    # --- 3. Re-Identification (Re-ID) ---
                     if track_id in self.track_id_to_permanent_id_map:
                         # Case 1: Person is already recognized
                         pid = self.track_id_to_permanent_id_map[track_id]
                         label, color = f"P{pid}", (0, 255, 0)  # Green (Recognized)
 
-                        # Update recognized person once per second (for performance)
+                        # We still respect the 1-second update interval
                         if (time.time() - self.last_update_time_for_pid[pid]) > self.UPDATE_INTERVAL:
-                            vecs = self.extract_embeddings_from_crops([crop])
-                            if vecs:
-                                self.incremental_update(pid, vecs[0])
-                                self.last_update_time_for_pid[pid] = time.time()
+                            # We ALREADY have the vector, no new call needed.
+                            self.incremental_update(pid, current_vector)
+                            self.last_update_time_for_pid[pid] = time.time()
                     else:
                         # Case 2: New person, try to match
-                        vecs = self.extract_embeddings_from_crops([crop])
-                        if not vecs: continue
-                        current_vector = vecs[0]
-
+                        # We ALREADY have the vector.
                         match_id, match_sim = self.find_best_match(current_vector)
 
                         if match_id is not None:
@@ -447,10 +487,11 @@ class PersonTrackerApp:
                             # Case 3: No match, start enrollment process
 
                             # --- Enrollment Quality Check ---
+                            # We pass the 'crop' we saved from the first loop
                             bbox_area = crop.shape[0] * crop.shape[1]
                             sharpness = self.calculate_sharpness(crop)
                             is_good_quality = (bbox_area >= MIN_BBOX_AREA_ENROLL) and (
-                                        sharpness >= MIN_SHARPNESS_ENROLL)
+                                    sharpness >= MIN_SHARPNESS_ENROLL)
 
                             if len(self.known_persons_db) > 0:
                                 print(
@@ -464,8 +505,7 @@ class PersonTrackerApp:
                                 reason = "Too small" if bbox_area < MIN_BBOX_AREA_ENROLL else "Too blurry"
                                 label = f"New? T{track_id} (REJECT: {reason})"
 
-                            buf[
-                                "last_seen"] = time.time()  # Always update last_seen to prevent premature buffer clearing
+                            buf["last_seen"] = time.time()
 
                             if len(buf["vectors"]) >= MIN_ENROLL_FRAMES:
                                 new_pid = self.enroll_person(buf["vectors"])
@@ -473,7 +513,7 @@ class PersonTrackerApp:
                                 self.track_id_to_permanent_id_map[track_id] = new_pid
                                 del self.active_track_buffers[track_id]
 
-                    # --- 4. Drawing ---
+                    # --- 5. Drawing (Moved from original loop) ---
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
