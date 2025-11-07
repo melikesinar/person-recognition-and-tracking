@@ -31,17 +31,22 @@ MONGO_FAISS_COLLECTION_NAME = "faiss_indexes"  # New collection to store the Fai
 FAISS_INDEX_KEY = "primary_person_index"  # Key to store the index in MongoDB
 TEMP_FAISS_FILENAME = "temp_faiss.index"  # Filename for temporarily writing the index to disk
 
-MIN_ENROLL_FRAMES = 30  # Minimum frames needed to enroll a new person
-MATCH_SIMILARITY_THRESHOLD = 0.85  # 0..1 (1 = exact match)
-MAX_VECTORS_FOR_UPDATE = 300  # Frames to stop updating the master vector
-RECENT_VECTOR_BUFFER_SIZE = 50  # Rolling buffer size for 'recent_master_vector'
-DETECTION_INTERVAL = 1  # How often the detector runs (in frames)
-REID_INPUT_SIZE = (128, 256)  # Re-ID model input size (width, height)
-VECTOR_DIMENSION = 512  # osnet_x0_25_msmt17.pt model's vector dimension
+# --- UPDATED: Load ALL constants from .env ---
+# We load them here (outside the class) because detector_worker needs them
+# We set defaults in case they are missing from .env
+DEFAULT_DETECTION_SCORE = 0.7
+DEFAULT_MATCH_THRESHOLD = 0.85
 
-# Enrollment Quality Filters
-MIN_BBOX_AREA_ENROLL = 100 * 100  # Minimum 100x100 pixel area for enrollment
-MIN_SHARPNESS_ENROLL = 50.0  # Laplacian variance, < 50 is often blurry
+DETECTION_SCORE_THRESHOLD = float(os.getenv("DETECTION_SCORE_THRESHOLD", DEFAULT_DETECTION_SCORE))
+MATCH_SIMILARITY_THRESHOLD = float(os.getenv("MATCH_SIMILARITY_THRESHOLD", DEFAULT_MATCH_THRESHOLD))
+MIN_ENROLL_FRAMES = int(os.getenv("MIN_ENROLL_FRAMES", "30"))
+MIN_BBOX_AREA_ENROLL = int(os.getenv("MIN_BBOX_AREA_ENROLL", "10000"))
+MIN_SHARPNESS_ENROLL = float(os.getenv("MIN_SHARPNESS_ENROLL", "50.0"))
+MAX_VECTORS_FOR_UPDATE = int(os.getenv("MAX_VECTORS_FOR_UPDATE", "300"))
+RECENT_VECTOR_BUFFER_SIZE = int(os.getenv("RECENT_VECTOR_BUFFER_SIZE", "50"))
+DETECTION_INTERVAL = int(os.getenv("DETECTION_INTERVAL", "2"))
+REID_INPUT_SIZE = (128, 256)
+VECTOR_DIMENSION = 512
 
 
 class PersonTrackerApp:
@@ -57,9 +62,15 @@ class PersonTrackerApp:
 
         # --- State Variables ---
         self.faiss_index = None
-        self.faiss_lock = threading.Lock()  # Lock for thread-safe access to the Faiss index
-        self.known_persons_db = {}  # Local cache for persons loaded from MongoDB
+        self.faiss_lock = threading.Lock()
+        self.known_persons_db = {}
         self.next_permanent_id = 1
+
+        # --- NEW: Live Tuning Variables ---
+        # These will be modified by keyboard presses
+        self.current_match_threshold = MATCH_SIMILARITY_THRESHOLD
+        self.current_detection_threshold = DETECTION_SCORE_THRESHOLD
+        # --- END NEW ---
 
         # --- Thread Communication Queues ---
         self.frame_queue = queue.Queue(maxsize=1)
@@ -70,7 +81,7 @@ class PersonTrackerApp:
         self.track_id_to_permanent_id_map = {}
         self.recent_vector_buffers = defaultdict(lambda: deque(maxlen=RECENT_VECTOR_BUFFER_SIZE))
         self.last_update_time_for_pid = defaultdict(float)
-        self.UPDATE_INTERVAL = 1.0
+        self.UPDATE_INTERVAL = 1.0  # 1 second
 
         # --- Database Connection ---
         try:
@@ -113,7 +124,7 @@ class PersonTrackerApp:
         Rebuilds the in-memory Faiss index from the local DB cache in a thread-safe manner
         and saves the serialized index to MongoDB via a temporary file.
         """
-        with self.faiss_lock:  # Ensures exclusive access to the index
+        with self.faiss_lock:
             print("Rebuilding Faiss index...")
 
             all_vectors = []
@@ -135,33 +146,24 @@ class PersonTrackerApp:
             vector_matrix = np.stack(all_vectors, axis=0).astype('float32')
             id_matrix = np.array(all_pids_for_vectors).astype('int64')
 
-            # Use IndexFlatIP (Cosine Similarity) for L2-normalized vectors
-            # Wrap it with IndexIDMap to map vectors directly to our permanent_ids
             base_index = faiss.IndexFlatIP(VECTOR_DIMENSION)
             self.faiss_index = faiss.IndexIDMap(base_index)
             self.faiss_index.add_with_ids(vector_matrix, id_matrix)
             print(f"Faiss index rebuilt successfully with {self.faiss_index.ntotal} vectors.")
 
             try:
-                # 1. Write index to a temporary file
                 faiss.write_index(self.faiss_index, TEMP_FAISS_FILENAME)
-
-                # 2. Read the bytes from that file
                 with open(TEMP_FAISS_FILENAME, "rb") as f:
                     index_buffer = f.read()
-
-                # 3. Save these bytes to MongoDB
                 self.faiss_collection.update_one(
                     {"name": FAISS_INDEX_KEY},
                     {"$set": {"index_data": Binary(index_buffer), "last_updated": datetime.now()}},
                     upsert=True
                 )
                 print(f"Faiss index saved to MongoDB ('{MONGO_FAISS_COLLECTION_NAME}').")
-
             except Exception as e:
                 print(f"!!!! FAISS SAVE ERROR !!!!: {e}")
             finally:
-                # 4. Clean up the temporary file
                 if os.path.exists(TEMP_FAISS_FILENAME):
                     os.remove(TEMP_FAISS_FILENAME)
 
@@ -170,7 +172,6 @@ class PersonTrackerApp:
         if image is None or image.size == 0:
             return 0
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        # Calculate the variance of the Laplacian
         variance = cv2.Laplacian(gray, cv2.CV_64F).var()
         return variance
 
@@ -181,7 +182,6 @@ class PersonTrackerApp:
         """
         print("Loading database from MongoDB...")
         try:
-            # Load person vectors into cache
             all_persons = list(self.persons_collection.find({}))
             if all_persons:
                 for doc in all_persons:
@@ -200,40 +200,29 @@ class PersonTrackerApp:
                 print("No person records found in MongoDB. Starting fresh.")
                 self.next_permanent_id = 1
 
-            # Attempt to load Faiss index from MongoDB
             index_doc = self.faiss_collection.find_one({"name": FAISS_INDEX_KEY})
             if index_doc and 'index_data' in index_doc:
                 print("Loading Faiss index from MongoDB...")
                 try:
-                    # 1. Get the binary data from Mongo
                     index_buffer = index_doc['index_data']
-
-                    # 2. Write the bytes to a temporary file
                     with open(TEMP_FAISS_FILENAME, "wb") as f:
                         f.write(index_buffer)
-
-                    # 3. Read the index from that file
                     loaded_index = faiss.read_index(TEMP_FAISS_FILENAME)
-
-                    # Verification: Is the index stale? (Does vector count match DB?)
                     if loaded_index.ntotal != len(self.known_persons_db) * 2:
                         print("Faiss index is stale (vector count mismatch). Rebuilding...")
                         raise ValueError("Index stale")
                     with self.faiss_lock:
                         self.faiss_index = loaded_index
                     print("Faiss index loaded successfully from MongoDB.")
-
                 except Exception as e:
                     print(f"Failed to load Faiss index from MongoDB ({e}), rebuilding...")
                     self.rebuild_faiss_index()
                 finally:
-                    # 4. Clean up the temporary file
                     if os.path.exists(TEMP_FAISS_FILENAME):
                         os.remove(TEMP_FAISS_FILENAME)
             else:
                 print("No Faiss index found in MongoDB. Building from scratch...")
                 self.rebuild_faiss_index()
-
         except Exception as e:
             print(f"Error loading DB, creating new one: {e}")
             self.rebuild_faiss_index()
@@ -259,15 +248,12 @@ class PersonTrackerApp:
             print(f"MongoDB INSERT: New person (P{self.next_permanent_id}) added.")
         except Exception as e:
             print(f"!!!! MongoDB INSERT ERROR !!!!: {e}")
-            return  # Don't increment ID on error
-
+            return
         self.known_persons_db[self.next_permanent_id] = {"master_vector": master, "recent_master_vector": master,
                                                          "count": len(vectors), "created": current_dt}
-
-        # New person added, rebuild the index
         self.rebuild_faiss_index()
         self.next_permanent_id += 1
-        return self.next_permanent_id - 1  # Return the newly assigned ID
+        return self.next_permanent_id - 1
 
     def incremental_update(self, perm_id, new_vector):
         """
@@ -277,15 +263,11 @@ class PersonTrackerApp:
         if entry is None: return
         n = entry.get("count", 1)
         mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
-
-        # "Recent" vector (recent_master_vector) is always updated
         buffer = self.recent_vector_buffers[perm_id]
         buffer.append(new_vector)
         updated_recent_master = self.l2_normalize(np.mean(buffer, axis=0))
         mongo_update_doc["$set"]["recent_master_vector"] = Binary(updated_recent_master.tobytes())
         entry["recent_master_vector"] = updated_recent_master
-
-        # "Master" vector (master_vector) is only updated if not locked
         if n < MAX_VECTORS_FOR_UPDATE:
             master = entry["master_vector"]
             updated_master = self.l2_normalize((n * master + new_vector) / (n + 1))
@@ -297,25 +279,21 @@ class PersonTrackerApp:
             if new_count == MAX_VECTORS_FOR_UPDATE:
                 print(f"INFO: Person P{perm_id} vector locked after {new_count} updates.")
         try:
-            # Fix: Use Python int for MongoDB query
             self.persons_collection.update_one({"permanent_id": int(perm_id)}, mongo_update_doc)
         except Exception as e:
             print(f"!!!! MongoDB UPDATE ERROR (P{perm_id}) !!!!: {e}")
 
     def find_best_match(self, query_vector):
         """Performs a fast, thread-safe similarity search using the Faiss index."""
-        with self.faiss_lock:  # Ensures no reading happens while the index is being rebuilt
+        with self.faiss_lock:
             if self.faiss_index is None or self.faiss_index.ntotal == 0:
                 return None, -1.0
             try:
                 query_vector_2d = query_vector.reshape(1, -1).astype('float32')
-                # k=1: Find the single best match
-                # D: Distances (in our case, similarities - IndexFlatIP)
-                # I: IDs (in our case, permanent_ids - IndexIDMap)
+                # --- UPDATED: Use the live-tuning threshold ---
                 D, I = self.faiss_index.search(query_vector_2d, k=1)
                 best_similarity = D[0][0]
-                if best_similarity >= MATCH_SIMILARITY_THRESHOLD:
-                    # Fix: Convert numpy int from Faiss to Python int
+                if best_similarity >= self.current_match_threshold:  # Use the dynamic variable
                     matched_pid = int(I[0][0])
                     return matched_pid, best_similarity
             except Exception as e:
@@ -346,17 +324,18 @@ class PersonTrackerApp:
                 print("Detector thread stopping...")
                 break
             with torch.inference_mode():
-                # 1. Detection (Slow Part)
                 tensor = torch.from_numpy(cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).to(
                     torch.uint8)
                 output = self.detector([self.transform(tensor).to(self.device)])[0]
                 scores, labels, boxes = output['scores'], output['labels'], output['boxes']
-                keep_mask = (scores >= 0.7) & (labels == 1)  # 'person' (1)
+
+                # --- UPDATED: Use the live-tuning threshold ---
+                # Read the current threshold value from the main class
+                keep_mask = (scores >= self.current_detection_threshold) & (labels == 1)
+
                 new_detections = np.concatenate(
                     [boxes[keep_mask].cpu().numpy(), scores[keep_mask].cpu().numpy()[:, None],
                      labels[keep_mask].cpu().numpy()[:, None]], axis=1)
-
-                # 2. Send Results
                 try:
                     self.detection_queue.get_nowait()
                 except queue.Empty:
@@ -397,97 +376,72 @@ class PersonTrackerApp:
                     try:
                         self.frame_queue.put_nowait(frame.copy())
                     except queue.Full:
-                        pass  # Skip frame if detector is busy
+                        pass
 
                 try:
                     detections = self.detection_queue.get_nowait()
                 except queue.Empty:
-                    pass  # No new detections, use old ones
+                    pass
 
                 # --- 2. Tracking (Fast) ---
                 res = self.tracker.update(detections, frame)
 
                 # --- 3. Batch Re-Identification (NEW EFFICIENT LOGIC) ---
-
-                # Step 1: Collect all valid crops and their track_ids
                 crops_to_process = []
                 track_ids_for_crops = []
-                tracker_results_list = []  # Store all results for the processing loop
+                tracker_results_list = []
 
                 for *box, track_id, conf, cls, ind in res:
                     track_id = int(track_id)
                     x1, y1, x2, y2 = map(int, box)
-
-                    # We need the original frame dimensions here
                     h, w, _ = frame.shape
                     x1 = max(0, min(w - 1, x1));
                     x2 = max(0, min(w - 1, x2))
                     y1 = max(0, min(h - 1, y1));
                     y2 = max(0, min(h - 1, y2))
-
                     if x2 <= x1 or y2 <= y1: continue
-
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0:
                         crops_to_process.append(crop)
                         track_ids_for_crops.append(track_id)
-                        # Save the full tracker result for the next loop
                         tracker_results_list.append((box, track_id, conf, cls, ind, crop))
 
-                # Step 2: Run batch inference *once* for all valid crops
                 all_vectors = []
                 if crops_to_process:
                     all_vectors = self.extract_embeddings_from_crops(crops_to_process)
 
-                # Step 3: Map the resulting vectors back to their track_ids
                 vector_map = {}
                 if len(all_vectors) == len(track_ids_for_crops):
-                    for i, track_id in enumerate(track_ids_for_crops):
-                        vector_map[track_id] = all_vectors[i]
+                    vector_map = {tid: vec for tid, vec in zip(track_ids_for_crops, all_vectors)}
                 else:
                     print(
                         f"!!!! WARNING: Mismatch in batch Re-ID. Crops: {len(crops_to_process)}, Vectors: {len(all_vectors)}")
 
                 # --- 4. Process Results (using pre-computed vectors) ---
                 current_frame_track_ids = set()
-
-                # Loop over the saved tracker results
                 for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
                     current_frame_track_ids.add(track_id)
-
-                    # Get the vector we pre-computed in the batch
                     current_vector = vector_map.get(track_id)
                     if current_vector is None:
-                        # This crop was invalid or failed embedding
                         continue
 
-                    x1, y1, x2, y2 = map(int, box)  # Get coordinates back
-                    label, color = f"T{track_id}", (0, 165, 255)  # Default: Orange (Tracking)
+                    x1, y1, x2, y2 = map(int, box)
+                    label, color = f"T{track_id}", (0, 165, 255)
 
                     if track_id in self.track_id_to_permanent_id_map:
-                        # Case 1: Person is already recognized
                         pid = self.track_id_to_permanent_id_map[track_id]
-                        label, color = f"P{pid}", (0, 255, 0)  # Green (Recognized)
-
-                        # We still respect the 1-second update interval
+                        label, color = f"P{pid}", (0, 255, 0)
                         if (time.time() - self.last_update_time_for_pid[pid]) > self.UPDATE_INTERVAL:
-                            # We ALREADY have the vector, no new call needed.
                             self.incremental_update(pid, current_vector)
                             self.last_update_time_for_pid[pid] = time.time()
                     else:
-                        # Case 2: New person, try to match
-                        # We ALREADY have the vector.
                         match_id, match_sim = self.find_best_match(current_vector)
 
                         if match_id is not None:
-                            # Match found!
                             self.track_id_to_permanent_id_map[track_id] = match_id
-                            label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)  # Green (Matched)
+                            label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)
                         else:
-                            # Case 3: No match, start enrollment process
-
                             # --- Enrollment Quality Check ---
-                            # We pass the 'crop' we saved from the first loop
                             bbox_area = crop.shape[0] * crop.shape[1]
                             sharpness = self.calculate_sharpness(crop)
                             is_good_quality = (bbox_area >= MIN_BBOX_AREA_ENROLL) and (
@@ -506,18 +460,17 @@ class PersonTrackerApp:
                                 label = f"New? T{track_id} (REJECT: {reason})"
 
                             buf["last_seen"] = time.time()
-
                             if len(buf["vectors"]) >= MIN_ENROLL_FRAMES:
                                 new_pid = self.enroll_person(buf["vectors"])
-                                print(f"ENROLLED: New person P{new_pid}. Vectors: {len(buf['vectors'])}")
-                                self.track_id_to_permanent_id_map[track_id] = new_pid
-                                del self.active_track_buffers[track_id]
+                                if new_pid:  # Check if enrollment was successful
+                                    print(f"ENROLLED: New person P{new_pid}. Vectors: {len(buf['vectors'])}")
+                                    self.track_id_to_permanent_id_map[track_id] = new_pid
+                                    del self.active_track_buffers[track_id]
 
-                    # --- 5. Drawing (Moved from original loop) ---
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                # --- Cleanup ---
+                # --- 5. Cleanup ---
                 now = time.time()
                 stale = [tid for tid, b in self.active_track_buffers.items() if (now - b.get("last_seen", now)) > 5.0]
                 for tid in stale: del self.active_track_buffers[tid]
@@ -528,7 +481,18 @@ class PersonTrackerApp:
                     if pid and pid in self.recent_vector_buffers:
                         del self.recent_vector_buffers[pid]
 
-                cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                # --- NEW: Draw the HUD (Heads-Up Display) ---
+                hud_text1 = f"FPS: {fps:.1f} | Detection (U/J): {self.current_detection_threshold:.2f}"
+                hud_text2 = f"Match (Y/H): {self.current_match_threshold:.2f} | DB Size: {len(self.known_persons_db)}"
+
+                # Draw a black background rectangle for readability
+                cv2.rectangle(frame, (5, 5), (450, 60), (0, 0, 0), -1)
+
+                # Draw the text
+                cv2.putText(frame, hud_text1, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                cv2.putText(frame, hud_text2, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # --- END NEW ---
+
                 cv2.imshow("ReID Vectors (MongoDB - Faiss)", frame)
 
                 key = self.handle_keyboard_input()
@@ -536,19 +500,38 @@ class PersonTrackerApp:
                     break
 
     def handle_keyboard_input(self):
-        """Manages keyboard shortcuts."""
+        """Manages keyboard shortcuts, now including live tuning."""
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             print("Quitting...")
-            self.frame_queue.put(None)  # Send shutdown signal to detector thread
+            self.frame_queue.put(None)
             return 'q'
 
+        # --- NEW: Live Tuning Keyboard Controls ---
+
+        # Detection Threshold (U=Up, J=Down)
+        elif key == ord('u'):
+            self.current_detection_threshold = min(1.0, self.current_detection_threshold + 0.05)
+            print(f"Detection Threshold set to: {self.current_detection_threshold:.2f}")
+        elif key == ord('j'):
+            self.current_detection_threshold = max(0.0, self.current_detection_threshold - 0.05)
+            print(f"Detection Threshold set to: {self.current_detection_threshold:.2f}")
+
+        # Match Threshold (Y=Up, H=Down)
+        elif key == ord('y'):
+            self.current_match_threshold = min(1.0, self.current_match_threshold + 0.05)
+            print(f"Match Threshold set to: {self.current_match_threshold:.2f}")
+        elif key == ord('h'):
+            self.current_match_threshold = max(0.0, self.current_match_threshold - 0.05)
+            print(f"Match Threshold set to: {self.current_match_threshold:.2f}")
+
+        # --- END NEW ---
+
         elif key == ord('r'):
-            # 'r' -> RESET MongoDB
             print("RESET: Deleting all entries from MongoDB...")
             try:
                 self.persons_collection.delete_many({})
-                self.faiss_collection.delete_many({})  # Also delete the index
+                self.faiss_collection.delete_many({})
                 print("MongoDB collections have been cleared.")
             except Exception as e:
                 print(f"!!!! MongoDB RESET ERROR !!!!: {e}")
@@ -560,7 +543,6 @@ class PersonTrackerApp:
             print("Program memory (cache and index) has been cleared.")
 
         elif key == ord('d'):
-            # 'd' -> Dump Database Status
             with self.faiss_lock:
                 print("\n--- DB STATUS (d) ---")
                 print(f"Persons in cache: {len(self.known_persons_db)}")
@@ -574,7 +556,6 @@ class PersonTrackerApp:
                 print("------------------\n")
 
         elif key == ord('k'):
-            # 'k' -> Kill (delete) the Last Added Person
             if self.known_persons_db:
                 try:
                     last_id = max(self.known_persons_db.keys())
@@ -601,7 +582,7 @@ class PersonTrackerApp:
 
 # --- Start the Application ---
 if __name__ == "__main__":
-    app = None  # Initialize app to None for the finally block
+    app = None
     try:
         app = PersonTrackerApp()
         app.run()
@@ -610,11 +591,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"!!!! UNEXPECTED ERROR OCCURRED !!!!: {e}")
     finally:
-        # Try to release resources even if an error occurred
         try:
             if app:
                 app.cleanup()
         except NameError:
-            # If app failed to initialize
             cv2.destroyAllWindows()
             print("Application failed to initialize, cleaning up windows.")
