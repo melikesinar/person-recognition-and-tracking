@@ -36,9 +36,13 @@ def main():
     MATCH_SIMILARITY_THRESHOLD = 0.85
     MAX_VECTORS_FOR_UPDATE = 300
     RECENT_VECTOR_BUFFER_SIZE = 50
-    DETECTION_INTERVAL = 2
+    DETECTION_INTERVAL = 1
     REID_INPUT_SIZE = (128, 256)
     VECTOR_DIMENSION = 512
+    # Min 100x100 pixels area to be considered for enrollment
+    MIN_BBOX_AREA_ENROLL = 100 * 100
+    # Laplacian variance, values < 50 are often considered blurry
+    MIN_SHARPNESS_ENROLL = 50.0
 
     # --- Faiss and Threading Globals ---
     faiss_index = None
@@ -120,6 +124,15 @@ def main():
                 # 4. Clean up the temporary file
                 if os.path.exists(temp_index_filename):
                     os.remove(temp_index_filename)
+
+    def calculate_sharpness(image):
+        """Calculates the sharpness of an image using Laplacian variance."""
+        if image is None or image.size == 0:
+            return 0
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Calculate the variance of the Laplacian
+        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return variance
 
     def load_db():
         """
@@ -360,13 +373,49 @@ def main():
                         track_id_to_permanent_id_map[track_id] = match_id
                         label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)
                     else:
+                        # Case 3: No match, start enrollment process
+
+                        # --- NEW: Enrollment Quality Check ---
+                        bbox_h, bbox_w, _ = crop.shape
+                        bbox_area = bbox_w * bbox_h
+                        sharpness = calculate_sharpness(crop)
+
+                        # Check if the crop quality is good enough to be enrolled
+                        is_good_quality = True
+                        quality_rejection_reason = ""
+
+                        if bbox_area < MIN_BBOX_AREA_ENROLL:
+                            is_good_quality = False
+                            quality_rejection_reason = "Too small"
+                        elif sharpness < MIN_SHARPNESS_ENROLL:
+                            is_good_quality = False
+                            quality_rejection_reason = "Too blurry"
+                        # --- END NEW ---
+
+                        if len(known_persons_db) > 0:
+                            # Updated debug print to show quality info
+                            print(
+                                f"DEBUG: New person (T{track_id}). Best sim: {match_sim:.4f}. Quality: {sharpness:.1f} / Area: {bbox_area}. Good: {is_good_quality}")
+
                         buf = active_track_buffers[track_id]
-                        buf["vectors"].append(vecs[0])
-                        label = f"New? T{track_id} ({len(buf['vectors'])})"
+
+                        if is_good_quality:
+                            # Only add high-quality vectors to the buffer
+                            buf["vectors"].append(vecs[0])
+                            label = f"New? T{track_id} ({len(buf['vectors'])})"
+                        else:
+                            # Frame is bad quality, don't add vector, but keep tracking
+                            label = f"New? T{track_id} (REJECT: {quality_rejection_reason})"
+
+                        # Always update last_seen, otherwise the buffer will be cleaned up prematurely
+                        buf["last_seen"] = time.time()
+
+                        # Check if we have enough *good* frames to enroll
                         if len(buf["vectors"]) >= MIN_ENROLL_FRAMES:
                             new_pid, known_persons_db, next_permanent_id = enroll_person(known_persons_db,
                                                                                          next_permanent_id,
                                                                                          buf["vectors"])
+                            print(f"ENROLLED: New person {new_pid}. Vectors: {len(buf['vectors'])}")
                             track_id_to_permanent_id_map[track_id] = new_pid
                             del active_track_buffers[track_id]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
