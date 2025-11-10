@@ -133,17 +133,23 @@ class PersonTrackerApp:
                 all_vectors.append(data.get('recent_master_vector', data['master_vector']))
                 all_pids_for_vectors.append(pid)
 
+            # Her zaman boş bir indeks ile başla
+            base_index = faiss.IndexFlatIP(VECTOR_DIMENSION)
+            self.faiss_index = faiss.IndexIDMap(base_index)
+
             if not all_vectors:
-                print("No vectors to index. Faiss index is empty.")
-                self.faiss_index = None
-                self.faiss_collection.delete_one({"name": FAISS_INDEX_KEY})
-                return
+                print("No vectors to index. Faiss index initialized empty.")
+                # MongoDB'den de sil (boş indeks kaydetmeye gerek yok)
+                try:
+                    self.faiss_collection.delete_one({"name": FAISS_INDEX_KEY})
+                except Exception as e:
+                    print(f"!!!! FAISS (empty) index delete error !!!!: {e}")
+                return  # self.faiss_index artık boş ama GEÇERLİ bir nesne.
 
             vector_matrix = np.stack(all_vectors, axis=0).astype('float32')
             id_matrix = np.array(all_pids_for_vectors).astype('int64')
 
-            base_index = faiss.IndexFlatIP(VECTOR_DIMENSION)
-            self.faiss_index = faiss.IndexIDMap(base_index)
+            # self.faiss_index = faiss.IndexIDMap(base_index) # Bu satır yukarı taşındı
             self.faiss_index.add_with_ids(vector_matrix, id_matrix)
             print(f"Faiss index rebuilt successfully with {self.faiss_index.ntotal} vectors.")
 
@@ -236,20 +242,42 @@ class PersonTrackerApp:
         if not vectors: raise ValueError("No vectors provided to enroll.")
         master = self.l2_normalize(np.mean(np.stack(vectors, axis=0), axis=0))
         current_dt = datetime.now()
-        new_person_doc = {"permanent_id": self.next_permanent_id, "master_vector": Binary(master.tobytes()),
+
+        new_pid = self.next_permanent_id  # ID'yi önce alalım
+
+        new_person_doc = {"permanent_id": new_pid, "master_vector": Binary(master.tobytes()),
                           "recent_master_vector": Binary(master.tobytes()), "count": len(vectors),
                           "created": current_dt, "last_seen": current_dt}
         try:
             self.persons_collection.insert_one(new_person_doc)
-            print(f"MongoDB INSERT: New person (P{self.next_permanent_id}) added.")
+            print(f"MongoDB INSERT: New person (P{new_pid}) added.")
         except Exception as e:
             print(f"!!!! MongoDB INSERT ERROR !!!!: {e}")
-            return
-        self.known_persons_db[self.next_permanent_id] = {"master_vector": master, "recent_master_vector": master,
-                                                         "count": len(vectors), "created": current_dt}
-        self.rebuild_faiss_index()
+            return None  # Hata varsa ID döndürme
+
+        # Yeni kişiyi lokal DB'ye ekle
+        self.known_persons_db[new_pid] = {"master_vector": master, "recent_master_vector": master,
+                                          "count": len(vectors), "created": current_dt}
+
+        try:
+            # Eklenecek vektörleri ve ID'leri hazırla
+            vectors_to_add = np.stack([master, master], axis=0).astype('float32')
+            ids_to_add = np.array([new_pid, new_pid]).astype('int64')
+
+            with self.faiss_lock:
+                # 'if self.faiss_index:' kontrolü ve 'else:' bloğu kaldırıldı.
+                # 'self.faiss_index'in artık 'None' olmayacağı garanti.
+                self.faiss_index.add_with_ids(vectors_to_add, ids_to_add)
+                print(
+                    f"FAISS ADD: P{new_pid} vektörleri anlık olarak indekse eklendi. (Yeni boyut: {self.faiss_index.ntotal})")
+
+        except Exception as e:
+            print(f"!!!! FAISS ANLIK EKLEME HATASI (P{new_pid}) !!!!: {e}")
+            # Bu durumda DB'ye eklendi ama indekse eklenemedi.
+            # Bir sonraki adım (periyodik rebuild) bunu düzeltecek.
+
         self.next_permanent_id += 1
-        return self.next_permanent_id - 1
+        return new_pid  # Başarılı kayıtta yeni ID'yi döndür
 
     def incremental_update(self, perm_id, new_vector):
         """
@@ -274,6 +302,29 @@ class PersonTrackerApp:
             entry["count"] = new_count
             if new_count == MAX_VECTORS_FOR_UPDATE:
                 print(f"INFO: Person P{perm_id} vector locked after {new_count} updates.")
+
+        vectors_to_add = np.stack([
+            entry["master_vector"],
+            entry["recent_master_vector"]
+        ], axis=0).astype('float32')
+
+        ids_to_add = np.array([perm_id, perm_id]).astype('int64')
+
+        try:
+            with self.faiss_lock:
+                if self.faiss_index:
+                    ids_to_remove = np.array([perm_id], dtype='int64')
+                    id_selector = faiss.IDSelectorBatch(ids_to_remove)
+
+                    # 1. Bu 'pid' için eski vektörleri kaldır
+                    self.faiss_index.remove_ids(id_selector)
+
+                    # 2. Bu 'pid' için yeni (güncellenmiş) vektörleri ekle
+                    self.faiss_index.add_with_ids(vectors_to_add, ids_to_add)
+
+        except Exception as e:
+            print(f"!!!! FAISS ANLIK GÜNCELLEME HATASI (P{perm_id}) !!!!: {e}")
+
         try:
             self.persons_collection.update_one({"permanent_id": int(perm_id)}, mongo_update_doc)
         except Exception as e:
