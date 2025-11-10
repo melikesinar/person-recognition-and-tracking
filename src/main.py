@@ -105,7 +105,7 @@ class PersonTrackerApp:
         self.transform = weights.transforms()
 
         print("Loading Re-ID Model...")
-        self.tracker = BoostTrack(reid_weights=Path('osnet_x0_25_msmt17.pt'),
+        self.tracker = BoostTrack(reid_weights=Path('osnet_x1_0_msmt17.pt'),
                                   device=(0 if self.device.type == 'cuda' else 'cpu'),
                                   half=False, with_reid=True)
         if not hasattr(self.tracker, 'reid_model') or self.tracker.reid_model is None:
