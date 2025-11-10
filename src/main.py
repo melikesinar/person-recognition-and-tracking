@@ -9,16 +9,13 @@ import threading
 import numpy as np
 import faiss  # type: ignore
 from pathlib import Path
+from ultralytics import YOLO
 from boxmot import BoostTrack
 from datetime import datetime
 from collections import deque
 from bson.binary import Binary
 from dotenv import load_dotenv
 from collections import defaultdict
-from torchvision.models.detection import (
-    fasterrcnn_resnet50_fpn_v2,
-    FasterRCNN_ResNet50_FPN_V2_Weights as Weights
-)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -98,11 +95,9 @@ class PersonTrackerApp:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
 
-        print("Loading Object Detector...")
-        weights = Weights.DEFAULT
-        self.detector = fasterrcnn_resnet50_fpn_v2(weights=weights, box_score_thresh=0.5)
-        self.detector.to(self.device).eval()
-        self.transform = weights.transforms()
+        print("Loading Object Detector (YOLOv8)...")
+        self.detector = YOLO('yolov8m.pt')
+        self.detector.to(self.device)
 
         print("Loading Re-ID Model...")
         self.tracker = BoostTrack(reid_weights=Path('osnet_x1_0_msmt17.pt'),
@@ -114,7 +109,7 @@ class PersonTrackerApp:
             print("SUCCESS: Re-ID MODEL LOADED.")
 
         self.stop_event = threading.Event()
-        self.rebuild_interval_seconds = 10  # 5 dakikada bir yeniden oluştur
+        self.rebuild_interval_seconds = 10  # 10 saniyede bir yeniden oluştur
         self.rebuilder_thread = threading.Thread(target=self.periodic_rebuild_worker, daemon=True)
 
         # --- Load Data ---
@@ -384,31 +379,49 @@ class PersonTrackerApp:
         return [self.l2_normalize(np.random.randn(VECTOR_DIMENSION).astype(np.float32)) for _ in crops]
 
     def detector_worker(self):
-        """Runs the slow detector in a separate thread."""
-        print("Detector thread started...")
+        """Runs the fast YOLOv8 detector in a separate thread."""
+        print("Detector thread (YOLOv8) started...")
         while True:
             frame_to_process = self.frame_queue.get()
             if frame_to_process is None:
                 print("Detector thread stopping...")
                 break
-            with torch.inference_mode():
-                tensor = torch.from_numpy(cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)).permute(2, 0, 1).to(
-                    torch.uint8)
-                output = self.detector([self.transform(tensor).to(self.device)])[0]
-                scores, labels, boxes = output['scores'], output['labels'], output['boxes']
 
-                # --- UPDATED: Use the live-tuning threshold ---
-                # Read the current threshold value from the main class
-                keep_mask = (scores >= self.current_detection_threshold) & (labels == 1)
+            # YOLO, transform/tensor çevrimlerini kendisi halleder.
+            # 'classes=0' sadece 'person' (insan) sınıfını arar.
+            # 'conf' filtresini burada değil, aşağıda manuel yapacağız.
+            output = self.detector(frame_to_process, classes=0, verbose=False)
 
-                new_detections = np.concatenate(
-                    [boxes[keep_mask].cpu().numpy(), scores[keep_mask].cpu().numpy()[:, None],
-                     labels[keep_mask].cpu().numpy()[:, None]], axis=1)
-                try:
-                    self.detection_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                self.detection_queue.put(new_detections)
+            # YOLO'nun 'results' nesnesini 'boxmot'un beklediği numpy formatına çevir
+            if not output:
+                new_detections = np.empty((0, 6), dtype=np.float32)
+            else:
+                # Sadece ilk sonucu al (tek frame işliyoruz)
+                boxes = output[0].boxes
+
+                # 'boxes.data' içinde [x1, y1, x2, y2, score, class_id] bulunur
+                # Faster R-CNN'in [boxes, scores, labels] formatından farklı
+
+                # Canlı ayar (live-tuning) eşik değerine göre filtrele
+                scores = boxes.conf.cpu().numpy()
+                keep_mask = (scores >= self.current_detection_threshold)
+
+                if keep_mask.any():
+                    # 'boxmot' formatı: [x1, y1, x2, y2, score, class_id]
+                    # 'class_id' zaten 0 (person) olduğu için direkt kullanabiliriz.
+                    new_detections = boxes.data[keep_mask].cpu().numpy()
+
+                    # Güvenlik kontrolü: Sütun sayısını 6 ile sınırla (eğer varsa tracker_id'leri kaldır)
+                    if new_detections.shape[1] > 6:
+                        new_detections = new_detections[:, :6]
+                else:
+                    new_detections = np.empty((0, 6), dtype=np.float32)
+
+            try:
+                self.detection_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.detection_queue.put(new_detections)
 
     def run(self):
         """
