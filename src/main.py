@@ -27,11 +27,10 @@ load_dotenv()
 MONGO_CONNECTION_STRING = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("DB_NAME")
 MONGO_COLLECTION_NAME = os.getenv("COLLECTION")
-MONGO_FAISS_COLLECTION_NAME = "faiss_indexes"  # New collection to store the Faiss index
+MONGO_FAISS_COLLECTION_NAME = os.getenv("FAISS_COLLECTION")  # New collection to store the Faiss index
 FAISS_INDEX_KEY = "primary_person_index"  # Key to store the index in MongoDB
 TEMP_FAISS_FILENAME = "temp_faiss.index"  # Filename for temporarily writing the index to disk
 
-# --- UPDATED: Load ALL constants from .env ---
 # We load them here (outside the class) because detector_worker needs them
 # We set defaults in case they are missing from .env
 DEFAULT_DETECTION_SCORE = 0.7
@@ -66,11 +65,9 @@ class PersonTrackerApp:
         self.known_persons_db = {}
         self.next_permanent_id = 1
 
-        # --- NEW: Live Tuning Variables ---
         # These will be modified by keyboard presses
         self.current_match_threshold = MATCH_SIMILARITY_THRESHOLD
         self.current_detection_threshold = DETECTION_SCORE_THRESHOLD
-        # --- END NEW ---
 
         # --- Thread Communication Queues ---
         self.frame_queue = queue.Queue(maxsize=1)
@@ -91,8 +88,7 @@ class PersonTrackerApp:
             self.persons_collection = self.db[MONGO_COLLECTION_NAME]
             self.faiss_collection = self.db[MONGO_FAISS_COLLECTION_NAME]
             self.persons_collection.create_index("permanent_id", unique=True)
-            print(
-                f"Successfully connected to MongoDB. DB: '{MONGO_DB_NAME}', Collections: '{MONGO_COLLECTION_NAME}', '{MONGO_FAISS_COLLECTION_NAME}'")
+            print("Successfully connected to MongoDB.")
         except pymongo.errors.ServerSelectionTimeoutError as e:
             print(f"!!!! MongoDB CONNECTION ERROR !!!!: {e}")
             exit()
