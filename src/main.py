@@ -43,6 +43,8 @@ RECENT_VECTOR_BUFFER_SIZE = int(os.getenv("RECENT_VECTOR_BUFFER_SIZE", "50"))
 DETECTION_INTERVAL = int(os.getenv("DETECTION_INTERVAL", "2"))
 REID_INPUT_SIZE = (128, 256)
 VECTOR_DIMENSION = 512
+SHORT_TERM_MEMORY_TTL = 2.0
+SPATIAL_MATCH_THRESHOLD = 150
 
 
 class PersonTrackerApp:
@@ -61,6 +63,8 @@ class PersonTrackerApp:
         self.faiss_lock = threading.Lock()
         self.known_persons_db = {}
         self.index_to_pid_map = []
+        self.lost_pid_buffer = {}
+        self.last_known_box_for_pid = {}
         self.next_permanent_id = 1
 
         # These will be modified by keyboard presses
@@ -276,6 +280,10 @@ class PersonTrackerApp:
             self.rebuild_faiss_index()
             self.known_persons_db.clear()
             self.next_permanent_id = 1
+
+    def get_box_center(self, box):
+        """Calculates the center (x, y) of a bounding box."""
+        return (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
 
     def l2_normalize(self, v):
         """Normalizes a vector to unit length (L2 norm)."""
@@ -511,56 +519,113 @@ class PersonTrackerApp:
 
                     if track_id in self.track_id_to_permanent_id_map:
                         pid = self.track_id_to_permanent_id_map[track_id]
+                        self.last_known_box_for_pid[pid] = box
                         label, color = f"P{pid}", (0, 255, 0)
                         if (time.time() - self.last_update_time_for_pid[pid]) > self.UPDATE_INTERVAL:
                             self.incremental_update(pid, current_vector)
                             self.last_update_time_for_pid[pid] = time.time()
                     else:
-                        match_id, match_sim = self.find_best_match(current_vector)
+                        new_box_center = self.get_box_center(box)
+                        spatial_match_pid = None
+                        min_dist = float('inf')
 
-                        if match_id is not None:
-                            self.track_id_to_permanent_id_map[track_id] = match_id
-                            label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)
+                        # Kayıp buffer'ındaki her 'pid'yi kontrol et
+                        for pid_to_check, data in self.lost_pid_buffer.items():
+                            lost_box_center = self.get_box_center(data["last_box"])
+                            dist = np.linalg.norm(np.array(new_box_center) - np.array(lost_box_center))
+
+                            if dist < SPATIAL_MATCH_THRESHOLD and dist < min_dist:
+                                min_dist = dist
+                                spatial_match_pid = pid_to_check
+
+                        if spatial_match_pid is not None:
+                            # MEKANSAL EŞLEŞME BULUNDU! Faiss'e sorma.
+                            self.track_id_to_permanent_id_map[track_id] = spatial_match_pid
+                            label, color = f"P{spatial_match_pid} (Re-Acquired)", (0, 255, 128)  # Yeniden yakalandı rengi
+
+                            # Buffer'dan çıkar (artık kayıp değil) ve son konumu güncelle
+                            del self.lost_pid_buffer[spatial_match_pid]
+                            self.last_known_box_for_pid[spatial_match_pid] = box
+                            print(f"DEBUG: P{spatial_match_pid} spatially re-acquired by T{track_id}.")
                         else:
-                            # --- Enrollment Quality Check ---
-                            bbox_area = crop.shape[0] * crop.shape[1]
-                            sharpness = self.calculate_sharpness(crop)
-                            is_good_quality = (bbox_area >= MIN_BBOX_AREA_ENROLL) and (
-                                    sharpness >= MIN_SHARPNESS_ENROLL)
+                            match_id, match_sim = self.find_best_match(current_vector)
 
-                            if len(self.known_persons_db) > 0:
-                                print(
-                                    f"DEBUG: New person (T{track_id}). Best sim: {match_sim:.4f}. Quality: {sharpness:.1f} / Area: {bbox_area}. Good: {is_good_quality}")
-
-                            buf = self.active_track_buffers[track_id]
-                            if is_good_quality:
-                                buf["vectors"].append(current_vector)
-                                label = f"New? T{track_id} ({len(buf['vectors'])})"
+                            if match_id is not None:
+                                self.track_id_to_permanent_id_map[track_id] = match_id
+                                label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)
                             else:
-                                reason = "Too small" if bbox_area < MIN_BBOX_AREA_ENROLL else "Too blurry"
-                                label = f"New? T{track_id} (REJECT: {reason})"
+                                # --- Enrollment Quality Check ---
+                                bbox_area = crop.shape[0] * crop.shape[1]
+                                sharpness = self.calculate_sharpness(crop)
+                                is_good_quality = (bbox_area >= MIN_BBOX_AREA_ENROLL) and (
+                                        sharpness >= MIN_SHARPNESS_ENROLL)
 
-                            buf["last_seen"] = time.time()
-                            if len(buf["vectors"]) >= MIN_ENROLL_FRAMES:
-                                new_pid = self.enroll_person(buf["vectors"])
-                                if new_pid:  # Check if enrollment was successful
-                                    print(f"ENROLLED: New person P{new_pid}. Vectors: {len(buf['vectors'])}")
-                                    self.track_id_to_permanent_id_map[track_id] = new_pid
-                                    del self.active_track_buffers[track_id]
+                                if len(self.known_persons_db) > 0:
+                                    print(
+                                        f"DEBUG: New person (T{track_id}). Best sim: {match_sim:.4f}. Quality: {sharpness:.1f} / Area: {bbox_area}. Good: {is_good_quality}")
+
+                                buf = self.active_track_buffers[track_id]
+                                if is_good_quality:
+                                    buf["vectors"].append(current_vector)
+                                    label = f"New? T{track_id} ({len(buf['vectors'])})"
+                                else:
+                                    reason = "Too small" if bbox_area < MIN_BBOX_AREA_ENROLL else "Too blurry"
+                                    label = f"New? T{track_id} (REJECT: {reason})"
+
+                                buf["last_seen"] = time.time()
+                                if len(buf["vectors"]) >= MIN_ENROLL_FRAMES:
+                                    new_pid = self.enroll_person(buf["vectors"])
+                                    if new_pid:  # Check if enrollment was successful
+                                        print(f"ENROLLED: New person P{new_pid}. Vectors: {len(buf['vectors'])}")
+                                        self.track_id_to_permanent_id_map[track_id] = new_pid
+                                        del self.active_track_buffers[track_id]
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 # --- 5. Cleanup ---
                 now = time.time()
-                stale = [tid for tid, b in self.active_track_buffers.items() if (now - b.get("last_seen", now)) > 5.0]
-                for tid in stale: del self.active_track_buffers[tid]
 
-                disappeared = [tid for tid in self.track_id_to_permanent_id_map if tid not in current_frame_track_ids]
-                for tid in disappeared:
-                    pid = self.track_id_to_permanent_id_map.pop(tid, None)
-                    if pid and pid in self.recent_vector_buffers:
+                # 1. Aktif 'T...' buffer'larını temizle (bu mantık değişmedi)
+                stale_active_tracks = [tid for tid, b in self.active_track_buffers.items() if
+                                       (now - b.get("last_seen", now)) > 5.0]
+                for tid in stale_active_tracks:
+                    del self.active_track_buffers[tid]
+
+                # --- YENİ (ADIM 8.E): Kaybolan 'pid'leri anında silmek yerine 'kayıp' buffer'ına taşı ---
+                disappeared_track_ids = [tid for tid in self.track_id_to_permanent_id_map if
+                                         tid not in current_frame_track_ids]
+
+                for tid in disappeared_track_ids:
+                    pid = self.track_id_to_permanent_id_map.pop(tid, None)  # Eşleşmeyi kaldır
+                    if pid:
+                        # 'recent_vector_buffers'dan SİLME!
+
+                        # 'lost' buffer'ına ekle
+                        if pid in self.last_known_box_for_pid:
+                            self.lost_pid_buffer[pid] = {
+                                "disappear_time": now,
+                                "last_box": self.last_known_box_for_pid[pid]
+                            }
+                            # print(f"DEBUG: P{pid} lost, added to short-term memory.") # İsteğe bağlı debug
+                        else:
+                            # Bu pid için hiç kutu kaydedilmemişse (nadir durum), direkt sil
+                            if pid in self.recent_vector_buffers: del self.recent_vector_buffers[pid]
+
+                # --- YENİ (ADIM 8.E): 'Kayıp' buffer'ını temizle ---
+                # Hafıza süresi (TTL) dolan 'pid'leri bul
+                stale_lost_pids = [pid for pid, data in self.lost_pid_buffer.items() if
+                                   (now - data["disappear_time"]) > SHORT_TERM_MEMORY_TTL]
+
+                for pid in stale_lost_pids:
+                    # print(f"DEBUG: P{pid} expired from short-term memory. Fully removing.") # İsteğe bağlı debug
+                    del self.lost_pid_buffer[pid]
+
+                    # Artık bu 'pid'yi diğer yerlerden de güvenle silebiliriz
+                    if pid in self.recent_vector_buffers:
                         del self.recent_vector_buffers[pid]
+                    if pid in self.last_known_box_for_pid:
+                        del self.last_known_box_for_pid[pid]
 
                 # --- NEW: Draw the HUD (Heads-Up Display) ---
                 hud_text1 = f"FPS: {fps:.1f} | Detection (U/J): {self.current_detection_threshold:.2f}"
@@ -620,6 +685,8 @@ class PersonTrackerApp:
             self.next_permanent_id = 1
             self.active_track_buffers.clear()
             self.track_id_to_permanent_id_map.clear()
+            self.lost_pid_buffer.clear()
+            self.last_known_box_for_pid.clear()
             self.rebuild_faiss_index()
             print("Program memory (cache and index) has been cleared.")
 
@@ -645,6 +712,8 @@ class PersonTrackerApp:
                     del self.known_persons_db[last_id]
                     self.active_track_buffers.clear()
                     self.track_id_to_permanent_id_map.clear()
+                    self.lost_pid_buffer.clear()
+                    self.last_known_box_for_pid.clear()
                     self.rebuild_faiss_index()
                     print(f"DELETED (k): P{last_id} deleted from local cache. Index rebuilt.")
                 except Exception as e:
