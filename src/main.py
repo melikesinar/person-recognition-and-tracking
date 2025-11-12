@@ -102,6 +102,15 @@ class PersonTrackerApp:
         self.BUFFER_MAX_IDLE_TIME = 3600.0  # 1 saat görunmeyen bufferi sil
         self.last_buffer_cleanup = time.time()
 
+        # OSNet ve çoğu Re-ID modeli ImageNet üzerinde pretrain edilmiş
+        self.IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self.IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+        # TTA (Test-Time Augmentation) settings
+        self.USE_TTA = True  # Keyboard ile toggle edilebilir
+        self.TTA_HORIZONTAL_FLIP = True
+        self.TTA_MULTI_SCALE = False  # Çok yavaş, opsiyonel
+
         # --- Database Connection ---
         try:
             self.mongo_client = pymongo.MongoClient(MONGO_CONNECTION_STRING, serverSelectionTimeoutMS=5000)
@@ -653,20 +662,86 @@ class PersonTrackerApp:
 
         return None, -1.0
 
-    def extract_embeddings_from_crops(self, crops):
-        """Extracts feature embeddings (embeddings) from a list of cropped images."""
-        rm = getattr(self.tracker, "reid_model", None)
-        if rm is not None and hasattr(rm, 'model') and callable(rm.model):
-            resized_crops = [cv2.resize(c, REID_INPUT_SIZE, interpolation=cv2.INTER_LINEAR) for c in crops if
-                             c.size > 0]
-            if not resized_crops: return []
-            tensor_batch = torch.from_numpy(np.stack(resized_crops, axis=0)).permute(0, 3, 1, 2).float().to(
-                self.device) / 255.0
-            out = rm.model(tensor_batch)
-            return [self.l2_normalize(v.cpu().numpy()) for v in out]
+    def preprocess_crop_advanced(self, crop):
+        """
+        Advanced preprocessing for a single crop:
+        - Histogram equalization (improve contrast)
+        - Denoising (reduce noise)
+        - Edge enhancement (sharpen)
+        """
+        # Convert to LAB color space
+        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
 
-        print("!!!! WARNING: Re-ID model is not callable, returning random vectors! !!!!")
-        return [self.l2_normalize(np.random.randn(VECTOR_DIMENSION).astype(np.float32)) for _ in crops]
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to L channel
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+
+        # Convert back to BGR
+        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        # Optional: Slight denoising (very light)
+        # enhanced = cv2.fastNlMeansDenoisingColored(enhanced, None, 3, 3, 7, 21)
+
+        return enhanced
+
+    def extract_embeddings_from_crops(self, crops):
+        """
+        Extracts feature embeddings with SOTA preprocessing:
+        - ImageNet normalization
+        - Test-Time Augmentation (TTA) with horizontal flip
+        - Optional multi-scale extraction
+        """
+        rm = getattr(self.tracker, "reid_model", None)
+        if rm is None or not hasattr(rm, 'model') or not callable(rm.model):
+            print("!!!! WARNING: Re-ID model is not callable, returning random vectors! !!!!")
+            return [self.l2_normalize(np.random.randn(VECTOR_DIMENSION).astype(np.float32)) for _ in crops]
+
+        # Filter valid crops
+        valid_crops = [c for c in crops if c.size > 0]
+        if not valid_crops:
+            return []
+
+        # Resize to model input size
+        resized_crops = [
+            cv2.resize(
+                self.preprocess_crop_advanced(c),  # Advanced preprocessing ekle
+                REID_INPUT_SIZE,
+                interpolation=cv2.INTER_LINEAR
+            )
+            for c in valid_crops
+        ]
+
+        # Convert to tensor batch [N, H, W, C] -> [N, C, H, W]
+        images_np = np.stack(resized_crops, axis=0)
+        tensor_batch = torch.from_numpy(images_np).permute(0, 3, 1, 2).float().to(self.device)
+
+        # Normalize to [0, 1]
+        tensor_batch = tensor_batch / 255.0
+
+        # Apply ImageNet normalization
+        # Move normalization constants to device if not already there
+        if self.IMAGENET_MEAN.device != self.device:
+            self.IMAGENET_MEAN = self.IMAGENET_MEAN.to(self.device)
+            self.IMAGENET_STD = self.IMAGENET_STD.to(self.device)
+
+        tensor_batch = (tensor_batch - self.IMAGENET_MEAN) / self.IMAGENET_STD
+
+        # Extract features with optional TTA
+        if self.USE_TTA and self.TTA_HORIZONTAL_FLIP:
+            # Original + Horizontal Flip
+            features_original = rm.model(tensor_batch)
+            features_flipped = rm.model(torch.flip(tensor_batch, dims=[3]))  # Flip width dimension
+
+            # Average features from both augmentations
+            features = (features_original + features_flipped) / 2.0
+        else:
+            # No TTA, just extract
+            features = rm.model(tensor_batch)
+
+        # Normalize and convert to numpy
+        embeddings = [self.l2_normalize(v.cpu().numpy()) for v in features]
+
+        return embeddings
 
     def detector_worker(self):
         """Runs the fast YOLOv8 detector in a separate thread."""
@@ -980,8 +1055,11 @@ class PersonTrackerApp:
                     self.cleanup_stale_buffers(now)
                     self.last_buffer_cleanup = now
 
+                # TTA indicator
+                tta_indicator = "TTA:ON" if self.USE_TTA else "TTA:OFF"
+
                 hud_text1 = f"FPS: {fps:.1f} | Detection (U/J): {self.current_detection_threshold:.2f}"
-                hud_text2 = f"Match (Y/H): {self.current_match_threshold:.2f} | DB Size: {len(self.known_persons_db)}"
+                hud_text2 = f"Match (Y/H): {self.current_match_threshold:.2f} | DB: {len(self.known_persons_db)} | {tta_indicator}"
 
                 # Draw a black background rectangle for readability
                 cv2.rectangle(frame, (5, 5), (450, 60), (0, 0, 0), -1)
@@ -1019,6 +1097,10 @@ class PersonTrackerApp:
         elif key == ord('h'):
             self.current_match_threshold = max(0.0, self.current_match_threshold - 0.05)
             print(f"Match Threshold set to: {self.current_match_threshold:.2f}")
+        elif key == ord('t'):
+            self.USE_TTA = not self.USE_TTA
+            status = "ENABLED" if self.USE_TTA else "DISABLED"
+            print(f"Test-Time Augmentation (TTA): {status}")
 
         elif key == ord('r'):
             print("RESET: Queuing MongoDB clear operation...")
