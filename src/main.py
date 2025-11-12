@@ -83,7 +83,12 @@ class PersonTrackerApp:
         self.detection_queue = queue.Queue(maxsize=1)
 
         # --- Tracking and Enrollment Buffers ---
-        self.active_track_buffers = defaultdict(lambda: {"vectors": [], "crops": [], "last_seen": time.time()})
+        self.active_track_buffers = defaultdict(lambda: {
+            "vectors": [],
+            "crops": [],
+            "quality_scores": [],
+            "last_seen": time.time()
+        })
         self.track_id_to_permanent_id_map = {}
         self.recent_vector_buffers = defaultdict(lambda: deque(maxlen=RECENT_VECTOR_BUFFER_SIZE))
         self.last_update_time_for_pid = defaultdict(float)
@@ -206,6 +211,124 @@ class PersonTrackerApp:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         variance = cv2.Laplacian(gray, cv2.CV_64F).var()
         return variance
+
+    def advanced_quality_check(self, crop, bbox, frame_shape):
+        """
+        Advanced quality assessment for enrollment using multiple criteria.
+        Returns: (is_good_quality: bool, reason: str, quality_score: float)
+        """
+        h, w = crop.shape[:2]
+        frame_h, frame_w = frame_shape[:2]
+        x1, y1, x2, y2 = map(int, bbox)
+
+        quality_scores = {}
+        rejection_reasons = []
+
+        # 1. ASPECT RATIO CHECK (person should be ~2:1 height/width)
+        aspect_ratio = h / w if w > 0 else 0
+        if aspect_ratio < 1.2:  # Too wide (sitting/lying or partial detection)
+            rejection_reasons.append("aspect_too_wide")
+            quality_scores['aspect'] = 0.0
+        elif aspect_ratio > 4.0:  # Too tall (only legs or unrealistic)
+            rejection_reasons.append("aspect_too_tall")
+            quality_scores['aspect'] = 0.0
+        else:
+            # Optimal range: 1.5 - 3.0 (standing person)
+            if 1.5 <= aspect_ratio <= 3.0:
+                quality_scores['aspect'] = 1.0
+            else:
+                quality_scores['aspect'] = 0.5  # Acceptable but not ideal
+
+        # 2. BOUNDING BOX AREA
+        bbox_area = h * w
+        if bbox_area < MIN_BBOX_AREA_ENROLL:
+            rejection_reasons.append("too_small")
+            quality_scores['size'] = 0.0
+        else:
+            # Normalize score (10000 = min, 50000 = excellent)
+            quality_scores['size'] = min(1.0, bbox_area / 50000.0)
+
+        # 3. SHARPNESS (Laplacian variance)
+        sharpness = self.calculate_sharpness(crop)
+        if sharpness < MIN_SHARPNESS_ENROLL:
+            rejection_reasons.append("too_blurry")
+            quality_scores['sharpness'] = 0.0
+        else:
+            # Normalize (50 = min, 200 = excellent)
+            quality_scores['sharpness'] = min(1.0, sharpness / 200.0)
+
+        # 4. EDGE DENSITY (occlusion detection)
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            edge_density = np.sum(edges > 0) / (h * w)
+
+            if edge_density < 0.02:  # Too smooth = heavily occluded or blurred
+                rejection_reasons.append("occluded")
+                quality_scores['edges'] = 0.0
+            elif edge_density > 0.30:  # Too busy = cluttered background
+                quality_scores['edges'] = 0.5
+            else:
+                # Optimal range: 0.05 - 0.20
+                quality_scores['edges'] = 1.0 if 0.05 <= edge_density <= 0.20 else 0.7
+        except Exception as e:
+            quality_scores['edges'] = 0.5  # Neutral if error
+
+        # 5. BRIGHTNESS VARIANCE (illumination check)
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            brightness_std = gray.std()
+            brightness_mean = gray.mean()
+
+            if brightness_std < 15:  # Too uniform (over/under exposed)
+                rejection_reasons.append("poor_illumination")
+                quality_scores['brightness'] = 0.0
+            elif brightness_mean < 30 or brightness_mean > 225:  # Too dark or bright
+                rejection_reasons.append("extreme_lighting")
+                quality_scores['brightness'] = 0.3
+            else:
+                quality_scores['brightness'] = 1.0
+        except Exception as e:
+            quality_scores['brightness'] = 0.5
+
+        # 6. CENTER POSITION (avoid truncated detections at frame edges)
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+
+        # Calculate distance from frame edges (normalized)
+        margin_x = min(center_x, frame_w - center_x) / frame_w
+        margin_y = min(center_y, frame_h - center_y) / frame_h
+
+        if margin_x < 0.05 or margin_y < 0.05:  # Too close to edge (within 5%)
+            rejection_reasons.append("at_frame_edge")
+            quality_scores['position'] = 0.0
+        else:
+            quality_scores['position'] = 1.0
+
+        # AGGREGATE SCORE (weighted average)
+        weights = {
+            'aspect': 1.5,  # Very important (prevents bad crops)
+            'size': 1.5,  # Very important
+            'sharpness': 2.0,  # Most important (blurry = useless)
+            'edges': 1.0,  # Important for occlusion
+            'brightness': 1.0,  # Important for consistency
+            'position': 0.5  # Less critical (can still be useful)
+        }
+
+        total_score = sum(quality_scores[k] * weights[k] for k in quality_scores.keys())
+        max_score = sum(weights.values())
+        normalized_score = total_score / max_score
+
+        # DECISION: Require minimum 0.6 overall quality (60%)
+        is_good_quality = (normalized_score >= 0.6) and (len(rejection_reasons) == 0)
+
+        # Format reason
+        if rejection_reasons:
+            reason = ", ".join(rejection_reasons)
+        else:
+            reason = "good"
+
+        return is_good_quality, reason, normalized_score
 
     def load_db(self):
         """
@@ -626,31 +749,48 @@ class PersonTrackerApp:
                                 self.track_id_to_permanent_id_map[track_id] = match_id
                                 label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)
                             else:
-                                # --- Enrollment Quality Check ---
-                                bbox_area = crop.shape[0] * crop.shape[1]
-                                sharpness = self.calculate_sharpness(crop)
-                                is_good_quality = (bbox_area >= MIN_BBOX_AREA_ENROLL) and (
-                                        sharpness >= MIN_SHARPNESS_ENROLL)
+                                # --- ADVANCED Enrollment Quality Check ---
+                                is_good_quality, reason, quality_score = self.advanced_quality_check(
+                                    crop, box, frame.shape
+                                )
 
                                 if len(self.known_persons_db) > 0:
                                     print(
-                                        f"DEBUG: New person (T{track_id}). Best sim: {match_sim:.4f}. Quality: {sharpness:.1f} / Area: {bbox_area}. Good: {is_good_quality}")
+                                        f"DEBUG: New person (T{track_id}). Best sim: {match_sim:.4f}. "
+                                        f"Quality: {quality_score:.2f} | Reason: {reason}")
 
                                 buf = self.active_track_buffers[track_id]
                                 if is_good_quality:
                                     buf["vectors"].append(current_vector)
-                                    label = f"New? T{track_id} ({len(buf['vectors'])})"
+                                    buf["quality_scores"] = buf.get("quality_scores", [])
+                                    buf["quality_scores"].append(quality_score)
+
+                                    # Show average quality in label
+                                    avg_quality = np.mean(buf["quality_scores"])
+                                    label = f"New? T{track_id} ({len(buf['vectors'])}/{MIN_ENROLL_FRAMES}) Q:{avg_quality:.2f}"
                                 else:
-                                    reason = "Too small" if bbox_area < MIN_BBOX_AREA_ENROLL else "Too blurry"
                                     label = f"New? T{track_id} (REJECT: {reason})"
 
                                 buf["last_seen"] = time.time()
+
+                                # ENROLLMENT with quality threshold
                                 if len(buf["vectors"]) >= MIN_ENROLL_FRAMES:
-                                    new_pid = self.enroll_person(buf["vectors"])
-                                    if new_pid:  # Check if enrollment was successful
-                                        print(f"ENROLLED: New person P{new_pid}. Vectors: {len(buf['vectors'])}")
-                                        self.track_id_to_permanent_id_map[track_id] = new_pid
-                                        del self.active_track_buffers[track_id]
+                                    avg_quality = np.mean(buf.get("quality_scores", [0.5]))
+
+                                    # Require average quality ≥ 0.65 for enrollment
+                                    if avg_quality >= 0.65:
+                                        new_pid = self.enroll_person(buf["vectors"])
+                                        if new_pid:
+                                            print(f"ENROLLED: New person P{new_pid}. "
+                                                  f"Vectors: {len(buf['vectors'])} | Avg Quality: {avg_quality:.2f}")
+                                            self.track_id_to_permanent_id_map[track_id] = new_pid
+                                            del self.active_track_buffers[track_id]
+                                    else:
+                                        print(f"REJECTED ENROLLMENT: T{track_id} failed quality threshold. "
+                                              f"Avg Quality: {avg_quality:.2f} < 0.65. Resetting buffer.")
+                                        # Reset buffer to collect better samples
+                                        buf["vectors"].clear()
+                                        buf["quality_scores"].clear()
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
