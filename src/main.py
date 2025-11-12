@@ -226,7 +226,7 @@ class PersonTrackerApp:
 
         # 1. ASPECT RATIO CHECK (person should be ~2:1 height/width)
         aspect_ratio = h / w if w > 0 else 0
-        if aspect_ratio < 1.2:  # Too wide (sitting/lying or partial detection)
+        if aspect_ratio < 0.5:  # Too wide (sitting/lying or partial detection)
             rejection_reasons.append("aspect_too_wide")
             quality_scores['aspect'] = 0.0
         elif aspect_ratio > 4.0:  # Too tall (only legs or unrealistic)
@@ -401,6 +401,85 @@ class PersonTrackerApp:
     def get_box_center(self, box):
         """Calculates the center (x, y) of a bounding box."""
         return (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
+
+    def calculate_iou(self, box1, box2):
+        """
+        Calculate Intersection over Union (IoU) between two bounding boxes.
+        box format: [x1, y1, x2, y2]
+        """
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+
+        # Intersection area
+        x_left = max(x1_1, x1_2)
+        y_top = max(y1_1, y1_2)
+        x_right = min(x2_1, x2_2)
+        y_bottom = min(y2_1, y2_2)
+
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+        # Union area
+        box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+        box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union_area = box1_area + box2_area - intersection_area
+
+        iou = intersection_area / union_area if union_area > 0 else 0.0
+        return iou
+
+    def predict_next_position(self, last_box, time_elapsed):
+        """
+        Simple linear motion prediction based on last known box.
+        For more sophisticated prediction, use Kalman filter from tracker.
+
+        Args:
+            last_box: [x1, y1, x2, y2]
+            time_elapsed: seconds since last seen
+
+        Returns:
+            predicted_box: [x1, y1, x2, y2]
+        """
+        # For now, assume person stays roughly in same place (identity prediction)
+        # In a more advanced version, we could use velocity from track history
+
+        # Simple expansion based on time (person could have moved slightly)
+        expansion_factor = min(50 * time_elapsed, 100)  # Max 100 pixels expansion
+
+        x1, y1, x2, y2 = last_box
+        predicted_box = [
+            x1 - expansion_factor,
+            y1 - expansion_factor,
+            x2 + expansion_factor,
+            y2 + expansion_factor
+        ]
+
+        return predicted_box
+
+    def adaptive_spatial_threshold(self, bbox):
+        """
+        Calculate adaptive threshold based on bbox size.
+        Larger objects can move more pixels while still being the same person.
+
+        Args:
+            bbox: [x1, y1, x2, y2]
+
+        Returns:
+            threshold: adaptive distance threshold in pixels
+        """
+        x1, y1, x2, y2 = bbox
+        bbox_width = x2 - x1
+        bbox_height = y2 - y1
+        bbox_diag = np.sqrt(bbox_width ** 2 + bbox_height ** 2)
+
+        # Threshold is proportional to bbox size (but capped)
+        # Small person (diag=100): threshold ~50
+        # Large person (diag=300): threshold ~150
+        threshold = min(bbox_diag * 0.5, 200.0)
+        threshold = max(threshold, 30.0)  # Minimum threshold
+
+        return threshold
 
     def l2_normalize(self, v):
         """Normalizes a vector to unit length (L2 norm)."""
@@ -720,28 +799,63 @@ class PersonTrackerApp:
                             self.incremental_update(pid, current_vector)
                             self.last_update_time_for_pid[pid] = time.time()
                     else:
+                        # --- ADVANCED Spatial Re-acquisition with Motion Prediction ---
+                        now = time.time()
                         new_box_center = self.get_box_center(box)
                         spatial_match_pid = None
-                        min_dist = float('inf')
+                        best_match_score = -1.0  # Combined score (higher is better)
 
-                        # Kayıp buffer'ındaki her 'pid'yi kontrol et
                         for pid_to_check, data in self.lost_pid_buffer.items():
-                            lost_box_center = self.get_box_center(data["last_box"])
-                            dist = np.linalg.norm(np.array(new_box_center) - np.array(lost_box_center))
+                            time_elapsed = now - data["disappear_time"]
+                            last_box = data["last_box"]
 
-                            if dist < SPATIAL_MATCH_THRESHOLD and dist < min_dist:
-                                min_dist = dist
+                            # 1. Predict where person might be now
+                            predicted_box = self.predict_next_position(last_box, time_elapsed)
+
+                            # 2. Calculate IoU (Intersection over Union)
+                            iou = self.calculate_iou(box, predicted_box)
+
+                            # 3. Calculate center distance
+                            lost_box_center = self.get_box_center(last_box)
+                            center_dist = np.linalg.norm(
+                                np.array(new_box_center) - np.array(lost_box_center)
+                            )
+
+                            # 4. Adaptive threshold based on bbox size
+                            adaptive_threshold = self.adaptive_spatial_threshold(box)
+
+                            # 5. Time decay factor (recent losses are more reliable)
+                            time_factor = np.exp(-time_elapsed / SHORT_TERM_MEMORY_TTL)
+
+                            # 6. Combined matching score
+                            # IoU component (0-1, higher is better)
+                            iou_score = iou * 2.0  # Weight IoU highly
+
+                            # Distance component (normalized, closer is better)
+                            dist_score = max(0, 1.0 - (center_dist / adaptive_threshold))
+
+                            # Time component (recent is better)
+                            time_score = time_factor
+
+                            # Weighted combination
+                            match_score = (iou_score * 0.5 + dist_score * 0.3 + time_score * 0.2)
+
+                            # Decision criteria (require minimum score)
+                            if match_score > 0.3 and match_score > best_match_score:
+                                best_match_score = match_score
                                 spatial_match_pid = pid_to_check
 
                         if spatial_match_pid is not None:
-                            # MEKANSAL EŞLEŞME BULUNDU! Faiss'e sorma.
+                            # SPATIAL MATCH FOUND!
                             self.track_id_to_permanent_id_map[track_id] = spatial_match_pid
-                            label, color = f"P{spatial_match_pid} (Re-Acquired)", (0, 255, 128)  # Yeniden yakalandı rengi
+                            label = f"P{spatial_match_pid} (ReAcq:{best_match_score:.2f})"
+                            color = (0, 255, 128)  # Greenish for re-acquired
 
-                            # Buffer'dan çıkar (artık kayıp değil) ve son konumu güncelle
+                            # Remove from lost buffer and update position
                             del self.lost_pid_buffer[spatial_match_pid]
                             self.last_known_box_for_pid[spatial_match_pid] = box
-                            print(f"DEBUG: P{spatial_match_pid} spatially re-acquired by T{track_id}.")
+                            print(f"DEBUG: P{spatial_match_pid} spatially re-acquired by T{track_id}. "
+                                  f"Match score: {best_match_score:.2f}")
                         else:
                             match_id, match_sim = self.find_best_match(current_vector)
 
@@ -810,18 +924,35 @@ class PersonTrackerApp:
                 for tid in disappeared_track_ids:
                     pid = self.track_id_to_permanent_id_map.pop(tid, None)  # Eşleşmeyi kaldır
                     if pid:
-                        # 'recent_vector_buffers'dan SİLME!
-
-                        # 'lost' buffer'ına ekle
+                        # 'lost' buffer'ına ekle with enhanced info
                         if pid in self.last_known_box_for_pid:
+                            last_box = self.last_known_box_for_pid[pid]
+
+                            # Calculate velocity if we have previous position
+                            velocity = [0, 0]  # [vx, vy] in pixels/second
+                            if pid in self.lost_pid_buffer:
+                                # Person was lost before, calculate velocity from last known movement
+                                prev_data = self.lost_pid_buffer[pid]
+                                prev_box = prev_data["last_box"]
+                                time_diff = now - prev_data["disappear_time"]
+
+                                if time_diff > 0:
+                                    prev_center = self.get_box_center(prev_box)
+                                    curr_center = self.get_box_center(last_box)
+                                    velocity = [
+                                        (curr_center[0] - prev_center[0]) / time_diff,
+                                        (curr_center[1] - prev_center[1]) / time_diff
+                                    ]
+
                             self.lost_pid_buffer[pid] = {
                                 "disappear_time": now,
-                                "last_box": self.last_known_box_for_pid[pid]
+                                "last_box": last_box,
+                                "velocity": velocity  # NEW: motion info
                             }
-                            # print(f"DEBUG: P{pid} lost, added to short-term memory.") # İsteğe bağlı debug
                         else:
                             # Bu pid için hiç kutu kaydedilmemişse (nadir durum), direkt sil
-                            if pid in self.recent_vector_buffers: del self.recent_vector_buffers[pid]
+                            if pid in self.recent_vector_buffers:
+                                del self.recent_vector_buffers[pid]
 
                 # Hafıza süresi (TTL) dolan 'pid'leri bul
                 stale_lost_pids = [pid for pid, data in self.lost_pid_buffer.items() if
