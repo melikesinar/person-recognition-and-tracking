@@ -66,6 +66,13 @@ class PersonTrackerApp:
         self.lost_pid_buffer = {}
         self.last_known_box_for_pid = {}
         self.next_permanent_id = 1
+        self.index_build_in_progress = False
+        self.pending_enrollments = []  # Yeni enrollment'ları topla
+        self.last_index_rebuild = time.time()
+        self.MIN_REBUILD_INTERVAL = 30  # En az 30 saniyede bir rebuild
+        self.BATCH_SIZE_TRIGGER = 5  # 5 yeni kişi eklenince rebuild
+
+        self.stop_event = threading.Event()
 
         # These will be modified by keyboard presses
         self.current_match_threshold = MATCH_SIMILARITY_THRESHOLD
@@ -112,99 +119,82 @@ class PersonTrackerApp:
         else:
             print("SUCCESS: Re-ID MODEL LOADED.")
 
-        self.stop_event = threading.Event()
-        self.rebuild_interval_seconds = 10  # 10 saniyede bir yeniden oluştur
-        self.rebuilder_thread = threading.Thread(target=self.periodic_rebuild_worker, daemon=True)
-
         # --- Load Data ---
         self.load_db()
 
-        # Thread'i DB yüklendikten SONRA başlat
-        self.rebuilder_thread.start()
-
     def rebuild_faiss_index(self):
         """
-        Rebuilds the in-memory Faiss index from the local DB cache in a thread-safe manner
-        using a fast HNSW index.
+        Builds a new HNSW Faiss index WITHOUT locking.
+        Uses atomic swap for minimal disruption.
         """
+        print("Building new HNSW Faiss index (non-blocking)...")
+
+        # 1. Veriyi topla (lock ALMADAN)
+        all_vectors = []
+        temp_pid_map = []
+
+        # known_persons_db'yi kopyala (thread-safe)
+        db_snapshot = dict(self.known_persons_db)  # Shallow copy yeterli
+
+        sorted_pids = sorted(db_snapshot.keys())
+        for pid in sorted_pids:
+            data = db_snapshot[pid]
+            # SADECE master_vector kullan (2x vector yaklaşımını bırakıyoruz)
+            all_vectors.append(data['master_vector'])
+            temp_pid_map.append(pid)
+
+        # 2. Yeni index oluştur (lock OLMADAN)
+        new_index = faiss.IndexHNSWFlat(VECTOR_DIMENSION, 48, faiss.METRIC_INNER_PRODUCT)
+        new_index.hnsw.efConstruction = 200
+        new_index.hnsw.efSearch = 64
+
+        if not all_vectors:
+            print("No vectors to index. HNSW index initialized empty.")
+            # Atomic swap için lock AL
+            with self.faiss_lock:
+                self.faiss_index = new_index
+                self.index_to_pid_map = []
+
+            # MongoDB'den sil
+            try:
+                self.faiss_collection.delete_one({"name": FAISS_INDEX_KEY})
+            except Exception as e:
+                print(f"!!!! FAISS (empty) index delete error !!!!: {e}")
+            return
+
+        # 3. Index'i train ve populate et (lock OLMADAN)
+        vector_matrix = np.stack(all_vectors, axis=0).astype('float32')
+        new_index.train(vector_matrix)
+        new_index.add(vector_matrix)
+
+        print(f"New HNSW index built with {new_index.ntotal} vectors. Preparing atomic swap...")
+
+        # 4. ATOMIC SWAP (kritik bölge, çok kısa sürecek)
         with self.faiss_lock:
-            print("Rebuilding HNSW Faiss index...")
+            old_index = self.faiss_index  # Referansı sakla (GC için)
+            self.faiss_index = new_index
+            self.index_to_pid_map = temp_pid_map
+            print(f"✓ Index swapped atomically. Active vectors: {self.faiss_index.ntotal}")
 
-            all_vectors = []
+        # 5. MongoDB'ye kaydet (lock OLMADAN, arka planda)
+        try:
+            faiss.write_index(new_index, TEMP_FAISS_FILENAME)
+            with open(TEMP_FAISS_FILENAME, "rb") as f:
+                index_buffer = f.read()
+            self.faiss_collection.update_one(
+                {"name": FAISS_INDEX_KEY},
+                {"$set": {"index_data": Binary(index_buffer), "last_updated": datetime.now()}},
+                upsert=True
+            )
+            print(f"✓ HNSW Faiss index persisted to MongoDB.")
+        except Exception as e:
+            print(f"!!!! FAISS SAVE ERROR (non-critical) !!!!: {e}")
+        finally:
+            if os.path.exists(TEMP_FAISS_FILENAME):
+                os.remove(TEMP_FAISS_FILENAME)
 
-            temp_pid_map = []
-
-            sorted_pids = sorted(self.known_persons_db.keys())
-            for pid in sorted_pids:
-                data = self.known_persons_db[pid]
-
-                all_vectors.append(data['master_vector'])
-                temp_pid_map.append(pid)  # 0. vektör -> bu pid
-
-                all_vectors.append(data.get('recent_master_vector', data['master_vector']))
-                temp_pid_map.append(pid)  # 1. vektör -> bu pid
-
-            # HNSW indeksi oluştur (M=32, HNSW için standart bir parametredir)
-            base_index = faiss.IndexHNSWFlat(VECTOR_DIMENSION, 32, faiss.METRIC_INNER_PRODUCT)
-            # Performans için ayar:
-            base_index.hnsw.efConstruction = 40
-
-            if not all_vectors:
-                print("No vectors to index. HNSW index initialized empty.")
-                self.faiss_index = base_index  # Boş ama geçerli bir HNSW indeksi
-                self.index_to_pid_map = []  # Harita da boş
-
-                try:
-                    self.faiss_collection.delete_one({"name": FAISS_INDEX_KEY})
-                except Exception as e:
-                    print(f"!!!! FAISS (empty) index delete error !!!!: {e}")
-                return  # Bitti
-
-            vector_matrix = np.stack(all_vectors, axis=0).astype('float32')
-
-            # HNSW indeksini "eğit" (veriyi nasıl organize edeceğini öğrenir)
-            base_index.train(vector_matrix)
-            # Veriyi ekle
-            base_index.add(vector_matrix)
-
-            # Ana nesneleri ata
-            self.faiss_index = base_index
-            self.index_to_pid_map = temp_pid_map  # Haritayı güncelle
-
-            print(f"HNSW Faiss index rebuilt successfully with {self.faiss_index.ntotal} vectors.")
-
-            try:
-                faiss.write_index(self.faiss_index, TEMP_FAISS_FILENAME)
-                with open(TEMP_FAISS_FILENAME, "rb") as f:
-                    index_buffer = f.read()
-                self.faiss_collection.update_one(
-                    {"name": FAISS_INDEX_KEY},
-                    {"$set": {"index_data": Binary(index_buffer), "last_updated": datetime.now()}},
-                    upsert=True
-                )
-                print(f"HNSW Faiss index saved to MongoDB ('{MONGO_FAISS_COLLECTION_NAME}').")
-            except Exception as e:
-                print(f"!!!! FAISS SAVE ERROR !!!!: {e}")
-            finally:
-                if os.path.exists(TEMP_FAISS_FILENAME):
-                    os.remove(TEMP_FAISS_FILENAME)
-
-    def periodic_rebuild_worker(self):
-        """
-        A background thread worker that periodically rebuilds the Faiss HNSW index
-        to ensure it stays in sync with the database cache.
-        """
-        print(f"Background Faiss rebuilder started. Interval: {self.rebuild_interval_seconds} seconds.")
-        while not self.stop_event.wait(self.rebuild_interval_seconds):
-            print("\n--- PERIODIC REBUILD TRIGGERED ---")
-            try:
-                # 'rebuild_faiss_index' zaten thread-safe (faiss_lock kullanıyor)
-                self.rebuild_faiss_index()
-            except Exception as e:
-                print(f"!!!! PERIODIC REBUILD FAILED !!!!: {e}")
-            print("--- PERIODIC REBUILD FINISHED ---\n")
-
-        print("Background Faiss rebuilder stopping.")
+        # Artık old_index garbage collected olacak
+        self.index_build_in_progress = False
 
     def calculate_sharpness(self, image):
         """Calculates the sharpness of an image using Laplacian variance."""
@@ -227,8 +217,7 @@ class PersonTrackerApp:
                     pid = doc['permanent_id']
                     self.known_persons_db[pid] = {
                         "master_vector": np.frombuffer(doc['master_vector'], dtype=np.float32),
-                        "recent_master_vector": np.frombuffer(doc.get('recent_master_vector', doc['master_vector']),
-                                                              dtype=np.float32),
+                        # recent_master_vector ARTIK YOK
                         "count": doc['count'],
                         "created": doc['created']
                     }
@@ -239,6 +228,7 @@ class PersonTrackerApp:
                 print("No person records found in MongoDB. Starting fresh.")
                 self.next_permanent_id = 1
 
+            # Faiss index loading aynı kalıyor (sadece ntotal check değişecek)
             index_doc = self.faiss_collection.find_one({"name": FAISS_INDEX_KEY})
             if index_doc and 'index_data' in index_doc:
                 print("Loading Faiss index from MongoDB...")
@@ -248,23 +238,24 @@ class PersonTrackerApp:
                         f.write(index_buffer)
                     loaded_index = faiss.read_index(TEMP_FAISS_FILENAME)
 
-                    # HNSW için efSearch ayarı (arama hızı/doğruluk dengesi)
                     if hasattr(loaded_index, 'hnsw'):
                         loaded_index.hnsw.efSearch = 64
 
-                    if loaded_index.ntotal != len(self.known_persons_db) * 2:
+                    # ARTIK 1x vector per person
+                    if loaded_index.ntotal != len(self.known_persons_db):
                         print("Faiss index is stale (vector count mismatch). Rebuilding...")
                         raise ValueError("Index stale")
+
                     with self.faiss_lock:
                         self.faiss_index = loaded_index
-                        # Manuel haritayı da yeniden oluştur
+                        # Manuel haritayı yeniden oluştur
                         print("Rebuilding index-to-pid map from loaded DB...")
                         temp_pid_map = []
                         sorted_pids = sorted(self.known_persons_db.keys())
                         for pid in sorted_pids:
-                            temp_pid_map.append(pid)  # master_vector
-                            temp_pid_map.append(pid)  # recent_master_vector
+                            temp_pid_map.append(pid)  # Sadece master_vector
                         self.index_to_pid_map = temp_pid_map
+
                     print("Faiss index loaded successfully from MongoDB.")
                 except Exception as e:
                     print(f"Failed to load Faiss index from MongoDB ({e}), rebuilding...")
@@ -294,55 +285,94 @@ class PersonTrackerApp:
     def enroll_person(self, vectors):
         """
         Enrolls a new person into the MongoDB and local cache.
-        The HNSW index is NOT updated here; it is updated by a periodic rebuilder.
+        Triggers index rebuild if batch size reached.
         """
-        if not vectors: raise ValueError("No vectors provided to enroll.")
+        if not vectors:
+            raise ValueError("No vectors provided to enroll.")
+
         master = self.l2_normalize(np.mean(np.stack(vectors, axis=0), axis=0))
         current_dt = datetime.now()
+        new_pid = self.next_permanent_id
 
-        new_pid = self.next_permanent_id  # ID'yi önce alalım
+        new_person_doc = {
+            "permanent_id": new_pid,
+            "master_vector": Binary(master.tobytes()),
+            # recent_master_vector ARTIK YOK
+            "count": len(vectors),
+            "created": current_dt,
+            "last_seen": current_dt
+        }
 
-        new_person_doc = {"permanent_id": new_pid, "master_vector": Binary(master.tobytes()),
-                          "recent_master_vector": Binary(master.tobytes()), "count": len(vectors),
-                          "created": current_dt, "last_seen": current_dt}
         try:
             self.persons_collection.insert_one(new_person_doc)
             print(f"MongoDB INSERT: New person (P{new_pid}) added.")
         except Exception as e:
             print(f"!!!! MongoDB INSERT ERROR !!!!: {e}")
-            return None  # Hata varsa ID döndürme
+            return None
 
-        # Yeni kişiyi lokal DB'ye ekle
-        self.known_persons_db[new_pid] = {"master_vector": master, "recent_master_vector": master,
-                                          "count": len(vectors), "created": current_dt}
+        # Lokal DB'ye ekle
+        self.known_persons_db[new_pid] = {
+            "master_vector": master,
+            "count": len(vectors),
+            "created": current_dt
+        }
 
-        print(f"CACHE ADD: P{new_pid} önbelleğe eklendi. (İndekse {self.rebuild_interval_seconds}sn içinde eklenecek)")
-
+        print(f"CACHE ADD: P{new_pid} added to cache.")
         self.next_permanent_id += 1
-        return new_pid  # Başarılı kayıtta yeni ID'yi döndür
+
+        # Pending enrollments'a ekle
+        self.pending_enrollments.append(new_pid)
+
+        # Batch size'a ulaştıysak VEYA yeterli zaman geçtiyse rebuild tetikle
+        time_since_rebuild = time.time() - self.last_index_rebuild
+        should_rebuild = (
+                len(self.pending_enrollments) >= self.BATCH_SIZE_TRIGGER or
+                time_since_rebuild > self.MIN_REBUILD_INTERVAL
+        )
+
+        if should_rebuild and not self.index_build_in_progress:
+            print(f"Triggering index rebuild (pending: {len(self.pending_enrollments)})")
+            self.index_build_in_progress = True
+            self.pending_enrollments.clear()
+            self.last_index_rebuild = time.time()
+
+            # Arka planda rebuild (non-blocking)
+            rebuild_thread = threading.Thread(target=self.rebuild_faiss_index, daemon=True)
+            rebuild_thread.start()
+
+        return new_pid
 
     def incremental_update(self, perm_id, new_vector):
         """
-        Updates vectors in DB cache.
-        The HNSW Faiss index is NOT updated here; it is updated by a periodic rebuilder.
+        Updates master vector in DB cache using EMA (Exponential Moving Average).
+        Index rebuild is handled separately in batches.
         """
         entry = self.known_persons_db.get(perm_id)
-        if entry is None: return
+        if entry is None:
+            return
+
         n = entry.get("count", 1)
         mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
+
+        # Recent vector buffer'ı kullan (ancak index'e eklemeden)
         buffer = self.recent_vector_buffers[perm_id]
         buffer.append(new_vector)
-        updated_recent_master = self.l2_normalize(np.mean(buffer, axis=0))
-        mongo_update_doc["$set"]["recent_master_vector"] = Binary(updated_recent_master.tobytes())
-        entry["recent_master_vector"] = updated_recent_master
+
+        # Vector update (MAX_VECTORS_FOR_UPDATE limitine kadar)
         if n < MAX_VECTORS_FOR_UPDATE:
             master = entry["master_vector"]
-            updated_master = self.l2_normalize((n * master + new_vector) / (n + 1))
+
+            # EMA with confidence weighting (daha stabil updates)
+            alpha = 0.1  # Learning rate
+            updated_master = self.l2_normalize((1 - alpha) * master + alpha * new_vector)
+
             new_count = n + 1
             mongo_update_doc["$set"]["master_vector"] = Binary(updated_master.tobytes())
             mongo_update_doc["$set"]["count"] = new_count
+
             entry["master_vector"] = updated_master
             entry["count"] = new_count
+
             if new_count == MAX_VECTORS_FOR_UPDATE:
                 print(f"INFO: Person P{perm_id} vector locked after {new_count} updates.")
 
@@ -352,23 +382,26 @@ class PersonTrackerApp:
             print(f"!!!! MongoDB UPDATE ERROR (P{perm_id}) !!!!: {e}")
 
     def find_best_match(self, query_vector):
-        """Performs a fast, thread-safe similarity search using the HNSW Faiss index."""
+        """
+        Performs a fast, thread-safe similarity search using the HNSW Faiss index.
+        Now uses only SINGLE vector per person.
+        """
         with self.faiss_lock:
-            # self.index_to_pid_map'in de dolu olduğunu kontrol et
             if self.faiss_index is None or self.faiss_index.ntotal == 0 or not self.index_to_pid_map:
                 return None, -1.0
+
             try:
                 query_vector_2d = query_vector.reshape(1, -1).astype('float32')
                 D, I = self.faiss_index.search(query_vector_2d, k=1)
                 best_similarity = D[0][0]
+
                 if best_similarity >= self.current_match_threshold:
-                    # Bu sıra numarasını manuel haritamızdan PID'ye çeviriyoruz.
                     matched_index_position = I[0][0]
                     matched_pid = self.index_to_pid_map[matched_index_position]
-
                     return matched_pid, best_similarity
             except Exception as e:
                 print(f"!!!! FAISS (HNSW) SEARCH ERROR !!!!: {e}")
+
         return None, -1.0
 
     def extract_embeddings_from_crops(self, crops):
@@ -724,8 +757,7 @@ class PersonTrackerApp:
 
     def cleanup(self):
         """Releases all resources when the application closes."""
-        self.stop_event.set()  # Arka plan thread'ine durmasını söyle
-
+        self.stop_event.set()
         print("Cleaning up and exiting...")
         cv2.destroyAllWindows()
         self.mongo_client.close()
