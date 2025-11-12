@@ -74,6 +74,11 @@ class PersonTrackerApp:
 
         self.stop_event = threading.Event()
 
+        self.db_write_queue = queue.Queue()  # Thread-safe queue
+        self.db_writer_thread = threading.Thread(target=self._db_writer_worker, daemon=True)
+        self.db_writer_thread.start()
+        print("Async database writer started.")
+
         # These will be modified by keyboard presses
         self.current_match_threshold = MATCH_SIMILARITY_THRESHOLD
         self.current_detection_threshold = DETECTION_SCORE_THRESHOLD
@@ -508,12 +513,12 @@ class PersonTrackerApp:
             "last_seen": current_dt
         }
 
-        try:
-            self.persons_collection.insert_one(new_person_doc)
-            print(f"MongoDB INSERT: New person (P{new_pid}) added.")
-        except Exception as e:
-            print(f"!!!! MongoDB INSERT ERROR !!!!: {e}")
-            return None
+        # Async database insert (non-blocking)
+        self.db_write_queue.put({
+            "type": "insert",
+            "doc": new_person_doc
+        })
+        print(f"MongoDB INSERT: New person (P{new_pid}) queued for async write.")
 
         # Lokal DB'ye ekle
         self.known_persons_db[new_pid] = {
@@ -617,10 +622,13 @@ class PersonTrackerApp:
             if new_count == MAX_VECTORS_FOR_UPDATE:
                 print(f"INFO: Person P{perm_id} vector locked after {new_count} updates.")
 
-        try:
-            self.persons_collection.update_one({"permanent_id": int(perm_id)}, mongo_update_doc)
-        except Exception as e:
-            print(f"!!!! MongoDB UPDATE ERROR (P{perm_id}) !!!!: {e}")
+        # Async database update (non-blocking)
+        self.db_write_queue.put({
+            "type": "update",
+            "pid": perm_id,
+            "update_doc": mongo_update_doc
+        })
+        # Log yok (çok sık çağrılıyor, spam önlemek için)
 
     def find_best_match(self, query_vector):
         """
@@ -996,8 +1004,6 @@ class PersonTrackerApp:
             self.frame_queue.put(None)
             return 'q'
 
-        # --- NEW: Live Tuning Keyboard Controls ---
-
         # Detection Threshold (U=Up, J=Down)
         elif key == ord('u'):
             self.current_detection_threshold = min(1.0, self.current_detection_threshold + 0.05)
@@ -1014,16 +1020,10 @@ class PersonTrackerApp:
             self.current_match_threshold = max(0.0, self.current_match_threshold - 0.05)
             print(f"Match Threshold set to: {self.current_match_threshold:.2f}")
 
-        # --- END NEW ---
-
         elif key == ord('r'):
-            print("RESET: Deleting all entries from MongoDB...")
-            try:
-                self.persons_collection.delete_many({})
-                self.faiss_collection.delete_many({})
-                print("MongoDB collections have been cleared.")
-            except Exception as e:
-                print(f"!!!! MongoDB RESET ERROR !!!!: {e}")
+            print("RESET: Queuing MongoDB clear operation...")
+            # Async database reset
+            self.db_write_queue.put({"type": "reset"})
             self.known_persons_db.clear()
             self.next_permanent_id = 1
             self.active_track_buffers.clear()
@@ -1048,12 +1048,18 @@ class PersonTrackerApp:
                     print(f"  - P{pid}: {data['count']} vectors, Created: {created_date}")
                 print("------------------\n")
 
+
         elif key == ord('k'):
             if self.known_persons_db:
                 try:
                     last_id = max(self.known_persons_db.keys())
-                    self.persons_collection.delete_one({"permanent_id": int(last_id)})
-                    print(f"DELETED (k): P{last_id} deleted from MongoDB.")
+
+                    # Async database delete
+                    self.db_write_queue.put({
+                        "type": "delete",
+                        "pid": last_id
+                    })
+                    print(f"DELETED (k): P{last_id} delete queued.")
                     del self.known_persons_db[last_id]
 
                     if last_id in self.recent_vector_buffers:
@@ -1077,10 +1083,92 @@ class PersonTrackerApp:
     def cleanup(self):
         """Releases all resources when the application closes."""
         self.stop_event.set()
+
         print("Cleaning up and exiting...")
+
+        # Gracefully shutdown async DB writer
+        print("Waiting for pending database writes to complete...")
+        self.db_write_queue.put(None)  # Poison pill
+        self.db_writer_thread.join(timeout=5.0)  # Max 5 saniye bekle
+
+        if self.db_writer_thread.is_alive():
+            print("WARNING: Database writer thread did not exit cleanly.")
+        else:
+            print("Database writer thread exited cleanly.")
+
         cv2.destroyAllWindows()
         self.mongo_client.close()
         print(f"Exited cleanly. DB entries in cache: {len(self.known_persons_db)}")
+
+    def _db_writer_worker(self):
+        """
+        Background thread that processes database write operations asynchronously.
+        Prevents main thread blocking during MongoDB writes.
+        """
+        print("Database writer thread started...")
+
+        while not self.stop_event.is_set():
+            try:
+                # Timeout ile al (1 saniye), böylece stop_event kontrol edilir
+                operation = self.db_write_queue.get(timeout=1.0)
+
+                if operation is None:  # Poison pill (shutdown signal)
+                    print("Database writer thread stopping...")
+                    break
+
+                op_type = operation.get("type")
+
+                # INSERT operation
+                if op_type == "insert":
+                    doc = operation["doc"]
+                    try:
+                        self.persons_collection.insert_one(doc)
+                        pid = doc["permanent_id"]
+                        print(f"[ASYNC] MongoDB INSERT: P{pid} completed.")
+                    except Exception as e:
+                        print(f"!!!! [ASYNC] MongoDB INSERT ERROR !!!!: {e}")
+
+                # UPDATE operation
+                elif op_type == "update":
+                    pid = operation["pid"]
+                    update_doc = operation["update_doc"]
+                    try:
+                        self.persons_collection.update_one(
+                            {"permanent_id": int(pid)},
+                            update_doc
+                        )
+                        # Sessiz güncelleme (spam önlemek için log yok)
+                    except Exception as e:
+                        print(f"!!!! [ASYNC] MongoDB UPDATE ERROR (P{pid}) !!!!: {e}")
+
+                # DELETE operation
+                elif op_type == "delete":
+                    pid = operation["pid"]
+                    try:
+                        self.persons_collection.delete_one({"permanent_id": int(pid)})
+                        print(f"[ASYNC] MongoDB DELETE: P{pid} completed.")
+                    except Exception as e:
+                        print(f"!!!! [ASYNC] MongoDB DELETE ERROR (P{pid}) !!!!: {e}")
+
+                # RESET operation
+                elif op_type == "reset":
+                    try:
+                        self.persons_collection.delete_many({})
+                        self.faiss_collection.delete_many({})
+                        print("[ASYNC] MongoDB RESET completed.")
+                    except Exception as e:
+                        print(f"!!!! [ASYNC] MongoDB RESET ERROR !!!!: {e}")
+
+                else:
+                    print(f"!!!! Unknown DB operation type: {op_type} !!!!")
+
+            except queue.Empty:
+                # Timeout, devam et
+                continue
+            except Exception as e:
+                print(f"!!!! [ASYNC] DB writer unexpected error !!!!: {e}")
+
+        print("Database writer thread exited.")
 
 
 # --- Start the Application ---
