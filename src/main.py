@@ -874,10 +874,14 @@ class PersonTrackerApp:
         detector_thread = threading.Thread(target=self.detector_worker, daemon=True)
         detector_thread.start()
 
-        cap = cv2.VideoCapture(0)  # Assumes default camera
+        cap = cv2.VideoCapture("7.mp4")  # Assumes default camera
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
+
+        WINDOW_NAME = "ReID Vectors (MongoDB - Faiss)"
+        cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
         with torch.inference_mode():
             detections = np.empty((0, 6), dtype=np.float32)
@@ -892,7 +896,14 @@ class PersonTrackerApp:
 
                 frame_count += 1
                 current_time = time.time()
-                fps = 1 / (current_time - prev_time) if prev_time > 0 else 0
+
+                # Eşiği 0.0001 saniye olarak belirleyelim
+                time_diff = current_time - prev_time
+                if time_diff > 0.0001:
+                    fps = 1.0 / time_diff
+                else:
+                    fps = 0.0  # Veya son bilinen FPS değerini koruyun
+
                 prev_time = current_time
 
                 # --- 1. Detection (Asynchronous Input) ---
