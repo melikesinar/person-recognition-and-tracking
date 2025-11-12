@@ -88,6 +88,9 @@ class PersonTrackerApp:
         self.recent_vector_buffers = defaultdict(lambda: deque(maxlen=RECENT_VECTOR_BUFFER_SIZE))
         self.last_update_time_for_pid = defaultdict(float)
         self.UPDATE_INTERVAL = 1.0  # 1 second
+        self.BUFFER_CLEANUP_INTERVAL = 60.0  # Her 60 saniyede cleanup
+        self.BUFFER_MAX_IDLE_TIME = 3600.0  # 1 saat görunmeyen bufferi sil
+        self.last_buffer_cleanup = time.time()
 
         # --- Database Connection ---
         try:
@@ -341,6 +344,42 @@ class PersonTrackerApp:
             rebuild_thread.start()
 
         return new_pid
+
+    def cleanup_stale_buffers(self, current_time):
+        """
+        Cleans up stale buffers for persons that haven't been seen recently.
+        Prevents memory leaks in long-running deployments.
+        """
+        stale_pids = []
+
+        # 1. recent_vector_buffers cleanup
+        for pid in list(self.recent_vector_buffers.keys()):
+            # Check if PID still exists in DB
+            if pid not in self.known_persons_db:
+                stale_pids.append(pid)
+            # Or check last seen time
+            elif (current_time - self.last_update_time_for_pid.get(pid, 0)) > self.BUFFER_MAX_IDLE_TIME:
+                stale_pids.append(pid)
+
+        # 2. last_update_time_for_pid cleanup
+        for pid in list(self.last_update_time_for_pid.keys()):
+            if pid not in self.known_persons_db:
+                if pid not in stale_pids:  # Avoid duplicates
+                    stale_pids.append(pid)
+
+        # 3. Remove all stale entries
+        if stale_pids:
+            for pid in stale_pids:
+                if pid in self.recent_vector_buffers:
+                    del self.recent_vector_buffers[pid]
+                if pid in self.last_update_time_for_pid:
+                    del self.last_update_time_for_pid[pid]
+                # last_known_box_for_pid de temizlenebilir (opsiyonel)
+                if pid in self.last_known_box_for_pid:
+                    del self.last_known_box_for_pid[pid]
+
+            print(f"BUFFER CLEANUP: Removed {len(stale_pids)} stale buffer(s). "
+                  f"Active buffers: {len(self.recent_vector_buffers)}")
 
     def incremental_update(self, perm_id, new_vector):
         """
@@ -625,7 +664,6 @@ class PersonTrackerApp:
                 for tid in stale_active_tracks:
                     del self.active_track_buffers[tid]
 
-                # --- YENİ (ADIM 8.E): Kaybolan 'pid'leri anında silmek yerine 'kayıp' buffer'ına taşı ---
                 disappeared_track_ids = [tid for tid in self.track_id_to_permanent_id_map if
                                          tid not in current_frame_track_ids]
 
@@ -645,7 +683,6 @@ class PersonTrackerApp:
                             # Bu pid için hiç kutu kaydedilmemişse (nadir durum), direkt sil
                             if pid in self.recent_vector_buffers: del self.recent_vector_buffers[pid]
 
-                # --- YENİ (ADIM 8.E): 'Kayıp' buffer'ını temizle ---
                 # Hafıza süresi (TTL) dolan 'pid'leri bul
                 stale_lost_pids = [pid for pid, data in self.lost_pid_buffer.items() if
                                    (now - data["disappear_time"]) > SHORT_TERM_MEMORY_TTL]
@@ -660,7 +697,10 @@ class PersonTrackerApp:
                     if pid in self.last_known_box_for_pid:
                         del self.last_known_box_for_pid[pid]
 
-                # --- NEW: Draw the HUD (Heads-Up Display) ---
+                if (now - self.last_buffer_cleanup) > self.BUFFER_CLEANUP_INTERVAL:
+                    self.cleanup_stale_buffers(now)
+                    self.last_buffer_cleanup = now
+
                 hud_text1 = f"FPS: {fps:.1f} | Detection (U/J): {self.current_detection_threshold:.2f}"
                 hud_text2 = f"Match (Y/H): {self.current_match_threshold:.2f} | DB Size: {len(self.known_persons_db)}"
 
@@ -670,7 +710,6 @@ class PersonTrackerApp:
                 # Draw the text
                 cv2.putText(frame, hud_text1, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 cv2.putText(frame, hud_text2, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                # --- END NEW ---
 
                 cv2.imshow("ReID Vectors (MongoDB - Faiss)", frame)
 
@@ -720,6 +759,8 @@ class PersonTrackerApp:
             self.track_id_to_permanent_id_map.clear()
             self.lost_pid_buffer.clear()
             self.last_known_box_for_pid.clear()
+            self.recent_vector_buffers.clear()
+            self.last_update_time_for_pid.clear()
             self.rebuild_faiss_index()
             print("Program memory (cache and index) has been cleared.")
 
@@ -743,10 +784,17 @@ class PersonTrackerApp:
                     self.persons_collection.delete_one({"permanent_id": int(last_id)})
                     print(f"DELETED (k): P{last_id} deleted from MongoDB.")
                     del self.known_persons_db[last_id]
+
+                    if last_id in self.recent_vector_buffers:
+                        del self.recent_vector_buffers[last_id]
+                    if last_id in self.last_update_time_for_pid:
+                        del self.last_update_time_for_pid[last_id]
+                    if last_id in self.last_known_box_for_pid:
+                        del self.last_known_box_for_pid[last_id]
+
                     self.active_track_buffers.clear()
                     self.track_id_to_permanent_id_map.clear()
                     self.lost_pid_buffer.clear()
-                    self.last_known_box_for_pid.clear()
                     self.rebuild_faiss_index()
                     print(f"DELETED (k): P{last_id} deleted from local cache. Index rebuilt.")
                 except Exception as e:
