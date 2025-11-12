@@ -45,7 +45,7 @@ RECENT_VECTOR_BUFFER_SIZE = int(os.getenv("RECENT_VECTOR_BUFFER_SIZE", "50"))
 DETECTION_INTERVAL = int(os.getenv("DETECTION_INTERVAL", "2"))  # Run detection every N frames
 REID_INPUT_SIZE = (128, 256)
 VECTOR_DIMENSION = 512
-SHORT_TERM_MEMORY_TTL = 2.0  # Time in seconds a lost PID stays in buffer
+SHORT_TERM_MEMORY_TTL = 4.0  # Time in seconds a lost PID stays in buffer
 SPATIAL_MATCH_THRESHOLD = 150  # Deprecated, now adaptive
 
 
@@ -532,7 +532,7 @@ class PersonTrackerApp:
         bbox_diag = np.sqrt(bbox_width ** 2 + bbox_height ** 2)
 
         # Threshold is proportional to diagonal size (0.5x, capped at 200, min 30)
-        threshold = min(bbox_diag * 0.5, 200.0)
+        threshold = min(bbox_diag * 0.75, 200.0)
         threshold = max(threshold, 30.0)
 
         return threshold
@@ -874,7 +874,7 @@ class PersonTrackerApp:
         detector_thread = threading.Thread(target=self.detector_worker, daemon=True)
         detector_thread.start()
 
-        cap = cv2.VideoCapture("7.mp4")  # Assumes default camera
+        cap = cv2.VideoCapture("../videos/3.mp4")  # Assumes default camera
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
@@ -1005,7 +1005,7 @@ class PersonTrackerApp:
                             dist_score = max(0, 1.0 - (center_dist / adaptive_threshold))
                             time_score = time_factor
 
-                            match_score = (iou_score * 0.5 + dist_score * 0.3 + time_score * 0.2)
+                            match_score = (iou_score * 0.4 + dist_score * 0.4 + time_score * 0.2)
 
                             if match_score > 0.3 and match_score > best_match_score:
                                 best_match_score = match_score
