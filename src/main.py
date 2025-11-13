@@ -19,6 +19,7 @@ from database.async_writer import AsyncDBWriter
 from tracking.person_manager import PersonManager
 from tracking.spatial_matcher import SpatialMatcher
 from tracking.buffer_manager import BufferManager
+from utils.visualizer import Visualizer
 
 # Validate configuration
 Config.validate()
@@ -77,6 +78,7 @@ class PersonTrackerApp:
         self.spatial_matcher = SpatialMatcher()
         self.buffer_manager = BufferManager()
         self.quality_checker = QualityChecker()
+        self.visualizer = Visualizer()
 
         # --- Thread Communication (for detector) ---
         self.frame_queue = queue.Queue(maxsize=1)
@@ -393,9 +395,9 @@ class PersonTrackerApp:
                     x1, y1, x2, y2 = map(int, box)
                     h, w, _ = frame.shape
                     # Boundary clamping
-                    x1 = max(0, min(w - 1, x1));
+                    x1 = max(0, min(w - 1, x1))
                     x2 = max(0, min(w - 1, x2))
-                    y1 = max(0, min(h - 1, y1));
+                    y1 = max(0, min(h - 1, y1))
                     y2 = max(0, min(h - 1, y2))
                     if x2 <= x1 or y2 <= y1: continue
                     crop = frame[y1:y2, x1:x2]
@@ -511,8 +513,7 @@ class PersonTrackerApp:
                                         buf["quality_scores"].clear()
 
                     # Draw bounding box and label
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    self.visualizer.draw_person_bbox(frame, (x1, y1, x2, y2), label, color)
 
                 # --- 5. Cleanup ---
                 now = time.time()
@@ -542,18 +543,15 @@ class PersonTrackerApp:
                 if self.buffer_manager.should_run_cleanup(now):
                     self.cleanup_stale_buffers(now)
 
-                # Display HUD (Head-Up Display) information
-                tta_indicator = "TTA:ON" if self.USE_TTA else "TTA:OFF"
-
-                hud_text1 = f"FPS: {fps:.1f} | Detection (U/J): {self.current_detection_threshold:.2f}"
-                hud_text2 = f"Match (Y/H): {self.current_match_threshold:.2f} | DB: {len(self.known_persons_db)} | {tta_indicator}"
-
-                # Draw background rectangle for readability
-                cv2.rectangle(frame, (5, 5), (450, 60), (0, 0, 0), -1)
-
-                # Draw the text
-                cv2.putText(frame, hud_text1, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(frame, hud_text2, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # Display HUD
+                self.visualizer.draw_hud(
+                    frame,
+                    fps,
+                    self.current_detection_threshold,
+                    self.current_match_threshold,
+                    len(self.known_persons_db),
+                    self.USE_TTA
+                )
 
                 cv2.imshow("ReID Vectors (MongoDB - Faiss)", frame)
 
@@ -619,7 +617,7 @@ class PersonTrackerApp:
                     created_date = created_date.strftime("%Y-%m-%d %H:%M:%S")
                 print(f"  - P{pid}: {data['count']} vectors, Created: {created_date}")
             print("------------------\n")
-
+            return key
 
         elif key == ord('k'):
             if self.known_persons_db:
@@ -645,6 +643,7 @@ class PersonTrackerApp:
                     print(f"Error deleting person: {e}")
             else:
                 print("DB is already empty. Nothing to delete.")
+            return key
 
     def cleanup(self):
         """Releases all resources gracefully."""
