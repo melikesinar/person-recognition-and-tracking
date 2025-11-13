@@ -60,8 +60,8 @@ class Config:
     BATCH_SIZE_TRIGGER = 5  # enrollments
 
     # --- Model Paths ---
-    YOLO_MODEL_PATH = 'yolov8l.pt'
-    REID_MODEL_PATH = 'osnet_x1_0_msmt17.pt'
+    YOLO_MODEL_PATH = '../models/yolov8l.pt'
+    REID_MODEL_PATH = '../models/osnet_x1_0_msmt17.pt'
 
     # --- TTA Settings ---
     USE_TTA_DEFAULT = True
