@@ -16,6 +16,7 @@ from utils.config import Config
 from utils.visualizer import Visualizer
 from core.quality_checker import QualityChecker
 from core.detector import DetectorWorker
+from core.reid_extractor import ReidExtractor
 from database.faiss_manager import FaissManager
 from database.async_writer import AsyncDBWriter
 from database.mongo_handler import MongoHandler
@@ -91,6 +92,7 @@ class PersonTrackerApp:
             self.device
         )
 
+        # --- Load ReidExtractor ---
         print("Loading Re-ID Model (OSNet)...")
         self.tracker = BoostTrack(
             reid_weights=Path(Config.REID_MODEL_PATH),
@@ -98,14 +100,13 @@ class PersonTrackerApp:
             half=False,
             with_reid=True
         )
-        if not hasattr(self.tracker, 'reid_model') or self.tracker.reid_model is None:
-            raise RuntimeError("Re-ID model failed to load! Exiting.")
-        else:
-            print("SUCCESS: Re-ID MODEL LOADED.")
 
-        # ImageNet normalization tensors
-        self.IMAGENET_MEAN = torch.tensor(Config.IMAGENET_MEAN).view(1, 3, 1, 1)
-        self.IMAGENET_STD = torch.tensor(Config.IMAGENET_STD).view(1, 3, 1, 1)
+        try:
+            self.reid_extractor = ReidExtractor(self.device, self.tracker)
+        except RuntimeError as e:
+            raise RuntimeError(e)
+
+        print("SUCCESS: Re-ID MODEL LOADED.")
 
         # --- Load Data ---
         self.load_db()
@@ -178,96 +179,6 @@ class PersonTrackerApp:
     def find_best_match(self, query_vector):
         """Wrapper for FaissManager.search()."""
         return self.faiss_manager.search(query_vector, self.current_match_threshold)
-
-    def preprocess_crop_advanced(self, crop):
-        """
-        Applies advanced image preprocessing techniques to a detected person crop
-        before feature extraction to enhance image quality and contrast,
-        thereby improving the quality of the generated embedding.
-
-        Techniques include Contrast Limited Adaptive Histogram Equalization (CLAHE).
-
-        Args:
-            crop (np.ndarray): The BGR image region of the person.
-
-        Returns:
-            np.ndarray: The enhanced BGR image crop.
-        """
-        # Convert to LAB color space
-        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-
-        # Apply CLAHE to the L (Lightness) channel
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-
-        # Convert back to BGR
-        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-        return enhanced
-
-    def extract_embeddings_from_crops(self, crops):
-        """
-        Extracts feature embeddings (vectors) for a batch of cropped person images
-        using the loaded Re-ID model (OSNet). Includes best practices such as:
-        - Advanced preprocessing (CLAHE)
-        - ImageNet normalization
-        - Test-Time Augmentation (TTA) with horizontal flip for robustness.
-
-        Args:
-            crops (list): List of BGR image crops (np.ndarray).
-
-        Returns:
-            list: List of L2-normalized feature embeddings (np.ndarray).
-        """
-        rm = getattr(self.tracker, "reid_model", None)
-        if rm is None or not hasattr(rm, 'model') or not callable(rm.model):
-            print("!!!! WARNING: Re-ID model is not callable, returning random vectors! !!!!")
-            return [self.l2_normalize(np.random.randn(Config.VECTOR_DIMENSION).astype(np.float32)) for _ in crops]
-
-        # Filter and process valid crops
-        valid_crops = [c for c in crops if c.size > 0]
-        if not valid_crops:
-            return []
-
-        # Resize and apply advanced preprocessing
-        resized_crops = [
-            cv2.resize(
-                self.preprocess_crop_advanced(c),
-                Config.REID_INPUT_SIZE,
-                interpolation=cv2.INTER_LINEAR
-            )
-            for c in valid_crops
-        ]
-
-        # Convert to a batch tensor: [N, H, W, C] -> [N, C, H, W]
-        images_np = np.stack(resized_crops, axis=0)
-        tensor_batch = torch.from_numpy(images_np).permute(0, 3, 1, 2).float().to(self.device)
-
-        # Normalize to [0, 1] and then apply ImageNet normalization
-        tensor_batch = tensor_batch / 255.0
-
-        if self.IMAGENET_MEAN.device != self.device:
-            self.IMAGENET_MEAN = self.IMAGENET_MEAN.to(self.device)
-            self.IMAGENET_STD = self.IMAGENET_STD.to(self.device)
-
-        tensor_batch = (tensor_batch - self.IMAGENET_MEAN) / self.IMAGENET_STD
-
-        # Extract features with optional TTA (Test-Time Augmentation)
-        if self.USE_TTA and self.TTA_HORIZONTAL_FLIP:
-            # Average features from the original image and its horizontal flip
-            features_original = rm.model(tensor_batch)
-            features_flipped = rm.model(torch.flip(tensor_batch, dims=[3]))
-            features = (features_original + features_flipped) / 2.0
-        else:
-            # Standard feature extraction
-            features = rm.model(tensor_batch)
-
-        # L2 Normalize and convert to numpy array
-        embeddings = [self.l2_normalize(v.cpu().numpy()) for v in features]
-
-        return embeddings
-
-
 
     def run(self):
         """
@@ -352,7 +263,7 @@ class PersonTrackerApp:
                 all_vectors = []
                 if crops_to_process:
                     # Extract all vectors in a single efficient batch
-                    all_vectors = self.extract_embeddings_from_crops(crops_to_process)
+                    all_vectors = self.reid_extractor.extract_embeddings_from_crops(crops_to_process)
 
                 vector_map = {}
                 if len(all_vectors) == len(track_ids_for_crops):
@@ -537,6 +448,7 @@ class PersonTrackerApp:
         # Toggle Test-Time Augmentation (TTA)
         elif key == ord('t'):
             self.USE_TTA = not self.USE_TTA
+            self.reid_extractor.set_tta_status(self.USE_TTA)
             status = "ENABLED" if self.USE_TTA else "DISABLED"
             print(f"Test-Time Augmentation (TTA): {status}")
 
