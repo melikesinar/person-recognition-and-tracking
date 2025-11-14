@@ -16,6 +16,7 @@ from utils.config import Config
 from core.quality_checker import QualityChecker
 from database.faiss_manager import FaissManager
 from database.async_writer import AsyncDBWriter
+from database.mongo_handler import MongoHandler
 from tracking.person_manager import PersonManager
 from tracking.spatial_matcher import SpatialMatcher
 from tracking.buffer_manager import BufferManager
@@ -52,22 +53,15 @@ class PersonTrackerApp:
 
         # --- Database Connection ---
         try:
-            self.mongo_client = pymongo.MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=5000)
-            self.mongo_client.server_info()
-            self.db = self.mongo_client[Config.DB_NAME]
-            self.persons_collection = self.db[Config.COLLECTION]
-            self.faiss_collection = self.db[Config.FAISS_COLLECTION]
-            self.persons_collection.create_index("permanent_id", unique=True)
-            print("Successfully connected to MongoDB.")
-        except pymongo.errors.ServerSelectionTimeoutError as e:
-            print(f"!!!! MongoDB CONNECTION ERROR !!!!: {e}")
-            exit()
+            self.mongo_handler = MongoHandler()
+        except RuntimeError:
+            exit()  # Exit if connection fails
 
         # --- Initialize Modular Components ---
-        self.faiss_manager = FaissManager(self.faiss_collection)
+        self.faiss_manager = FaissManager(self.mongo_handler.faiss_collection)
         self.async_writer = AsyncDBWriter(
-            self.persons_collection,
-            self.faiss_collection,
+            self.mongo_handler.persons_collection,
+            self.mongo_handler.faiss_collection,
             self.stop_event
         )
         self.person_manager = PersonManager(
@@ -129,31 +123,17 @@ class PersonTrackerApp:
         """
         Loads person database from MongoDB and initializes Faiss index.
         """
-        print("Loading database from MongoDB...")
         try:
-            all_persons = list(self.persons_collection.find({}))
-            if all_persons:
-                for doc in all_persons:
-                    pid = doc['permanent_id']
-                    self.known_persons_db[pid] = {
-                        "master_vector": np.frombuffer(doc['master_vector'], dtype=np.float32),
-                        "count": doc['count'],
-                        "created": doc['created']
-                    }
+            # 1. Load person data from MongoDB into cache
+            next_id = self.mongo_handler.load_db_to_cache(self.known_persons_db)
+            self.person_manager.set_next_id(next_id)
 
-                next_id = max(self.known_persons_db.keys()) + 1 if self.known_persons_db else 1
-                self.person_manager.set_next_id(next_id)
-
-                print(f"Successfully loaded {len(self.known_persons_db)} persons from MongoDB. Next ID: {next_id}")
-            else:
-                print("No person records found in MongoDB. Starting fresh.")
-                self.person_manager.set_next_id(1)
-
-            # Load Faiss index
+            # 2. Load or build Faiss index
             self.faiss_manager.load_index_from_db(self.known_persons_db)
 
         except Exception as e:
-            print(f"Error loading DB: {e}")
+            print(f"Error in load_db process: {e}")
+            # Ensure a fresh start if loading fails catastrophically
             self.faiss_manager.build_index(self.known_persons_db)
             self.known_persons_db.clear()
             self.person_manager.set_next_id(1)
@@ -334,7 +314,7 @@ class PersonTrackerApp:
         detector_thread = threading.Thread(target=self.detector_worker, daemon=True)
         detector_thread.start()
 
-        cap = cv2.VideoCapture(0)  # Assumes default camera
+        cap = cv2.VideoCapture("../videos/3.mp4")  # Assumes default camera
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
@@ -654,7 +634,7 @@ class PersonTrackerApp:
         self.async_writer.shutdown()
 
         cv2.destroyAllWindows()
-        self.mongo_client.close()
+        self.mongo_handler.close()
         print(f"Exited cleanly. DB entries in cache: {len(self.known_persons_db)}")
 
 # --- Start the Application ---
