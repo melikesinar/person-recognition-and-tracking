@@ -3,11 +3,9 @@ import cv2
 import time
 import torch
 import queue
-import pymongo
 import threading
 import numpy as np
 from pathlib import Path
-from ultralytics import YOLO
 from boxmot import BoostTrack
 from datetime import datetime
 
@@ -27,7 +25,6 @@ from tracking.buffer_manager import BufferManager
 # Validate configuration
 Config.validate()
 Config.print_config()
-
 
 class PersonTrackerApp:
     """
