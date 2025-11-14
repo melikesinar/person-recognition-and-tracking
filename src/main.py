@@ -13,14 +13,15 @@ from datetime import datetime
 
 # Import modular components
 from utils.config import Config
+from utils.visualizer import Visualizer
 from core.quality_checker import QualityChecker
+from core.detector import DetectorWorker
 from database.faiss_manager import FaissManager
 from database.async_writer import AsyncDBWriter
 from database.mongo_handler import MongoHandler
 from tracking.person_manager import PersonManager
 from tracking.spatial_matcher import SpatialMatcher
 from tracking.buffer_manager import BufferManager
-from utils.visualizer import Visualizer
 
 # Validate configuration
 Config.validate()
@@ -82,9 +83,13 @@ class PersonTrackerApp:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
 
-        print("Loading Object Detector (YOLOv8)...")
-        self.detector = YOLO(Config.YOLO_MODEL_PATH)
-        self.detector.to(self.device)
+        # --- Load Detector ---
+        self.detector_worker_instance = DetectorWorker(
+            self.frame_queue,
+            self.detection_queue,
+            self.current_detection_threshold,
+            self.device
+        )
 
         print("Loading Re-ID Model (OSNet)...")
         self.tracker = BoostTrack(
@@ -262,48 +267,7 @@ class PersonTrackerApp:
 
         return embeddings
 
-    def detector_worker(self):
-        """
-        Runs the YOLOv8 object detector in a separate, non-blocking thread.
-        It continuously pulls frames from the input queue, performs detection
-        (only for the 'person' class), filters results based on the live threshold,
-        and pushes the detections to the output queue.
-        """
-        print("Detector thread (YOLOv8) started...")
-        while True:
-            frame_to_process = self.frame_queue.get()
-            if frame_to_process is None:  # Exit signal
-                print("Detector thread stopping...")
-                break
 
-            # Run YOLO detection for 'person' class (class_id=0)
-            output = self.detector(frame_to_process, classes=0, verbose=False)
-
-            if not output:
-                new_detections = np.empty((0, 6), dtype=np.float32)
-            else:
-                boxes = output[0].boxes
-
-                # Filter detections based on the current live-tuning threshold
-                scores = boxes.conf.cpu().numpy()
-                keep_mask = (scores >= self.current_detection_threshold)
-
-                if keep_mask.any():
-                    # Format as BoostTrack expects: [x1, y1, x2, y2, score, class_id]
-                    new_detections = boxes.data[keep_mask].cpu().numpy()
-
-                    # Safety check: limit columns to 6 (may include tracker_id if BoostTrack was used)
-                    if new_detections.shape[1] > 6:
-                        new_detections = new_detections[:, :6]
-                else:
-                    new_detections = np.empty((0, 6), dtype=np.float32)
-
-            # Atomically put new detections into the queue
-            try:
-                self.detection_queue.get_nowait()
-            except queue.Empty:
-                pass
-            self.detection_queue.put(new_detections)
 
     def run(self):
         """
@@ -311,10 +275,9 @@ class PersonTrackerApp:
         batch feature extraction, Re-ID matching, spatial re-acquisition,
         enrollment logic, drawing results, and user input processing.
         """
-        detector_thread = threading.Thread(target=self.detector_worker, daemon=True)
-        detector_thread.start()
+        self.detector_worker_instance.start()
 
-        cap = cv2.VideoCapture("../videos/3.mp4")  # Assumes default camera
+        cap = cv2.VideoCapture(0)  # Assumes default camera
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
@@ -550,15 +513,17 @@ class PersonTrackerApp:
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             print("Quitting...")
-            self.frame_queue.put(None)  # Signal detector thread to stop
+            self.detector_worker_instance.stop()  # Signal detector thread to stop
             return 'q'
 
         # Detection Threshold (U=Up, J=Down)
         elif key == ord('u'):
             self.current_detection_threshold = min(1.0, self.current_detection_threshold + 0.05)
+            self.detector_worker_instance.set_detection_threshold(self.current_detection_threshold)
             print(f"Detection Threshold set to: {self.current_detection_threshold:.2f}")
         elif key == ord('j'):
             self.current_detection_threshold = max(0.0, self.current_detection_threshold - 0.05)
+            self.detector_worker_instance.set_detection_threshold(self.current_detection_threshold)
             print(f"Detection Threshold set to: {self.current_detection_threshold:.2f}")
 
         # Match Threshold (Y=Up, H=Down)
@@ -629,6 +594,9 @@ class PersonTrackerApp:
         """Releases all resources gracefully."""
         self.stop_event.set()
         print("Cleaning up and exiting...")
+
+        # Shutdown detector worker (if not already stopped by 'q' key)
+        self.detector_worker_instance.stop()
 
         # Shutdown async writer
         self.async_writer.shutdown()
