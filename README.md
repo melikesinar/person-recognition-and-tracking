@@ -5,8 +5,8 @@ Advanced person re-identification system using YOLO, BoostTrack, OSNet, and Fais
 ## 📁 Project Structure
 ```
 src/
-├── main.py                 # Main application entry point
-├── core/                   # Core functionality
+├── main.py                # Main application entry point
+├── core/                  # Core functionality
 │   ├── detector.py        # YOLO detector wrapper
 │   ├── tracker.py         # BoostTrack wrapper
 │   ├── reid_extractor.py  # Feature extraction logic
