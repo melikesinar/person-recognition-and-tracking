@@ -7,12 +7,12 @@ Advanced person re-identification system using YOLO, BoostTrack, OSNet, and Fais
 src/
 ├── main.py                 # Main application entry point
 ├── core/                   # Core functionality
-│   ├── detector.py        # (Future) YOLO detector wrapper
-│   ├── tracker.py         # (Future) BoostTrack wrapper
+│   ├── detector.py        # YOLO detector wrapper
+│   ├── tracker.py         # BoostTrack wrapper
 │   ├── reid_extractor.py  # Feature extraction logic
 │   └── quality_checker.py # Quality assessment
 ├── database/              # Database management
-│   ├── mongo_handler.py   # (Future) MongoDB operations
+│   ├── mongo_handler.py   # MongoDB operations
 │   ├── faiss_manager.py   # Faiss index management
 │   └── async_writer.py    # Async database writer
 ├── tracking/              # Tracking logic
