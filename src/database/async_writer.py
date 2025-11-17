@@ -3,7 +3,6 @@ Asynchronous database writer for non-blocking MongoDB operations.
 """
 import queue
 import threading
-from datetime import datetime
 from bson.binary import Binary
 
 

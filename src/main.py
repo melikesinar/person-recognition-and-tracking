@@ -105,8 +105,6 @@ class PersonTrackerApp:
         except RuntimeError as e:
             raise RuntimeError(e)
 
-        print("SUCCESS: Re-ID MODEL LOADED.")
-
         # --- Load Data ---
         self.load_db()
 
@@ -187,7 +185,7 @@ class PersonTrackerApp:
         """
         self.detector_worker_instance.start()
 
-        cap = cv2.VideoCapture(0)  # Assumes default camera
+        cap = cv2.VideoCapture("../videos/3.mp4")  # Assumes default camera
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
@@ -210,12 +208,12 @@ class PersonTrackerApp:
                 frame_count += 1
                 current_time = time.time()
 
-                # Eşiği 0.0001 saniye olarak belirleyelim
+                # Set threshold to 0.0001 seconds
                 time_diff = current_time - prev_time
                 if time_diff > 0.0001:
                     fps = 1.0 / time_diff
                 else:
-                    fps = 0.0  # Veya son bilinen FPS değerini koruyun
+                    fps = 0.0   # Or keep the last known FPS value
 
                 prev_time = current_time
 
@@ -293,7 +291,7 @@ class PersonTrackerApp:
                             self.incremental_update(pid, current_vector)
                             self.buffer_manager.last_update_time_for_pid[pid] = time.time()
                     else:
-                        # --- ADVANCED Spatial Re-acquisition with Motion Prediction ---
+                        # --- Spatial Re-acquisition with Motion Prediction ---
                         now = time.time()
                         spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
                             box,
