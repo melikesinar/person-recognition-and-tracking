@@ -28,7 +28,6 @@ class DetectorWorker:
         self.device = device
 
         # Live-tuning threshold reference (can be updated externally if passed as mutable object)
-        # We will use a simple attribute here for simplicity.
         self._current_detection_threshold = detection_threshold
 
         print("Loading Object Detector (YOLOv8)...")

@@ -3,8 +3,8 @@ import cv2
 import torch
 import numpy as np
 from pathlib import Path
-from ultralytics import YOLO  # BoostTrack dependency for internal structure
-from boxmot import BoostTrack  # Used to load the underlying Re-ID model
+from ultralytics import YOLO
+from boxmot import BoostTrack
 from utils.config import Config
 
 
