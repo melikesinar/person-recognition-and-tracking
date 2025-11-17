@@ -95,7 +95,9 @@ class PersonTrackerApp:
             reid_weights=Path(Config.REID_MODEL_PATH),
             device=(0 if self.device.type == 'cuda' else 'cpu'),
             half=False,
-            with_reid=True
+            with_reid=True,
+            max_age=60,
+            max_obs=100
         )
 
         try:
