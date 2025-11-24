@@ -185,7 +185,7 @@ class PersonTrackerApp:
         """
         self.detector_worker_instance.start()
 
-        cap = cv2.VideoCapture("../videos/3.mp4")  # Assumes default camera
+        cap = cv2.VideoCapture(0)  # Assumes default camera
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
