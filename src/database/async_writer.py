@@ -4,6 +4,7 @@ Asynchronous database writer for non-blocking MongoDB operations.
 import queue
 import threading
 from bson.binary import Binary
+from utils.config import Config
 
 
 class AsyncDBWriter:
@@ -25,7 +26,7 @@ class AsyncDBWriter:
         self.faiss_collection = faiss_collection
         self.stop_event = stop_event
 
-        self.write_queue = queue.Queue()
+        self.write_queue = queue.Queue(maxsize=Config.ASYNC_DB_WRITER_QUEUE_SIZE)
         self.writer_thread = threading.Thread(target=self._writer_worker, daemon=True)
         self.writer_thread.start()
 
