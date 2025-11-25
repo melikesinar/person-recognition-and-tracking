@@ -68,7 +68,7 @@ class SpatialMatcher:
         Returns:
             list: Predicted box [x1, y1, x2, y2]
         """
-        expansion_factor = min(50 * time_elapsed, 100)
+        expansion_factor = min(Config.SPATIAL_PREDICTION_FACTOR_1 * time_elapsed, Config.SPATIAL_PREDICTION_FACTOR_2)
         x1, y1, x2, y2 = last_box
 
         return [
@@ -93,8 +93,8 @@ class SpatialMatcher:
         bbox_height = y2 - y1
         bbox_diag = np.sqrt(bbox_width ** 2 + bbox_height ** 2)
 
-        threshold = min(bbox_diag * 0.75, 200.0)
-        threshold = max(threshold, 30.0)
+        threshold = min(bbox_diag * Config.ADAPTIVE_THRESHOLD_FACTOR, Config.ADAPTIVE_THRESHOLD_MAX)
+        threshold = max(threshold, Config.ADAPTIVE_THRESHOLD_MIN)
 
         return threshold
 
@@ -141,9 +141,9 @@ class SpatialMatcher:
             dist_score = max(0, 1.0 - (center_dist / adaptive_threshold))
             time_score = time_factor
 
-            match_score = (iou_score * 0.4 + dist_score * 0.4 + time_score * 0.2)
+            match_score = (iou_score * Config.SPATIAL_IOU_WEIGHT + dist_score * Config.SPATIAL_DIST_WEIGHT + time_score * Config.SPATIAL_TIME_WEIGHT)
 
-            if match_score > 0.3 and match_score > best_match_score:
+            if match_score > Config.SPATIAL_MATCH_MIN_SCORE and match_score > best_match_score:
                 best_match_score = match_score
                 best_match_pid = pid
 
