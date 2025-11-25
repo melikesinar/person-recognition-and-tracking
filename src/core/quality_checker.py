@@ -19,16 +19,8 @@ class QualityChecker:
         self.min_sharpness = Config.MIN_SHARPNESS_ENROLL
 
         # Quality scoring weights
-        self.weights = {
-            'aspect': 1.5,  # Prevents bad crops
-            'size': 1.5,  # Ensures sufficient detail
-            'sharpness': 2.0,  # Most critical (blur = useless)
-            'edges': 1.0,  # Occlusion detection
-            'brightness': 1.0,  # Illumination consistency
-            'position': 0.5  # Frame edge detection
-        }
-
-        self.min_quality_threshold = 0.6  # Overall quality requirement
+        self.weights = Config.Q_WEIGHTS
+        self.min_quality_threshold = Config.Q_MIN_QUALITY_THRESHOLD
 
     def calculate_sharpness(self, image):
         """
@@ -63,11 +55,11 @@ class QualityChecker:
 
         aspect_ratio = height / width
 
-        if aspect_ratio < 0.5:
+        if aspect_ratio < Config.Q_MIN_ASPECT_RATIO:
             return 0.0, "aspect_too_wide"
-        elif aspect_ratio > 4.0:
+        elif aspect_ratio > Config.Q_MAX_ASPECT_RATIO:
             return 0.0, "aspect_too_tall"
-        elif 1.5 <= aspect_ratio <= 3.0:
+        elif Config.Q_ASPECT_RATIO_OPTIMAL_MIN <= aspect_ratio <= Config.Q_ASPECT_RATIO_OPTIMAL_MAX:
             return 1.0, None  # Optimal range
         else:
             return 0.5, None  # Acceptable but not ideal
@@ -89,7 +81,7 @@ class QualityChecker:
             return 0.0, "too_small"
         else:
             # Normalized score (10000 = min, 50000 = excellent)
-            score = min(1.0, area / 50000.0)
+            score = min(1.0, area / Config.Q_BBOX_AREA_EXCELLENT)
             return score, None
 
     def check_sharpness(self, crop):
@@ -108,7 +100,7 @@ class QualityChecker:
             return 0.0, "too_blurry"
         else:
             # Normalized score (50 = min, 200 = excellent)
-            score = min(1.0, sharpness / 200.0)
+            score = min(1.0, sharpness / Config.Q_SHARPNESS_EXCELLENT)
             return score, None
 
     def check_edge_density(self, crop):
@@ -127,13 +119,13 @@ class QualityChecker:
             edges = cv2.Canny(gray, 50, 150)
             edge_density = np.sum(edges > 0) / (h * w)
 
-            if edge_density < 0.02:  # Too smooth = occluded
+            if edge_density < Config.Q_EDGE_DENSITY_MIN:  # Too smooth = occluded
                 return 0.0, "occluded"
-            elif edge_density > 0.30:  # Too busy = cluttered
+            elif edge_density > Config.Q_EDGE_DENSITY_MAX:  # Too busy = cluttered
                 return 0.5, None
             else:
                 # Optimal range: 0.05 - 0.20
-                score = 1.0 if 0.05 <= edge_density <= 0.20 else 0.7
+                score = 1.0 if Config.Q_EDGE_DENSITY_OPTIMAL_MIN <= edge_density <= Config.Q_EDGE_DENSITY_OPTIMAL_MAX else 0.7
                 return score, None
         except Exception:
             return 0.5, None  # Neutral score on error
@@ -153,9 +145,9 @@ class QualityChecker:
             brightness_std = gray.std()
             brightness_mean = gray.mean()
 
-            if brightness_std < 15:  # Too uniform
+            if brightness_std < Config.Q_BRIGHTNESS_STD_MIN:  # Too uniform
                 return 0.0, "poor_illumination"
-            elif brightness_mean < 30 or brightness_mean > 225:  # Too dark/bright
+            elif brightness_mean < Config.Q_BRIGHTNESS_MEAN_MIN or brightness_mean > Config.Q_BRIGHTNESS_MEAN_MAX:  # Too dark/bright
                 return 0.3, "extreme_lighting"
             else:
                 return 1.0, None
@@ -183,7 +175,7 @@ class QualityChecker:
         margin_x = min(center_x, frame_w - center_x) / frame_w
         margin_y = min(center_y, frame_h - center_y) / frame_h
 
-        if margin_x < 0.05 or margin_y < 0.05:  # Within 5% of edge
+        if margin_x < Config.Q_FRAME_EDGE_MARGIN or margin_y < Config.Q_FRAME_EDGE_MARGIN:  # Within 5% of edge
             return 0.0, "at_frame_edge"
         else:
             return 1.0, None
