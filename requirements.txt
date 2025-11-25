@@ -1,9 +1,21 @@
+# NOTE: The torch and torchvision versions below might be specific to a certain CUDA setup.
+# If you encounter issues, please install the appropriate versions for your system
+# by following the official instructions at https://pytorch.org/get-started/locally/
+
+torch==2.9.0
+torchvision==0.24.0
+ultralytics
+
+# Tracking
 boxmot==15.0.9
-numpy==2.3.4
-opencv_python==4.12.0.88
+
+# Computer Vision
+opencv-python==4.12.0.88
+
+# Database & Vector Search
 pymongo==4.15.3
 python-dotenv==1.2.1
-torch==2.9.0
-torch==2.9.0+cu130
-torchvision==0.24.0
-torchvision==0.24.0+cu130
+faiss-cpu  # For CPU-based Faiss. For GPU, install 'faiss-gpu' instead.
+
+# General Utilities
+numpy==2.3.4
