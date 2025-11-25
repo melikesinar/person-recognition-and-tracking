@@ -26,9 +26,6 @@ class BufferManager:
         self.last_known_box_for_pid = {}
 
         # Update tracking
-        self.recent_vector_buffers = defaultdict(
-            lambda: deque(maxlen=Config.RECENT_VECTOR_BUFFER_SIZE)
-        )
         self.last_update_time_for_pid = defaultdict(float)
 
         # Cleanup tracking
@@ -46,13 +43,6 @@ class BufferManager:
         """
         stale_pids = []
 
-        # Check recent_vector_buffers
-        for pid in list(self.recent_vector_buffers.keys()):
-            if pid not in known_persons_db:
-                stale_pids.append(pid)
-            elif (current_time - self.last_update_time_for_pid.get(pid, 0)) > Config.BUFFER_MAX_IDLE_TIME:
-                stale_pids.append(pid)
-
         # Check last_update_time_for_pid
         for pid in list(self.last_update_time_for_pid.keys()):
             if pid not in known_persons_db:
@@ -62,15 +52,12 @@ class BufferManager:
         # Remove stale entries
         if stale_pids:
             for pid in stale_pids:
-                if pid in self.recent_vector_buffers:
-                    del self.recent_vector_buffers[pid]
                 if pid in self.last_update_time_for_pid:
                     del self.last_update_time_for_pid[pid]
                 if pid in self.last_known_box_for_pid:
                     del self.last_known_box_for_pid[pid]
 
-            print(f"BUFFER CLEANUP: Removed {len(stale_pids)} stale buffer(s). "
-                  f"Active buffers: {len(self.recent_vector_buffers)}")
+            print(f"BUFFER CLEANUP: Removed {len(stale_pids)} stale buffer(s).")
 
     def cleanup_stale_tracks(self, current_time):
         """
@@ -105,8 +92,6 @@ class BufferManager:
         for pid in stale_lost_pids:
             del self.lost_pid_buffer[pid]
 
-            if pid in self.recent_vector_buffers:
-                del self.recent_vector_buffers[pid]
             if pid in self.last_known_box_for_pid:
                 del self.last_known_box_for_pid[pid]
 
@@ -150,5 +135,4 @@ class BufferManager:
         self.track_id_to_permanent_id_map.clear()
         self.lost_pid_buffer.clear()
         self.last_known_box_for_pid.clear()
-        self.recent_vector_buffers.clear()
         self.last_update_time_for_pid.clear()
