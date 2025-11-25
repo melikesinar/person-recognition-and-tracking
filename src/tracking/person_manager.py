@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime
 from bson.binary import Binary
 from utils.config import Config
+from utils.math_utils import l2_normalize
 
 
 class PersonManager:
@@ -33,19 +34,7 @@ class PersonManager:
         """Set the next available permanent ID."""
         self.next_permanent_id = next_id
 
-    def l2_normalize(self, v):
-        """
-        Normalizes a vector to unit length (L2 norm).
 
-        Args:
-            v (np.ndarray): Feature vector
-
-        Returns:
-            np.ndarray: L2 normalized vector
-        """
-        v = np.asarray(v, dtype=np.float32)
-        n = np.linalg.norm(v)
-        return v if n == 0 else v / n
 
     def enroll_person(self, vectors):
         """
@@ -61,7 +50,7 @@ class PersonManager:
             raise ValueError("No vectors provided to enroll.")
 
         # Calculate master vector (mean of all vectors)
-        master = self.l2_normalize(np.mean(np.stack(vectors, axis=0), axis=0))
+        master = l2_normalize(np.mean(np.stack(vectors, axis=0), axis=0))
         current_dt = datetime.now()
         new_pid = self.next_permanent_id
 
@@ -113,8 +102,7 @@ class PersonManager:
             master = entry["master_vector"]
 
             # EMA update
-            alpha = 0.1
-            updated_master = self.l2_normalize((1 - alpha) * master + alpha * new_vector)
+            updated_master = l2_normalize((1 - Config.EMA_ALPHA) * master + Config.EMA_ALPHA * new_vector)
 
             new_count = n + 1
             mongo_update_doc["$set"]["master_vector"] = Binary(updated_master.tobytes())
