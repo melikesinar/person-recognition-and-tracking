@@ -48,37 +48,70 @@ class MongoHandler:
             self.mongo_client.close()
             print("MongoDB connection closed.")
 
-    def load_db_to_cache(self, known_persons_db):
+    def get_person_by_id(self, pid):
         """
-        Loads all person documents from MongoDB into the application's in-memory cache.
+        Fetches a single person's document from MongoDB by permanent_id.
 
         Args:
-            known_persons_db (dict): The application's local cache dictionary.
+            pid (int): The permanent ID of the person.
 
         Returns:
-            int: The next permanent ID to use.
+            dict: The person's document or None if not found.
         """
-        print("Loading person records from MongoDB into cache...")
         try:
-            all_persons = list(self.persons_collection.find({}))
-            if all_persons:
-                for doc in all_persons:
-                    pid = doc['permanent_id']
-                    # Use a shallow copy or dict comprehension to avoid modifying the doc directly if needed later
-                    known_persons_db[pid] = {
-                        "master_vector": np.frombuffer(doc['master_vector'], dtype=np.float32),
-                        "count": doc['count'],
-                        "created": doc['created']
-                    }
-
-                next_id = max(known_persons_db.keys()) + 1
-                print(f"Successfully loaded {len(known_persons_db)} persons. Next ID: {next_id}")
-                return next_id
-            else:
-                print("No person records found in MongoDB. Starting fresh.")
-                return 1
+            doc = self.persons_collection.find_one({"permanent_id": pid})
+            if doc:
+                # Convert BSON binary back to numpy array
+                doc["master_vector"] = np.frombuffer(doc['master_vector'], dtype=np.float32)
+            return doc
         except Exception as e:
-            print(f"Error loading DB: {e}")
-            # If loading fails, start fresh
-            known_persons_db.clear()
+            print(f"!!!! Error fetching person P{pid} from MongoDB !!!!: {e}")
+            return None
+
+    def load_vectors_for_faiss(self):
+        """
+        Loads only the necessary data (ID and vector) from MongoDB
+        to build the Faiss index, without loading the entire database into memory.
+
+        Returns:
+            tuple: (list_of_pids, list_of_vectors, next_pid)
+        """
+        print("Loading vectors from MongoDB for Faiss index...")
+        try:
+            # Projection: only retrieve the fields we absolutely need
+            cursor = self.persons_collection.find({}, {"permanent_id": 1, "master_vector": 1, "_id": 0})
+
+            pids = []
+            vectors = []
+            max_id = 0
+
+            for doc in cursor:
+                pid = doc['permanent_id']
+                pids.append(pid)
+                vectors.append(np.frombuffer(doc['master_vector'], dtype=np.float32))
+                if pid > max_id:
+                    max_id = pid
+
+            next_pid = max_id + 1
+            print(f"Successfully loaded {len(pids)} vectors. Next available PID will be {next_pid}")
+            return pids, vectors, next_pid
+
+        except Exception as e:
+            print(f"!!!! Error loading vectors from MongoDB !!!!: {e}")
+            return [], [], 1
+
+    def get_next_id(self):
+        """
+        Finds the highest permanent_id in the database and returns the next available one.
+        This is a fallback for when the DB is empty or for PersonManager initialization.
+        """
+        try:
+            # Find the document with the highest permanent_id
+            last_person = self.persons_collection.find_one(sort=[("permanent_id", -1)])
+            if last_person:
+                return last_person['permanent_id'] + 1
+            else:
+                return 1  # Database is empty
+        except Exception as e:
+            print(f"!!!! Error getting next ID from MongoDB !!!!: {e}")
             return 1

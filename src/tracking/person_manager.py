@@ -78,7 +78,7 @@ class PersonManager:
         self.next_permanent_id += 1
 
         # Trigger index rebuild if needed
-        self.faiss_manager.trigger_rebuild_if_needed(self.known_persons_db, new_enrollment=True)
+        self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True)
 
         return new_pid
 
@@ -131,6 +131,10 @@ class PersonManager:
         if pid in self.known_persons_db:
             del self.known_persons_db[pid]
             print(f"DELETED: P{pid} removed from cache.")
+
+        # Trigger index rebuild to remove the person from search results
+        self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True)
+
 
     def reset_all(self):
         """Resets entire database and cache."""

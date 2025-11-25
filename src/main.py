@@ -57,7 +57,7 @@ class PersonTrackerApp:
             exit()  # Exit if connection fails
 
         # --- Initialize Modular Components ---
-        self.faiss_manager = FaissManager(self.mongo_handler.faiss_collection)
+        self.faiss_manager = FaissManager(self.mongo_handler)
         self.async_writer = AsyncDBWriter(
             self.mongo_handler.persons_collection,
             self.mongo_handler.faiss_collection,
@@ -124,20 +124,23 @@ class PersonTrackerApp:
 
     def load_db(self):
         """
-        Loads person database from MongoDB and initializes Faiss index.
+        Initializes the system by loading the Faiss index and setting the next person ID.
+        The known_persons_db now acts as a lazy-loaded cache and starts empty.
         """
         try:
-            # 1. Load person data from MongoDB into cache
-            next_id = self.mongo_handler.load_db_to_cache(self.known_persons_db)
+            # 1. FaissManager now loads its index directly from MongoDB data
+            self.faiss_manager.load_index_from_db()
+
+            # 2. PersonManager gets the next available ID from MongoDB
+            next_id = self.mongo_handler.get_next_id()
             self.person_manager.set_next_id(next_id)
 
-            # 2. Load or build Faiss index
-            self.faiss_manager.load_index_from_db(self.known_persons_db)
+            print("System ready. In-memory cache is empty and will be populated on-demand.")
 
         except Exception as e:
-            print(f"Error in load_db process: {e}")
-            # Ensure a fresh start if loading fails catastrophically
-            self.faiss_manager.build_index(self.known_persons_db)
+            print(f"!!!! Error during initialization process !!!!: {e}")
+            # Ensure a fresh start if loading fails
+            self.faiss_manager.build_index()
             self.known_persons_db.clear()
             self.person_manager.set_next_id(1)
 
@@ -156,10 +159,6 @@ class PersonTrackerApp:
     def adaptive_spatial_threshold(self, bbox):
         """Wrapper for SpatialMatcher.adaptive_spatial_threshold()."""
         return self.spatial_matcher.adaptive_spatial_threshold(bbox)
-
-    def l2_normalize(self, v):
-        """Wrapper for PersonManager.l2_normalize()."""
-        return self.person_manager.l2_normalize(v)
 
     def enroll_person(self, vectors):
         """Wrapper for PersonManager.enroll_person()."""
@@ -237,10 +236,10 @@ class PersonTrackerApp:
 
             x1, y1, x2, y2 = map(int, box)
             label, color = f"T{track_id}", (0, 165, 255)
+            pid = None
 
             if track_id in self.buffer_manager.track_id_to_permanent_id_map:
                 pid = self.buffer_manager.track_id_to_permanent_id_map[track_id]
-                self.buffer_manager.last_known_box_for_pid[pid] = box
                 label, color = f"P{pid}", (0, 255, 0)
                 if (time.time() - self.buffer_manager.last_update_time_for_pid.get(pid, 0)) > Config.UPDATE_INTERVAL:
                     self.incremental_update(pid, current_vector)
@@ -251,18 +250,20 @@ class PersonTrackerApp:
                     box, self.buffer_manager.lost_pid_buffer, now
                 )
                 if spatial_match_pid is not None:
-                    self.buffer_manager.track_id_to_permanent_id_map[track_id] = spatial_match_pid
-                    label = f"P{spatial_match_pid} (ReAcq:{best_match_score:.2f})"
+                    pid = spatial_match_pid
+                    self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
+                    label = f"P{pid} (ReAcq:{best_match_score:.2f})"
                     color = (0, 255, 128)
-                    if spatial_match_pid in self.buffer_manager.lost_pid_buffer:
-                        del self.buffer_manager.lost_pid_buffer[spatial_match_pid]
-                    self.buffer_manager.last_known_box_for_pid[spatial_match_pid] = box
+                    if pid in self.buffer_manager.lost_pid_buffer:
+                        del self.buffer_manager.lost_pid_buffer[pid]
                 else:
                     match_id, match_sim = self.find_best_match(current_vector)
                     if match_id is not None:
-                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = match_id
-                        label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)
+                        pid = match_id
+                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
+                        label, color = f"P{pid} (S:{match_sim:.2f})", (0, 255, 0)
                     else:
+                        # --- Enrollment Logic ---
                         is_good, reason, q_score = self.advanced_quality_check(crop, box, frame.shape)
                         buf = self.buffer_manager.active_track_buffers[track_id]
                         if is_good:
@@ -279,10 +280,21 @@ class PersonTrackerApp:
                                 new_pid = self.enroll_person(buf["vectors"])
                                 if new_pid:
                                     self.buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
-                                    del self.buffer_manager.active_track_buffers[track_id]
+                                    if track_id in self.buffer_manager.active_track_buffers:
+                                        del self.buffer_manager.active_track_buffers[track_id]
                             else:
-                                buf["vectors"].clear()
-                                buf.get("quality_scores", []).clear()
+                                buf["vectors"].clear(); buf.get("quality_scores", []).clear()
+            
+            # --- This is the FIX ---
+            # If a person is identified, ensure they are in the cache and update their timestamp.
+            if pid is not None:
+                self.buffer_manager.last_known_box_for_pid[pid] = box
+                if pid not in self.known_persons_db:
+                    person_doc = self.mongo_handler.get_person_by_id(pid)
+                    if person_doc: self.known_persons_db[pid] = person_doc
+                
+                if pid in self.known_persons_db:
+                    self.known_persons_db[pid]['last_seen_timestamp'] = time.time()
 
             self.visualizer.draw_person_bbox(frame, (x1, y1, x2, y2), label, color)
         return current_frame_track_ids
@@ -306,6 +318,17 @@ class PersonTrackerApp:
                 self.buffer_manager.add_to_lost_buffer(
                     pid, self.buffer_manager.last_known_box_for_pid[pid], now
                 )
+        # Clean up persons from the active cache if they haven't been seen for a while
+        # This is optional but good for memory management over very long runs
+        # Example: remove if not seen for 10 minutes
+        pids_to_evict = [
+            pid for pid, data in self.known_persons_db.items()
+            if now - data.get('last_seen_timestamp', 0) > 600
+        ]
+        for pid in pids_to_evict:
+            del self.known_persons_db[pid]
+            print(f"Evicted P{pid} from active cache due to inactivity.")
+
         self.buffer_manager.cleanup_lost_pids(now)
         if self.buffer_manager.should_run_cleanup(now):
             self.cleanup_stale_buffers(now)
@@ -318,7 +341,7 @@ class PersonTrackerApp:
         """
         self.detector_worker_instance.start()
 
-        cap = cv2.VideoCapture(0)  # Assumes default camera
+        cap = cv2.VideoCapture("../videos/3.mp4")  # Assumes default camera
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
@@ -376,93 +399,66 @@ class PersonTrackerApp:
             self.detector_worker_instance.stop()  # Signal detector thread to stop
             return 'q'
 
-        # Detection Threshold (U=Up, J=Down)
+        # Live-tuning and other controls...
         elif key == ord('u'):
             self.current_detection_threshold = min(1.0, self.current_detection_threshold + 0.05)
             self.detector_worker_instance.set_detection_threshold(self.current_detection_threshold)
-            print(f"Detection Threshold set to: {self.current_detection_threshold:.2f}")
         elif key == ord('j'):
             self.current_detection_threshold = max(0.0, self.current_detection_threshold - 0.05)
             self.detector_worker_instance.set_detection_threshold(self.current_detection_threshold)
-            print(f"Detection Threshold set to: {self.current_detection_threshold:.2f}")
-
-        # Match Threshold (Y=Up, H=Down)
         elif key == ord('y'):
             self.current_match_threshold = min(1.0, self.current_match_threshold + 0.05)
-            print(f"Match Threshold set to: {self.current_match_threshold:.2f}")
         elif key == ord('h'):
             self.current_match_threshold = max(0.0, self.current_match_threshold - 0.05)
-            print(f"Match Threshold set to: {self.current_match_threshold:.2f}")
-
-        # Toggle Test-Time Augmentation (TTA)
         elif key == ord('t'):
             self.USE_TTA = not self.USE_TTA
             self.reid_extractor.set_tta_status(self.USE_TTA)
-            status = "ENABLED" if self.USE_TTA else "DISABLED"
-            print(f"Test-Time Augmentation (TTA): {status}")
 
         elif key == ord('r'):
             print("RESET: Queuing MongoDB clear operation...")
             self.person_manager.reset_all()
             self.buffer_manager.reset_all()
-            self.faiss_manager.build_index(self.known_persons_db)
+            self.faiss_manager.build_index()  # No longer needs persons_db
             print("Program memory (cache and index) has been cleared.")
 
         elif key == ord('d'):
+            # Debugging status...
             print("\n--- DB STATUS (d) ---")
-            print(f"Persons in cache: {len(self.known_persons_db)}")
-
+            print(f"Persons in ACTIVE CACHE: {len(self.known_persons_db)}")
             stats = self.faiss_manager.get_index_stats()
             print(f"Vectors in Faiss index: {stats['ntotal']}")
-            print(f"Index build in progress: {stats['build_in_progress']}")
             print(f"Next ID: {self.person_manager.next_permanent_id}")
-
-            for pid, data in self.known_persons_db.items():
-                created_date = data.get('created', 'N/A')
-                if isinstance(created_date, datetime):
-                    created_date = created_date.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"  - P{pid}: {data['count']} vectors, Created: {created_date}")
             print("------------------\n")
-            return key
 
         elif key == ord('k'):
             if self.known_persons_db:
                 try:
                     last_id = max(self.known_persons_db.keys())
                     self.person_manager.delete_person(last_id)
-
+                    # Clear from cache
+                    if last_id in self.known_persons_db:
+                        del self.known_persons_db[last_id]
                     # Clear associated buffers
-                    if last_id in self.buffer_manager.last_update_time_for_pid:
-                        del self.buffer_manager.last_update_time_for_pid[last_id]
-                    if last_id in self.buffer_manager.last_known_box_for_pid:
-                        del self.buffer_manager.last_known_box_for_pid[last_id]
-
                     self.buffer_manager.active_track_buffers.clear()
                     self.buffer_manager.track_id_to_permanent_id_map.clear()
                     self.buffer_manager.lost_pid_buffer.clear()
-
-                    self.faiss_manager.build_index(self.known_persons_db)
-                    print(f"DELETED (k): P{last_id} deleted. Index rebuilt.")
+                    print(f"DELETED (k): P{last_id} delete command issued.")
                 except Exception as e:
                     print(f"Error deleting person: {e}")
             else:
                 print("DB is already empty. Nothing to delete.")
-            return key
 
+        return key
+    
     def cleanup(self):
         """Releases all resources gracefully."""
         self.stop_event.set()
         print("Cleaning up and exiting...")
-
-        # Shutdown detector worker (if not already stopped by 'q' key)
         self.detector_worker_instance.stop()
-
-        # Shutdown async writer
         self.async_writer.shutdown()
-
         cv2.destroyAllWindows()
         self.mongo_handler.close()
-        print(f"Exited cleanly. DB entries in cache: {len(self.known_persons_db)}")
+        print(f"Exited cleanly. DB entries in active cache: {len(self.known_persons_db)}")
 
 # --- Start the Application ---
 if __name__ == "__main__":
@@ -475,9 +471,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"!!!! UNEXPECTED ERROR OCCURRED !!!!: {e}")
     finally:
-        try:
-            if app:
-                app.cleanup()
-        except NameError:
-            cv2.destroyAllWindows()
-            print("Application failed to initialize, cleaning up windows.")
+        if app:
+            app.cleanup()
