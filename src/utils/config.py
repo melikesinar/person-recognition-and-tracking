@@ -50,7 +50,15 @@ class Config:
 
     # --- Tracking Parameters ---
     SHORT_TERM_MEMORY_TTL = 4.0  # seconds
-    SPATIAL_MATCH_THRESHOLD = 150  # deprecated (now adaptive)
+    SPATIAL_PREDICTION_FACTOR_1 = 50
+    SPATIAL_PREDICTION_FACTOR_2 = 100
+    ADAPTIVE_THRESHOLD_FACTOR = 0.75
+    ADAPTIVE_THRESHOLD_MAX = 200.0
+    ADAPTIVE_THRESHOLD_MIN = 30.0
+    SPATIAL_IOU_WEIGHT = 0.4
+    SPATIAL_DIST_WEIGHT = 0.4
+    SPATIAL_TIME_WEIGHT = 0.2
+    SPATIAL_MATCH_MIN_SCORE = 0.3
 
     # --- Faiss Index Parameters ---
     FAISS_M = 48  # HNSW M parameter
@@ -58,6 +66,37 @@ class Config:
     FAISS_EF_SEARCH = 64
     MIN_REBUILD_INTERVAL = 30  # seconds
     BATCH_SIZE_TRIGGER = 5  # enrollments
+
+    # --- EMA Parameters ---
+    EMA_ALPHA = 0.1
+
+    # --- Async DB Writer ---
+    ASYNC_DB_WRITER_QUEUE_SIZE = 1000
+
+    # --- Quality Checker Settings ---
+    Q_WEIGHTS = {
+        'aspect': 1.5,
+        'size': 1.5,
+        'sharpness': 2.0,
+        'edges': 1.0,
+        'brightness': 1.0,
+        'position': 0.5
+    }
+    Q_MIN_QUALITY_THRESHOLD = 0.6
+    Q_MAX_ASPECT_RATIO = 4.0
+    Q_MIN_ASPECT_RATIO = 0.5
+    Q_ASPECT_RATIO_OPTIMAL_MIN = 1.5
+    Q_ASPECT_RATIO_OPTIMAL_MAX = 3.0
+    Q_BBOX_AREA_EXCELLENT = 50000.0
+    Q_SHARPNESS_EXCELLENT = 200.0
+    Q_EDGE_DENSITY_MIN = 0.02
+    Q_EDGE_DENSITY_MAX = 0.30
+    Q_EDGE_DENSITY_OPTIMAL_MIN = 0.05
+    Q_EDGE_DENSITY_OPTIMAL_MAX = 0.20
+    Q_BRIGHTNESS_STD_MIN = 15
+    Q_BRIGHTNESS_MEAN_MIN = 30
+    Q_BRIGHTNESS_MEAN_MAX = 225
+    Q_FRAME_EDGE_MARGIN = 0.05
 
     # --- Model Paths ---
     YOLO_MODEL_PATH = '../models/yolov8l.pt'
