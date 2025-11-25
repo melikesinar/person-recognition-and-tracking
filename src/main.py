@@ -177,6 +177,139 @@ class PersonTrackerApp:
         """Wrapper for FaissManager.search()."""
         return self.faiss_manager.search(query_vector, self.current_match_threshold)
 
+    def _process_tracking_and_reid(self, detections, frame):
+        """
+        Handles BoostTrack update and batch Re-ID feature extraction.
+
+        Args:
+            detections (np.ndarray): Detections from the detector.
+            frame (np.ndarray): The current video frame.
+
+        Returns:
+            tuple: (tracker_results_list, vector_map)
+        """
+        res = self.tracker.update(detections, frame)
+        crops_to_process, track_ids_for_crops, tracker_results_list = [], [], []
+
+        for *box, track_id, conf, cls, ind in res:
+            track_id = int(track_id)
+            x1, y1, x2, y2 = map(int, box)
+            h, w, _ = frame.shape
+            x1, x2 = max(0, min(w - 1, x1)), max(0, min(w - 1, x2))
+            y1, y2 = max(0, min(h - 1, y1)), max(0, min(h - 1, y2))
+            if x2 <= x1 or y2 <= y1: continue
+            crop = frame[y1:y2, x1:x2]
+            if crop.size > 0:
+                crops_to_process.append(crop)
+                track_ids_for_crops.append(track_id)
+                tracker_results_list.append((box, track_id, conf, cls, ind, crop))
+
+        all_vectors = []
+        if crops_to_process:
+            all_vectors = self.reid_extractor.extract_embeddings_from_crops(crops_to_process)
+
+        vector_map = {}
+        if len(all_vectors) == len(track_ids_for_crops):
+            vector_map = {tid: vec for tid, vec in zip(track_ids_for_crops, all_vectors)}
+        else:
+            print(f"!!!! WARNING: Mismatch in batch Re-ID. Crops: {len(crops_to_process)}, Vectors: {len(all_vectors)}")
+
+
+        return tracker_results_list, vector_map
+
+    def _process_results(self, frame, tracker_results_list, vector_map):
+        """
+        Processes tracker results for matching, enrollment, and updates.
+
+        Args:
+            frame (np.ndarray): The current video frame.
+            tracker_results_list (list): List of tracker results.
+            vector_map (dict): Map of track IDs to feature vectors.
+
+        Returns:
+            set: A set of track IDs present in the current frame.
+        """
+        current_frame_track_ids = set()
+        for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
+            current_frame_track_ids.add(track_id)
+            current_vector = vector_map.get(track_id)
+            if current_vector is None: continue
+
+            x1, y1, x2, y2 = map(int, box)
+            label, color = f"T{track_id}", (0, 165, 255)
+
+            if track_id in self.buffer_manager.track_id_to_permanent_id_map:
+                pid = self.buffer_manager.track_id_to_permanent_id_map[track_id]
+                self.buffer_manager.last_known_box_for_pid[pid] = box
+                label, color = f"P{pid}", (0, 255, 0)
+                if (time.time() - self.buffer_manager.last_update_time_for_pid.get(pid, 0)) > Config.UPDATE_INTERVAL:
+                    self.incremental_update(pid, current_vector)
+                    self.buffer_manager.last_update_time_for_pid[pid] = time.time()
+            else:
+                now = time.time()
+                spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
+                    box, self.buffer_manager.lost_pid_buffer, now
+                )
+                if spatial_match_pid is not None:
+                    self.buffer_manager.track_id_to_permanent_id_map[track_id] = spatial_match_pid
+                    label = f"P{spatial_match_pid} (ReAcq:{best_match_score:.2f})"
+                    color = (0, 255, 128)
+                    if spatial_match_pid in self.buffer_manager.lost_pid_buffer:
+                        del self.buffer_manager.lost_pid_buffer[spatial_match_pid]
+                    self.buffer_manager.last_known_box_for_pid[spatial_match_pid] = box
+                else:
+                    match_id, match_sim = self.find_best_match(current_vector)
+                    if match_id is not None:
+                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = match_id
+                        label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)
+                    else:
+                        is_good, reason, q_score = self.advanced_quality_check(crop, box, frame.shape)
+                        buf = self.buffer_manager.active_track_buffers[track_id]
+                        if is_good:
+                            buf["vectors"].append(current_vector)
+                            buf.setdefault("quality_scores", []).append(q_score)
+                            avg_q = np.mean(buf["quality_scores"])
+                            label = f"New? T{track_id} ({len(buf['vectors'])}/{Config.MIN_ENROLL_FRAMES}) Q:{avg_q:.2f}"
+                        else:
+                            label = f"New? T{track_id} (REJECT: {reason})"
+                        buf["last_seen"] = time.time()
+                        if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
+                            avg_q = np.mean(buf.get("quality_scores", [0.5]))
+                            if avg_q >= 0.65:
+                                new_pid = self.enroll_person(buf["vectors"])
+                                if new_pid:
+                                    self.buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
+                                    del self.buffer_manager.active_track_buffers[track_id]
+                            else:
+                                buf["vectors"].clear()
+                                buf.get("quality_scores", []).clear()
+
+            self.visualizer.draw_person_bbox(frame, (x1, y1, x2, y2), label, color)
+        return current_frame_track_ids
+
+    def _perform_cleanup(self, current_frame_track_ids):
+        """
+        Performs periodic cleanup of stale tracks and buffers.
+
+        Args:
+            current_frame_track_ids (set): Set of track IDs in the current frame.
+        """
+        now = time.time()
+        self.buffer_manager.cleanup_stale_tracks(now)
+        disappeared_track_ids = [
+            tid for tid in self.buffer_manager.track_id_to_permanent_id_map
+            if tid not in current_frame_track_ids
+        ]
+        for tid in disappeared_track_ids:
+            pid = self.buffer_manager.track_id_to_permanent_id_map.pop(tid, None)
+            if pid and pid in self.buffer_manager.last_known_box_for_pid:
+                self.buffer_manager.add_to_lost_buffer(
+                    pid, self.buffer_manager.last_known_box_for_pid[pid], now
+                )
+        self.buffer_manager.cleanup_lost_pids(now)
+        if self.buffer_manager.should_run_cleanup(now):
+            self.cleanup_stale_buffers(now)
+
     def run(self):
         """
         The main application loop. It handles video capture, tracking update,
@@ -189,10 +322,6 @@ class PersonTrackerApp:
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
-
-        # WINDOW_NAME = "ReID Vectors (MongoDB - Faiss)"
-        # cv2.namedWindow(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN)
-        # cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
         with torch.inference_mode():
             detections = np.empty((0, 6), dtype=np.float32)
@@ -207,207 +336,30 @@ class PersonTrackerApp:
 
                 frame_count += 1
                 current_time = time.time()
-
-                # Set threshold to 0.0001 seconds
                 time_diff = current_time - prev_time
-                if time_diff > 0.0001:
-                    fps = 1.0 / time_diff
-                else:
-                    fps = 0.0   # Or keep the last known FPS value
-
+                fps = 1.0 / time_diff if time_diff > 0.0001 else 0.0
                 prev_time = current_time
 
-                # --- 1. Detection (Asynchronous Input) ---
                 if frame_count % Config.DETECTION_INTERVAL == 0:
                     try:
                         self.frame_queue.put_nowait(frame.copy())
                     except queue.Full:
-                        # Skip if detector is still busy
                         pass
-
                 try:
-                    # Get the latest detections from the worker thread
                     detections = self.detection_queue.get_nowait()
                 except queue.Empty:
-                    # Use old detections if new ones aren't ready
                     pass
 
-                # --- 2. Tracking (BoostTrack Update) ---
-                res = self.tracker.update(detections, frame)
+                tracker_results_list, vector_map = self._process_tracking_and_reid(detections, frame)
+                current_frame_track_ids = self._process_results(frame, tracker_results_list, vector_map)
+                self._perform_cleanup(current_frame_track_ids)
 
-                # --- 3. Batch Re-Identification Feature Extraction ---
-                crops_to_process = []
-                track_ids_for_crops = []
-                tracker_results_list = []
-
-                # Prepare list of crops for batch processing
-                for *box, track_id, conf, cls, ind in res:
-                    track_id = int(track_id)
-                    x1, y1, x2, y2 = map(int, box)
-                    h, w, _ = frame.shape
-                    # Boundary clamping
-                    x1 = max(0, min(w - 1, x1))
-                    x2 = max(0, min(w - 1, x2))
-                    y1 = max(0, min(h - 1, y1))
-                    y2 = max(0, min(h - 1, y2))
-                    if x2 <= x1 or y2 <= y1: continue
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        crops_to_process.append(crop)
-                        track_ids_for_crops.append(track_id)
-                        tracker_results_list.append((box, track_id, conf, cls, ind, crop))
-
-                all_vectors = []
-                if crops_to_process:
-                    # Extract all vectors in a single efficient batch
-                    all_vectors = self.reid_extractor.extract_embeddings_from_crops(crops_to_process)
-
-                vector_map = {}
-                if len(all_vectors) == len(track_ids_for_crops):
-                    vector_map = {tid: vec for tid, vec in zip(track_ids_for_crops, all_vectors)}
-                else:
-                    print(
-                        f"!!!! WARNING: Mismatch in batch Re-ID. Crops: {len(crops_to_process)}, Vectors: {len(all_vectors)}")
-
-                # --- 4. Process Results (Matching, Enrollment, Update) ---
-                current_frame_track_ids = set()
-                for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
-                    current_frame_track_ids.add(track_id)
-                    current_vector = vector_map.get(track_id)
-                    if current_vector is None:
-                        continue
-
-                    x1, y1, x2, y2 = map(int, box)
-                    label, color = f"T{track_id}", (0, 165, 255)  # Default: Transient Track ID (Orange)
-
-                    if track_id in self.buffer_manager.track_id_to_permanent_id_map:
-                        # Existing known person
-                        pid = self.buffer_manager.track_id_to_permanent_id_map[track_id]
-                        self.buffer_manager.last_known_box_for_pid[pid] = box
-                        label, color = f"P{pid}", (0, 255, 0)  # Green for P-ID match
-
-                        # Incremental master vector update check
-                        if (time.time() - self.buffer_manager.last_update_time_for_pid[pid]) > Config.UPDATE_INTERVAL:
-                            self.incremental_update(pid, current_vector)
-                            self.buffer_manager.last_update_time_for_pid[pid] = time.time()
-                    else:
-                        # --- Spatial Re-acquisition with Motion Prediction ---
-                        now = time.time()
-                        spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
-                            box,
-                            self.buffer_manager.lost_pid_buffer,
-                            now
-                        )
-
-                        if spatial_match_pid is not None:
-                            # SPATIAL MATCH FOUND: Assign P-ID to the current T-ID
-                            self.buffer_manager.track_id_to_permanent_id_map[track_id] = spatial_match_pid
-                            label = f"P{spatial_match_pid} (ReAcq:{best_match_score:.2f})"
-                            color = (0, 255, 128)  # Greenish for re-acquired
-
-                            # Remove from lost buffer and update position
-                            del self.buffer_manager.lost_pid_buffer[spatial_match_pid]
-                            self.buffer_manager.last_known_box_for_pid[spatial_match_pid] = box
-                            print(f"DEBUG: P{spatial_match_pid} spatially re-acquired by T{track_id}. "
-                                  f"Match score: {best_match_score:.2f}")
-                        else:
-                            # --- Re-ID Match Search (Faiss) ---
-                            match_id, match_sim = self.find_best_match(current_vector)
-
-                            if match_id is not None:
-                                # Re-ID match found
-                                self.buffer_manager.track_id_to_permanent_id_map[track_id] = match_id
-                                label, color = f"P{match_id} (S:{match_sim:.2f})", (0, 255, 0)
-                            else:
-                                # --- Enrollment Candidate Processing ---
-                                is_good_quality, reason, quality_score = self.advanced_quality_check(
-                                    crop, box, frame.shape
-                                )
-
-                                if len(self.known_persons_db) > 0:
-                                    print(
-                                        f"DEBUG: New person (T{track_id}). Best sim: {match_sim:.4f}. "
-                                        f"Quality: {quality_score:.2f} | Reason: {reason}")
-
-                                buf = self.buffer_manager.active_track_buffers[track_id]
-                                if is_good_quality:
-                                    # Collect vector if quality is sufficient
-                                    buf["vectors"].append(current_vector)
-                                    buf["quality_scores"] = buf.get("quality_scores", [])
-                                    buf["quality_scores"].append(quality_score)
-
-                                    # Display enrollment progress and quality
-                                    avg_quality = np.mean(buf["quality_scores"])
-                                    label = f"New? T{track_id} ({len(buf['vectors'])}/{Config.MIN_ENROLL_FRAMES}) Q:{avg_quality:.2f}"
-                                else:
-                                    label = f"New? T{track_id} (REJECT: {reason})"
-
-                                buf["last_seen"] = time.time()
-
-                                # Enrollment decision
-                                if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
-                                    avg_quality = np.mean(buf.get("quality_scores", [0.5]))
-
-                                    # Final quality threshold check
-                                    if avg_quality >= 0.65:
-                                        new_pid = self.enroll_person(buf["vectors"])
-                                        if new_pid:
-                                            print(f"ENROLLED: New person P{new_pid}. "
-                                                  f"Vectors: {len(buf['vectors'])} | Avg Quality: {avg_quality:.2f}")
-                                            self.buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
-                                            del self.buffer_manager.active_track_buffers[track_id]
-                                    else:
-                                        print(f"REJECTED ENROLLMENT: T{track_id} failed quality threshold. "
-                                              f"Avg Quality: {avg_quality:.2f} < 0.65. Resetting buffer.")
-                                        # Reset buffer to collect better samples
-                                        buf["vectors"].clear()
-                                        buf["quality_scores"].clear()
-
-                    # Draw bounding box and label
-                    self.visualizer.draw_person_bbox(frame, (x1, y1, x2, y2), label, color)
-
-                # --- 5. Cleanup ---
-                now = time.time()
-
-                # 1. Clean stale track buffers
-                self.buffer_manager.cleanup_stale_tracks(now)
-
-                # 2. Handle disappeared PIDs
-                disappeared_track_ids = [
-                    tid for tid in self.buffer_manager.track_id_to_permanent_id_map
-                    if tid not in current_frame_track_ids
-                ]
-
-                for tid in disappeared_track_ids:
-                    pid = self.buffer_manager.track_id_to_permanent_id_map.pop(tid, None)
-                    if pid and pid in self.buffer_manager.last_known_box_for_pid:
-                        self.buffer_manager.add_to_lost_buffer(
-                            pid,
-                            self.buffer_manager.last_known_box_for_pid[pid],
-                            now
-                        )
-
-                # 3. Clean expired lost PIDs
-                self.buffer_manager.cleanup_lost_pids(now)
-
-                # 4. Periodic buffer cleanup
-                if self.buffer_manager.should_run_cleanup(now):
-                    self.cleanup_stale_buffers(now)
-
-                # Display HUD
                 self.visualizer.draw_hud(
-                    frame,
-                    fps,
-                    self.current_detection_threshold,
-                    self.current_match_threshold,
-                    len(self.known_persons_db),
-                    self.USE_TTA
+                    frame, fps, self.current_detection_threshold,
+                    self.current_match_threshold, len(self.known_persons_db), self.USE_TTA
                 )
-
                 cv2.imshow("ReID Vectors (MongoDB - Faiss)", frame)
-
-                key = self.handle_keyboard_input()
-                if key == 'q':
+                if self.handle_keyboard_input() == 'q':
                     break
 
     def handle_keyboard_input(self):
@@ -480,8 +432,6 @@ class PersonTrackerApp:
                     self.person_manager.delete_person(last_id)
 
                     # Clear associated buffers
-                    if last_id in self.buffer_manager.recent_vector_buffers:
-                        del self.buffer_manager.recent_vector_buffers[last_id]
                     if last_id in self.buffer_manager.last_update_time_for_pid:
                         del self.buffer_manager.last_update_time_for_pid[last_id]
                     if last_id in self.buffer_manager.last_known_box_for_pid:
