@@ -43,11 +43,10 @@ class BufferManager:
         """
         stale_pids = []
 
-        # Check last_update_time_for_pid
-        for pid in list(self.last_update_time_for_pid.keys()):
-            if pid not in known_persons_db:
-                if pid not in stale_pids:
-                    stale_pids.append(pid)
+        # Check for idle PIDs that haven't been updated in a long time
+        for pid, last_update_time in self.last_update_time_for_pid.items():
+            if (current_time - last_update_time) > Config.BUFFER_MAX_IDLE_TIME:
+                stale_pids.append(pid)
 
         # Remove stale entries
         if stale_pids:
@@ -57,7 +56,7 @@ class BufferManager:
                 if pid in self.last_known_box_for_pid:
                     del self.last_known_box_for_pid[pid]
 
-            print(f"BUFFER CLEANUP: Removed {len(stale_pids)} stale buffer(s).")
+            print(f"BUFFER CLEANUP: Removed {len(stale_pids)} stale buffer(s) due to inactivity.")
 
     def cleanup_stale_tracks(self, current_time):
         """
