@@ -184,6 +184,7 @@ class PersonTrackerApp:
     def _process_tracking_and_reid(self, detections, frame):
         """
         Handles BoostTrack update and batch Re-ID feature extraction.
+        Implements QUALITY GATING: Only extracts features from high-quality crops.
 
         Args:
             detections (np.ndarray): Detections from the detector.
@@ -202,10 +203,18 @@ class PersonTrackerApp:
             x1, x2 = max(0, min(w - 1, x1)), max(0, min(w - 1, x2))
             y1, y2 = max(0, min(h - 1, y1)), max(0, min(h - 1, y2))
             if x2 <= x1 or y2 <= y1: continue
+            
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
-                crops_to_process.append(crop)
-                track_ids_for_crops.append(track_id)
+                # --- Quality Gating ---
+                # Check quality BEFORE heavy ReID extraction
+                is_good, _, _ = self.quality_checker.assess_quality(crop, box, frame.shape)
+                
+                if is_good:
+                    crops_to_process.append(crop)
+                    track_ids_for_crops.append(track_id)
+                
+                # We store the result regardless of quality so we can still draw the box
                 tracker_results_list.append((box, track_id, conf, cls, ind, crop))
 
         all_vectors = []
@@ -218,17 +227,17 @@ class PersonTrackerApp:
         else:
             print(f"!!!! WARNING: Mismatch in batch Re-ID. Crops: {len(crops_to_process)}, Vectors: {len(all_vectors)}")
 
-
         return tracker_results_list, vector_map
 
     def _process_results(self, frame, tracker_results_list, vector_map):
         """
         Processes tracker results for matching, enrollment, and updates.
+        Handles both High-Quality (ReID available) and Low-Quality (Spatial only) tracks.
 
         Args:
             frame (np.ndarray): The current video frame.
             tracker_results_list (list): List of tracker results.
-            vector_map (dict): Map of track IDs to feature vectors.
+            vector_map (dict): Map of track IDs to feature vectors (only for high-quality crops).
 
         Returns:
             set: A set of track IDs present in the current frame.
@@ -237,61 +246,82 @@ class PersonTrackerApp:
         for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
             current_frame_track_ids.add(track_id)
             current_vector = vector_map.get(track_id)
-            if current_vector is None: continue
-
+            
             x1, y1, x2, y2 = map(int, box)
             label, color = f"T{track_id}", (0, 165, 255)
-            pid = None
+            pid = self.buffer_manager.track_id_to_permanent_id_map.get(track_id)
 
-            if track_id in self.buffer_manager.track_id_to_permanent_id_map:
-                pid = self.buffer_manager.track_id_to_permanent_id_map[track_id]
-                label, color = f"P{pid}", (0, 255, 0)
-                if (time.time() - self.buffer_manager.last_update_time_for_pid.get(pid, 0)) > Config.UPDATE_INTERVAL:
-                    self.incremental_update(pid, current_vector)
-                    self.buffer_manager.last_update_time_for_pid[pid] = time.time()
-            else:
-                now = time.time()
-                spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
-                    box, self.buffer_manager.lost_pid_buffer, now
-                )
-                if spatial_match_pid is not None:
-                    pid = spatial_match_pid
-                    self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
-                    label = f"P{pid} (ReAcq:{best_match_score:.2f})"
-                    color = (0, 255, 128)
-                    if pid in self.buffer_manager.lost_pid_buffer:
-                        del self.buffer_manager.lost_pid_buffer[pid]
+            # --- High Quality: Re-ID Vector Available ---
+            if current_vector is not None:
+                if pid:
+                    label, color = f"P{pid}", (0, 255, 0)
+                    if (time.time() - self.buffer_manager.last_update_time_for_pid.get(pid, 0)) > Config.UPDATE_INTERVAL:
+                        self.incremental_update(pid, current_vector)
+                        self.buffer_manager.last_update_time_for_pid[pid] = time.time()
                 else:
-                    match_id, match_sim = self.find_best_match(current_vector)
-                    if match_id is not None:
-                        pid = match_id
+                    now = time.time()
+                    spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
+                        box, self.buffer_manager.lost_pid_buffer, now
+                    )
+                    if spatial_match_pid is not None:
+                        pid = spatial_match_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
-                        label, color = f"P{pid} (S:{match_sim:.2f})", (0, 255, 0)
+                        label = f"P{pid} (ReAcq:{best_match_score:.2f})"
+                        color = (0, 255, 128)
+                        if pid in self.buffer_manager.lost_pid_buffer:
+                            del self.buffer_manager.lost_pid_buffer[pid]
                     else:
-                        # --- Enrollment Logic ---
-                        is_good, reason, q_score = self.advanced_quality_check(crop, box, frame.shape)
-                        buf = self.buffer_manager.active_track_buffers[track_id]
-                        if is_good:
+                        match_id, match_sim = self.find_best_match(current_vector)
+                        if match_id is not None:
+                            pid = match_id
+                            self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
+                            label, color = f"P{pid} (S:{match_sim:.2f})", (0, 255, 0)
+                        else:
+                            # --- Enrollment Logic ---
+                            # Note: Crop is already known to be "good" quality by _process_tracking_and_reid
+                            # But we re-check 'reason' and 'q_score' if we want detailed logs/display
+                            is_good, reason, q_score = self.advanced_quality_check(crop, box, frame.shape)
+                            buf = self.buffer_manager.active_track_buffers[track_id]
+                            
                             buf["vectors"].append(current_vector)
                             buf.setdefault("quality_scores", []).append(q_score)
                             avg_q = np.mean(buf["quality_scores"])
-                            label = f"New? T{track_id} ({len(buf['vectors'])}/{Config.MIN_ENROLL_FRAMES}) Q:{avg_q:.2f}"
-                        else:
-                            label = f"New? T{track_id} (REJECT: {reason})"
-                        buf["last_seen"] = time.time()
-                        if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
-                            avg_q = np.mean(buf.get("quality_scores", [0.5]))
-                            if avg_q >= 0.65:
-                                new_pid = self.enroll_person(buf["vectors"])
-                                if new_pid:
-                                    self.buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
-                                    if track_id in self.buffer_manager.active_track_buffers:
-                                        del self.buffer_manager.active_track_buffers[track_id]
-                            else:
-                                buf["vectors"].clear(); buf.get("quality_scores", []).clear()
-            
-            # --- This is the FIX ---
-            # If a person is identified, ensure they are in the cache and update their timestamp.
+                            label = f"New? T{track_id} ({len(buf['vectors'])}/{Config.MIN_ENROLL_FRAMES})"
+                            
+                            buf["last_seen"] = time.time()
+                            if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
+                                avg_q = np.mean(buf.get("quality_scores", [0.5]))
+                                if avg_q >= 0.65:
+                                    new_pid = self.enroll_person(buf["vectors"])
+                                    if new_pid:
+                                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
+                                        if track_id in self.buffer_manager.active_track_buffers:
+                                            del self.buffer_manager.active_track_buffers[track_id]
+                                else:
+                                    buf["vectors"].clear(); buf.get("quality_scores", []).clear()
+
+            # --- Low Quality: Spatial Tracking Only ---
+            else:
+                if pid:
+                    # We know who this is, but the image is currently bad
+                    label, color = f"P{pid} (LowQ)", (100, 255, 100) # Slightly dimmer green
+                else:
+                    # Unknown person and bad quality -> Try spatial recovery only
+                    now = time.time()
+                    spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
+                        box, self.buffer_manager.lost_pid_buffer, now
+                    )
+                    if spatial_match_pid is not None:
+                        pid = spatial_match_pid
+                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
+                        label = f"P{pid} (LowQ-ReAcq)"
+                        color = (100, 255, 128)
+                        if pid in self.buffer_manager.lost_pid_buffer:
+                            del self.buffer_manager.lost_pid_buffer[pid]
+                    else:
+                        label, color = f"T{track_id} (LowQ)", (0, 100, 155)
+
+            # --- Common Update Logic ---
             if pid is not None:
                 self.buffer_manager.last_known_box_for_pid[pid] = box
                 if pid not in self.known_persons_db:
@@ -346,8 +376,8 @@ class PersonTrackerApp:
         """
         self.detector_worker_instance.start()
 
-        cap = cv2.VideoCapture("../videos/3.mp4")
-        # cap = cv2.VideoCapture(0)
+        # cap = cv2.VideoCapture("../videos/3.mp4")
+        cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
