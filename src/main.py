@@ -4,6 +4,7 @@ import time
 import torch
 import queue
 import threading
+import multiprocessing
 import numpy as np
 from pathlib import Path
 from boxmot import BoostTrack
@@ -44,7 +45,9 @@ class PersonTrackerApp:
 
         # Live tuning thresholds
         self.current_match_threshold = Config.MATCH_SIMILARITY_THRESHOLD
-        self.current_detection_threshold = Config.DETECTION_SCORE_THRESHOLD
+        
+        # Shared value for detection threshold (multiprocessing safe)
+        self.detection_threshold_value = multiprocessing.Value('d', Config.DETECTION_SCORE_THRESHOLD)
 
         # TTA settings
         self.USE_TTA = Config.USE_TTA_DEFAULT
@@ -73,20 +76,22 @@ class PersonTrackerApp:
         self.quality_checker = QualityChecker()
         self.visualizer = Visualizer()
 
-        # --- Thread Communication (for detector) ---
-        self.frame_queue = queue.Queue(maxsize=1)
-        self.detection_queue = queue.Queue(maxsize=1)
+        # --- Thread/Process Communication (for detector) ---
+        # Use multiprocessing Queues for inter-process communication
+        self.frame_queue = multiprocessing.Queue(maxsize=1)
+        self.detection_queue = multiprocessing.Queue(maxsize=1)
 
         # --- Load Models ---
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {self.device}")
+        device_str = 0 if self.device.type == 'cuda' else 'cpu'
+        print(f"Using device: {self.device} (passed to worker as {device_str})")
 
         # --- Load Detector ---
         self.detector_worker_instance = DetectorWorker(
             self.frame_queue,
             self.detection_queue,
-            self.current_detection_threshold,
-            self.device
+            self.detection_threshold_value,
+            device_str
         )
 
         # --- Load ReidExtractor ---
@@ -341,7 +346,8 @@ class PersonTrackerApp:
         """
         self.detector_worker_instance.start()
 
-        cap = cv2.VideoCapture("../videos/3.mp4")  # Assumes default camera
+        cap = cv2.VideoCapture("../videos/3.mp4")
+        # cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return
@@ -378,7 +384,7 @@ class PersonTrackerApp:
                 self._perform_cleanup(current_frame_track_ids)
 
                 self.visualizer.draw_hud(
-                    frame, fps, self.current_detection_threshold,
+                    frame, fps, self.detection_threshold_value.value,
                     self.current_match_threshold, len(self.known_persons_db), self.USE_TTA
                 )
                 cv2.imshow("ReID Vectors (MongoDB - Faiss)", frame)
@@ -401,11 +407,11 @@ class PersonTrackerApp:
 
         # Live-tuning and other controls...
         elif key == ord('u'):
-            self.current_detection_threshold = min(1.0, self.current_detection_threshold + 0.05)
-            self.detector_worker_instance.set_detection_threshold(self.current_detection_threshold)
+            new_val = min(1.0, self.detection_threshold_value.value + 0.05)
+            self.detector_worker_instance.set_detection_threshold(new_val)
         elif key == ord('j'):
-            self.current_detection_threshold = max(0.0, self.current_detection_threshold - 0.05)
-            self.detector_worker_instance.set_detection_threshold(self.current_detection_threshold)
+            new_val = max(0.0, self.detection_threshold_value.value - 0.05)
+            self.detector_worker_instance.set_detection_threshold(new_val)
         elif key == ord('y'):
             self.current_match_threshold = min(1.0, self.current_match_threshold + 0.05)
         elif key == ord('h'):

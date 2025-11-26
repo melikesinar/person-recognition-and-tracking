@@ -1,65 +1,52 @@
-import torch
+import multiprocessing
 import queue
-import threading
 import numpy as np
 from ultralytics import YOLO
 from utils.config import Config
 
 
-class DetectorWorker:
+class DetectorWorker(multiprocessing.Process):
     """
     Manages the YOLOv8 object detection model and executes detection
-    inside a dedicated background thread to avoid blocking the main pipeline.
+    inside a dedicated background PROCESS to avoid blocking the main pipeline (GIL).
     """
 
-    def __init__(self, frame_queue, detection_queue, detection_threshold, device):
+    def __init__(self, frame_queue, detection_queue, detection_threshold_value, device_str):
         """
         Initializes the background detector worker.
 
         Args:
-            frame_queue (queue.Queue): Queue for incoming frames to process.
-            detection_queue (queue.Queue): Queue to push processed detection results.
-            detection_threshold (float): Live-tunable detection confidence threshold.
-            device (torch.device): CUDA or CPU device.
+            frame_queue (multiprocessing.Queue): Queue for incoming frames to process.
+            detection_queue (multiprocessing.Queue): Queue to push processed detection results.
+            detection_threshold_value (multiprocessing.Value): Shared float for live tuning.
+            device_str (str): "cuda" or "cpu" string.
         """
+        super().__init__()
         self.frame_queue = frame_queue
         self.detection_queue = detection_queue
-        self.device = device
-
-        # Live-updatable threshold (kept local for thread-safe reads)
-        self._current_detection_threshold = detection_threshold
-
-        print("Loading YOLOv8 Object Detector...")
-        self.detector = YOLO(Config.YOLO_MODEL_PATH)   # No explicit .to(device) required
-        print("SUCCESS: YOLOv8 Detector Loaded.")
-
-        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.shared_threshold = detection_threshold_value
+        self.device_str = device_str
+        self.daemon = True
 
         # Pre-allocated empty detection array for fast returns
         self.EMPTY = np.zeros((0, 6), dtype=np.float32)
 
     def set_detection_threshold(self, threshold):
         """Updates the live detection threshold used during filtering."""
-        self._current_detection_threshold = threshold
-
-    def start(self):
-        """Starts the detector worker thread."""
-        self.thread.start()
-        print("Detector thread started.")
+        self.shared_threshold.value = threshold
 
     def stop(self):
         """
-        Signals the thread to stop by sending a sentinel value into the queue,
-        then waits for the thread to exit cleanly.
+        Signals the process to stop by sending a sentinel value into the queue,
+        then waits for the process to exit cleanly.
         """
         self.frame_queue.put(None)
-        self.thread.join()
+        self.join()
 
     def _clear_detection_queue(self):
         """
         Removes all pending items from the detection queue.
-        Ensures only the *latest* detection result is kept,
-        preventing queue buildup and stale results.
+        Ensures only the *latest* detection result is kept.
         """
         while not self.detection_queue.empty():
             try:
@@ -67,45 +54,55 @@ class DetectorWorker:
             except queue.Empty:
                 break
 
-    def _worker_loop(self):
+    def run(self):
         """
-        Main execution loop for the worker thread.
-        Continuously pulls frames from the input queue, performs YOLO detection,
-        filters results based on the live threshold, and pushes detections
-        into the result queue.
+        Main execution loop for the worker process.
+        Initializes YOLO inside the process and continuously processes frames.
         """
-        while True:
-            frame = self.frame_queue.get()
+        print(f"Detector Process Started. Loading YOLOv8 on {self.device_str}...")
+        
+        try:
+            # Load model INSIDE the process to avoid pickling issues
+            detector = YOLO(Config.YOLO_MODEL_PATH)
+            # Force device if needed, though YOLO usually auto-detects. 
+            # Passing device to YOLO(...) or detector.to() can be done if strictly required.
+            
+            print("SUCCESS: YOLOv8 Detector Loaded in background process.")
+            
+            while True:
+                try:
+                    frame = self.frame_queue.get()
+                except Exception:
+                    break
 
-            # Exit signal for thread termination
-            if frame is None:
-                print("Detector thread stopping...")
-                break
+                # Exit signal
+                if frame is None:
+                    print("Detector process stopping...")
+                    break
 
-            # Perform YOLO detection (person class only, class_id = 0)
-            output = self.detector(frame, classes=0, verbose=False)
+                # Perform YOLO detection
+                # verbose=False prevents stdout spam
+                output = detector(frame, classes=0, verbose=False, device=self.device_str)
 
-            # Basic validation of YOLO output
-            if not output or output[0] is None or output[0].boxes is None:
-                new_det = self.EMPTY
-            else:
-                boxes = output[0].boxes
-
-                # Convert boxes to numpy: [x1, y1, x2, y2, score, class_id]
-                det = boxes.data.cpu().numpy()
-
-                if det.size == 0:
+                if not output or output[0] is None or output[0].boxes is None:
                     new_det = self.EMPTY
                 else:
-                    # Apply live configurable confidence threshold
-                    new_det = det[det[:, 4] >= self._current_detection_threshold]
+                    boxes = output[0].boxes
+                    det = boxes.data.cpu().numpy()
 
-                    # Safety: ensure only 6 columns
-                    if new_det.shape[1] > 6:
-                        new_det = new_det[:, :6]
+                    if det.size == 0:
+                        new_det = self.EMPTY
+                    else:
+                        # Read threshold from shared memory
+                        thresh = self.shared_threshold.value
+                        new_det = det[det[:, 4] >= thresh]
 
-            # Replace previous result with the latest one
-            self._clear_detection_queue()
+                        if new_det.shape[1] > 6:
+                            new_det = new_det[:, :6]
 
-            # Push fresh detections to output queue
-            self.detection_queue.put(new_det)
+                self._clear_detection_queue()
+                self.detection_queue.put(new_det)
+                
+        except Exception as e:
+            print(f"!!!! CRITICAL ERROR in Detector Process !!!!: {e}")
+
