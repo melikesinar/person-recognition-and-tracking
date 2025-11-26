@@ -178,12 +178,13 @@ class FaissManager:
 
         return None, -1.0
 
-    def trigger_rebuild_if_needed(self, new_enrollment=False):
+    def trigger_rebuild_if_needed(self, new_enrollment=False, force=False):
         """
         Checks if index rebuild should be triggered based on batch size or time.
         This is now self-sufficient and does not need persons_db.
         Args:
             new_enrollment (bool): Whether this call is due to a new enrollment
+            force (bool): If True, forces an immediate rebuild ignoring thresholds
         """
         if new_enrollment:
             self.pending_enrollments.append(time.time())
@@ -191,8 +192,8 @@ class FaissManager:
         time_since_rebuild = time.time() - self.last_index_rebuild
         pending_count = len(self.pending_enrollments)
         
-        # Rebuild if enough new people are pending, or if it's been a while since the last enrollment
-        should_rebuild = (
+        # Rebuild if forced, or enough new people are pending, or if it's been a while since the last enrollment
+        should_rebuild = force or (
             pending_count > 0 and (
                 pending_count >= Config.BATCH_SIZE_TRIGGER or
                 time_since_rebuild > Config.MIN_REBUILD_INTERVAL
@@ -200,7 +201,7 @@ class FaissManager:
         )
 
         if should_rebuild and not self.index_build_in_progress:
-            print(f"Triggering index rebuild (pending enrollments: {pending_count})")
+            print(f"Triggering index rebuild (force={force}, pending enrollments: {pending_count})")
             self.pending_enrollments.clear()
             self.last_index_rebuild = time.time()
             

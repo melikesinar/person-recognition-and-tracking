@@ -132,8 +132,11 @@ class PersonManager:
             del self.known_persons_db[pid]
             print(f"DELETED: P{pid} removed from cache.")
 
+        # Ensure the delete is processed by DB before rebuilding index
+        self.async_writer.flush()
+
         # Trigger index rebuild to remove the person from search results
-        self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True)
+        self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True, force=True)
 
 
     def reset_all(self):

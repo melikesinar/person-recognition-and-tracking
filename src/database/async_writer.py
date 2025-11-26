@@ -64,6 +64,15 @@ class AsyncDBWriter:
         """Queue a full database reset."""
         self.write_queue.put({"type": "reset"})
 
+    def flush(self):
+        """
+        Blocks until all currently queued operations are processed.
+        Useful for ensuring consistency before critical operations (like index rebuild).
+        """
+        barrier_event = threading.Event()
+        self.write_queue.put({"type": "barrier", "event": barrier_event})
+        barrier_event.wait()
+
     def _writer_worker(self):
         """Background worker thread that processes queued operations."""
         print("Database writer thread started...")
@@ -85,6 +94,8 @@ class AsyncDBWriter:
                     self._handle_delete(operation["pid"])
                 elif op_type == "reset":
                     self._handle_reset()
+                elif op_type == "barrier":
+                    operation["event"].set()
                 else:
                     print(f"!!!! Unknown DB operation type: {op_type} !!!!")
 
