@@ -3,6 +3,7 @@ Configuration management for the Person Re-ID system.
 Handles environment variables and default settings.
 """
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -12,6 +13,10 @@ load_dotenv()
 class Config:
     """Central configuration class for all system parameters."""
 
+    # --- Path Configuration ---
+    # Resolve project root: src/utils/config.py -> src/utils -> src -> root
+    BASE_DIR = Path(__file__).resolve().parent.parent.parent
+    
     # --- Database Configuration ---
     MONGO_URI = os.getenv("MONGO_URI")
     DB_NAME = os.getenv("DB_NAME")
@@ -99,13 +104,15 @@ class Config:
     Q_FRAME_EDGE_MARGIN = 0.05
 
     # --- Model Paths ---
-    YOLO_MODEL_PATH = '../models/yolov8l.pt'
-    REID_MODEL_PATH = '../models/osnet_x1_0_msmt17.pt'
+    # Use dynamic paths based on project root
+    YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8l.pt")
+    REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
     # --- TTA Settings ---
     USE_TTA_DEFAULT = True
     TTA_HORIZONTAL_FLIP = True
     TTA_MULTI_SCALE = False
+
 
     @staticmethod
     def validate():
