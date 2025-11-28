@@ -1,27 +1,26 @@
 # main_reid_vectors.py
 import cv2
 import time
-import torch
 import queue
+import torch
 import threading
-import multiprocessing
 import numpy as np
+import multiprocessing
 from pathlib import Path
 from boxmot import BoostTrack
-from datetime import datetime
 
 # Import modular components
 from utils.config import Config
 from utils.visualizer import Visualizer
-from core.quality_checker import QualityChecker
 from core.detector import DetectorWorker
 from core.reid_extractor import ReidExtractor
+from core.quality_checker import QualityChecker
 from database.faiss_manager import FaissManager
 from database.async_writer import AsyncDBWriter
 from database.mongo_handler import MongoHandler
 from tracking.person_manager import PersonManager
-from tracking.spatial_matcher import SpatialMatcher
 from tracking.buffer_manager import BufferManager
+from tracking.spatial_matcher import SpatialMatcher
 
 # Validate configuration
 Config.validate()
@@ -376,8 +375,8 @@ class PersonTrackerApp:
         """
         self.detector_worker_instance.start()
 
-        # cap = cv2.VideoCapture("../videos/3.mp4")
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture("../videos/3.mp4")
+        # cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("!!!! ERROR: Could not open camera. !!!!")
             return

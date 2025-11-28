@@ -3,5 +3,6 @@
 .gemini
 /videos
 /models
+/Misc
 **/__pycache__
 .idea
