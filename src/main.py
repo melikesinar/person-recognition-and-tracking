@@ -55,8 +55,8 @@ class PersonTrackerApp:
         # --- Database Connection ---
         try:
             self.mongo_handler = MongoHandler()
-        except RuntimeError:
-            exit()  # Exit if connection fails
+        except RuntimeError as e:
+            raise RuntimeError(f"Failed to initialize MongoDB handler: {e}")
 
         # --- Initialize Modular Components ---
         self.faiss_manager = FaissManager(self.mongo_handler)
@@ -375,10 +375,9 @@ class PersonTrackerApp:
         """
         self.detector_worker_instance.start()
 
-        cap = cv2.VideoCapture("../videos/3.mp4")
-        # cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(Config.VIDEO_SOURCE)
         if not cap.isOpened():
-            print("!!!! ERROR: Could not open camera. !!!!")
+            print(f"!!!! ERROR: Could not open video source: {Config.VIDEO_SOURCE} !!!!")
             return
 
         with torch.inference_mode():

@@ -108,6 +108,10 @@ class Config:
     YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8l.pt")
     REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
+    # --- Video Source ---
+    # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
+    VIDEO_SOURCE = 0  # Uncomment for webcam
+
     # --- TTA Settings ---
     USE_TTA_DEFAULT = True
     TTA_HORIZONTAL_FLIP = True
@@ -123,6 +127,8 @@ class Config:
             raise ValueError("DB_NAME environment variable is not set!")
         if not Config.COLLECTION:
             raise ValueError("COLLECTION environment variable is not set!")
+        if not Config.FAISS_COLLECTION:
+            raise ValueError("FAISS_COLLECTION environment variable is not set!")
 
         print("✓ Configuration validated successfully.")
 
