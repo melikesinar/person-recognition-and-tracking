@@ -127,7 +127,8 @@ class QualityChecker:
                 # Optimal range: 0.05 - 0.20
                 score = 1.0 if Config.Q_EDGE_DENSITY_OPTIMAL_MIN <= edge_density <= Config.Q_EDGE_DENSITY_OPTIMAL_MAX else 0.7
                 return score, None
-        except Exception:
+        except Exception as e:
+            print(f"Error in check_edge_density: {e}")
             return 0.5, None  # Neutral score on error
 
     def check_brightness(self, crop):
@@ -151,7 +152,8 @@ class QualityChecker:
                 return 0.3, "extreme_lighting"
             else:
                 return 1.0, None
-        except Exception:
+        except Exception as e:
+            print(f"Error in check_brightness: {e}")
             return 0.5, None
 
     def check_position(self, bbox, frame_shape):
