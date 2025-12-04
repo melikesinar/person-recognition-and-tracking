@@ -79,6 +79,7 @@ class PersonTrackerApp:
         # Use multiprocessing Queues for inter-process communication
         self.frame_queue = multiprocessing.Queue(maxsize=1)
         self.detection_queue = multiprocessing.Queue(maxsize=1)
+        self.detector_ready_event = multiprocessing.Event()
 
         # --- Load Models ---
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -90,7 +91,8 @@ class PersonTrackerApp:
             self.frame_queue,
             self.detection_queue,
             self.detection_threshold_value,
-            device_str
+            device_str,
+            self.detector_ready_event
         )
 
         # --- Load ReidExtractor ---
@@ -374,6 +376,10 @@ class PersonTrackerApp:
         enrollment logic, drawing results, and user input processing.
         """
         self.detector_worker_instance.start()
+        
+        print("Waiting for YOLO model to load in background process...")
+        self.detector_ready_event.wait()
+        print("YOLO model loaded. Starting video stream.")
 
         cap = cv2.VideoCapture(Config.VIDEO_SOURCE)
         if not cap.isOpened():

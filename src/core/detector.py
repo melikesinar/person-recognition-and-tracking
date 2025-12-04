@@ -11,7 +11,7 @@ class DetectorWorker(multiprocessing.Process):
     inside a dedicated background PROCESS to avoid blocking the main pipeline (GIL).
     """
 
-    def __init__(self, frame_queue, detection_queue, detection_threshold_value, device_str):
+    def __init__(self, frame_queue, detection_queue, detection_threshold_value, device_str, ready_event):
         """
         Initializes the background detector worker.
 
@@ -20,12 +20,14 @@ class DetectorWorker(multiprocessing.Process):
             detection_queue (multiprocessing.Queue): Queue to push processed detection results.
             detection_threshold_value (multiprocessing.Value): Shared float for live tuning.
             device_str (str): "cuda" or "cpu" string.
+            ready_event (multiprocessing.Event): Event to signal when model is loaded.
         """
         super().__init__()
         self.frame_queue = frame_queue
         self.detection_queue = detection_queue
         self.shared_threshold = detection_threshold_value
         self.device_str = device_str
+        self.ready_event = ready_event
         self.daemon = True
 
         # Pre-allocated empty detection array for fast returns
@@ -68,6 +70,7 @@ class DetectorWorker(multiprocessing.Process):
             # Passing device to YOLO(...) or detector.to() can be done if strictly required.
             
             print("SUCCESS: YOLOv8 Detector Loaded in background process.")
+            self.ready_event.set()  # Signal that the model is ready
             
             while True:
                 try:
