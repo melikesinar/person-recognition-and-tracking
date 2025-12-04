@@ -5,6 +5,7 @@ Handles index building, loading, saving, and atomic swaps.
 import os
 import time
 import faiss
+import tempfile
 import threading
 import numpy as np
 from datetime import datetime
@@ -88,10 +89,14 @@ class FaissManager:
         Args:
             index: Faiss index object
         """
+        temp_filename = None
         try:
-            # We need to use a temporary file to write the index before reading as binary
-            faiss.write_index(index, Config.TEMP_FAISS_FILENAME)
-            with open(Config.TEMP_FAISS_FILENAME, "rb") as f:
+            # Create a temporary file
+            fd, temp_filename = tempfile.mkstemp()
+            os.close(fd) # Close the file descriptor, we'll open it with faiss
+
+            faiss.write_index(index, temp_filename)
+            with open(temp_filename, "rb") as f:
                 index_buffer = f.read()
 
             self.mongo_handler.faiss_collection.update_one(
@@ -107,8 +112,8 @@ class FaissManager:
         except Exception as e:
             print(f"!!!! FAISS SAVE ERROR (non-critical) !!!!: {e}")
         finally:
-            if os.path.exists(Config.TEMP_FAISS_FILENAME):
-                os.remove(Config.TEMP_FAISS_FILENAME)
+            if temp_filename and os.path.exists(temp_filename):
+                os.remove(temp_filename)
 
     def load_index_from_db(self):
         """
@@ -118,12 +123,15 @@ class FaissManager:
 
         if index_doc and 'index_data' in index_doc and 'pids' in index_doc:
             print("Loading Faiss index from MongoDB...")
+            temp_filename = None
             try:
                 index_buffer = index_doc['index_data']
-                with open(Config.TEMP_FAISS_FILENAME, "wb") as f:
-                    f.write(index_buffer)
+                
+                fd, temp_filename = tempfile.mkstemp()
+                os.write(fd, index_buffer)
+                os.close(fd)
 
-                loaded_index = faiss.read_index(Config.TEMP_FAISS_FILENAME)
+                loaded_index = faiss.read_index(temp_filename)
                 if hasattr(loaded_index, 'hnsw'):
                     loaded_index.hnsw.efSearch = Config.FAISS_EF_SEARCH
 
@@ -142,8 +150,8 @@ class FaissManager:
                 print(f"Failed to load Faiss index from MongoDB ({e}), rebuilding...")
                 self.build_index()
             finally:
-                if os.path.exists(Config.TEMP_FAISS_FILENAME):
-                    os.remove(Config.TEMP_FAISS_FILENAME)
+                if temp_filename and os.path.exists(temp_filename):
+                    os.remove(temp_filename)
         else:
             print("No Faiss index found in MongoDB. Building from scratch...")
             self.build_index()
