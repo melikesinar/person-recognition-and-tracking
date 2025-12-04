@@ -39,7 +39,7 @@ class Config:
     MAX_VECTORS_FOR_UPDATE = 500
 
     # --- Buffer & Timing Settings ---
-    RECENT_VECTOR_BUFFER_SIZE = 100
+    RECENT_VECTOR_BUFFER_SIZE = 200
     DETECTION_INTERVAL = 2
     UPDATE_INTERVAL = 1.0
     BUFFER_CLEANUP_INTERVAL = 60.0
@@ -87,9 +87,9 @@ class Config:
         'brightness': 1.0,
         'position': 0.5
     }
-    Q_MIN_QUALITY_THRESHOLD = 0.6
-    Q_MAX_ASPECT_RATIO = 4.0
-    Q_MIN_ASPECT_RATIO = 0.5
+    Q_MIN_QUALITY_THRESHOLD = 0.3
+    Q_MAX_ASPECT_RATIO = 5.0
+    Q_MIN_ASPECT_RATIO = 0.3
     Q_ASPECT_RATIO_OPTIMAL_MIN = 1.5
     Q_ASPECT_RATIO_OPTIMAL_MAX = 3.0
     Q_BBOX_AREA_EXCELLENT = 50000.0
@@ -109,8 +109,8 @@ class Config:
     REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
     # --- Video Source ---
-    # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
-    VIDEO_SOURCE = 0  # Uncomment for webcam
+    VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
+    # VIDEO_SOURCE = 0  # Uncomment for webcam
 
     # --- TTA Settings ---
     USE_TTA_DEFAULT = True
