@@ -32,7 +32,7 @@ class AsyncDBWriter:
 
         print("Async database writer started.")
 
-    def queue_insert(self, doc):
+    def queue_insert(self, doc: dict):
         """
         Queue a document for insertion.
 
@@ -41,7 +41,7 @@ class AsyncDBWriter:
         """
         self.write_queue.put({"type": "insert", "doc": doc})
 
-    def queue_update(self, pid, update_doc):
+    def queue_update(self, pid: int, update_doc: dict):
         """
         Queue a document update.
 
@@ -51,7 +51,7 @@ class AsyncDBWriter:
         """
         self.write_queue.put({"type": "update", "pid": pid, "update_doc": update_doc})
 
-    def queue_delete(self, pid):
+    def queue_delete(self, pid: int):
         """
         Queue a document deletion.
 
