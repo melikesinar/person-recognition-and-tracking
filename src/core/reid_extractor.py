@@ -6,6 +6,7 @@ from pathlib import Path
 from ultralytics import YOLO
 from boxmot import BoostTrack
 from utils.config import Config
+from utils.math_utils import l2_normalize
 
 
 class ReidExtractor:
@@ -44,12 +45,6 @@ class ReidExtractor:
         """Updates the Test-Time Augmentation (TTA) flag."""
         self.USE_TTA = status
 
-    def _l2_normalize(self, v):
-        """L2 normalization helper (copied from PersonManager for self-containment)."""
-        v = np.asarray(v, dtype=np.float32)
-        n = np.linalg.norm(v)
-        return v if n == 0 else v / n
-
     def _preprocess_crop_advanced(self, crop):
         """
         Applies advanced image preprocessing techniques (e.g., CLAHE).
@@ -72,7 +67,7 @@ class ReidExtractor:
         Extracts feature embeddings (vectors) for a batch of cropped person images.
         """
         if self.reid_model is None:
-            return [self._l2_normalize(np.random.randn(Config.VECTOR_DIMENSION).astype(np.float32)) for _ in crops]
+            return [l2_normalize(np.random.randn(Config.VECTOR_DIMENSION).astype(np.float32)) for _ in crops]
 
         # Filter and process valid crops
         valid_crops = [c for c in crops if c.size > 0]
@@ -109,6 +104,6 @@ class ReidExtractor:
             features = self.reid_model.model(tensor_batch)
 
         # L2 Normalize and convert to numpy array
-        embeddings = [self._l2_normalize(v.cpu().numpy()) for v in features]
+        embeddings = [l2_normalize(v.cpu().numpy()) for v in features]
 
         return embeddings
