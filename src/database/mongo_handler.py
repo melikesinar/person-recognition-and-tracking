@@ -48,7 +48,7 @@ class MongoHandler:
             self.mongo_client.close()
             print("MongoDB connection closed.")
 
-    def get_person_by_id(self, pid):
+    def get_person_by_id(self, pid: int) -> dict | None:
         """
         Fetches a single person's document from MongoDB by permanent_id.
 
@@ -68,7 +68,7 @@ class MongoHandler:
             print(f"!!!! Error fetching person P{pid} from MongoDB !!!!: {e}")
             return None
 
-    def load_vectors_for_faiss(self):
+    def load_vectors_for_faiss(self) -> tuple[list, list, int]:
         """
         Loads only the necessary data (ID and vector) from MongoDB
         to build the Faiss index, without loading the entire database into memory.
@@ -100,7 +100,7 @@ class MongoHandler:
             print(f"!!!! Error loading vectors from MongoDB !!!!: {e}")
             return [], [], 1
 
-    def get_next_id(self):
+    def get_next_id(self) -> int:
         """
         Finds the highest permanent_id in the database and returns the next available one.
         This is a fallback for when the DB is empty or for PersonManager initialization.

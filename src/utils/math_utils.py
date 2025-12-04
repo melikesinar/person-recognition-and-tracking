@@ -3,7 +3,7 @@ Utility functions for mathematical operations.
 """
 import numpy as np
 
-def l2_normalize(v):
+def l2_normalize(v: np.ndarray) -> np.ndarray:
     """
     Normalizes a vector to unit length (L2 norm).
 

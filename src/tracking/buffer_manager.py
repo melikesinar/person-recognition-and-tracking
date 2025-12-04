@@ -33,7 +33,7 @@ class BufferManager:
 
         print("Buffer manager initialized.")
 
-    def cleanup_stale_buffers(self, current_time, known_persons_db):
+    def cleanup_stale_buffers(self, current_time: float, known_persons_db: dict):
         """
         Periodic cleanup of stale buffers.
 
@@ -58,7 +58,7 @@ class BufferManager:
 
             print(f"BUFFER CLEANUP: Removed {len(stale_pids)} stale buffer(s) due to inactivity.")
 
-    def cleanup_stale_tracks(self, current_time):
+    def cleanup_stale_tracks(self, current_time: float):
         """
         Remove stale active track buffers (T-IDs).
 
@@ -73,7 +73,7 @@ class BufferManager:
         for tid in stale_tracks:
             del self.active_track_buffers[tid]
 
-    def cleanup_lost_pids(self, current_time):
+    def cleanup_lost_pids(self, current_time: float) -> list:
         """
         Remove PIDs that have expired from short-term memory.
 
@@ -96,7 +96,7 @@ class BufferManager:
 
         return stale_lost_pids
 
-    def add_to_lost_buffer(self, pid, box, current_time):
+    def add_to_lost_buffer(self, pid: int, box: list, current_time: float):
         """
         Add PID to lost buffer for re-acquisition.
 
@@ -113,7 +113,7 @@ class BufferManager:
             "velocity": velocity
         }
 
-    def should_run_cleanup(self, current_time):
+    def should_run_cleanup(self, current_time: float) -> bool:
         """
         Check if periodic cleanup should run.
 

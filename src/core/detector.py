@@ -31,7 +31,7 @@ class DetectorWorker(multiprocessing.Process):
         # Pre-allocated empty detection array for fast returns
         self.EMPTY = np.zeros((0, 6), dtype=np.float32)
 
-    def set_detection_threshold(self, threshold):
+    def set_detection_threshold(self, threshold: float):
         """Updates the live detection threshold used during filtering."""
         self.shared_threshold.value = threshold
 

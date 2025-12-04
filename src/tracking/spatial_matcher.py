@@ -16,7 +16,7 @@ class SpatialMatcher:
         self.short_term_memory_ttl = Config.SHORT_TERM_MEMORY_TTL
         print("Spatial matcher initialized.")
 
-    def get_box_center(self, box):
+    def get_box_center(self, box: list) -> tuple[int, int]:
         """
         Calculate center coordinates of a bounding box.
 
@@ -28,7 +28,7 @@ class SpatialMatcher:
         """
         return (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
 
-    def calculate_iou(self, box1, box2):
+    def calculate_iou(self, box1: list, box2: list) -> float:
         """
         Calculate Intersection over Union (IoU).
 
@@ -57,7 +57,7 @@ class SpatialMatcher:
 
         return intersection_area / union_area if union_area > 0 else 0.0
 
-    def predict_next_position(self, last_box, time_elapsed):
+    def predict_next_position(self, last_box: list, time_elapsed: float) -> list:
         """
         Predict next position based on time elapsed.
 
@@ -78,7 +78,7 @@ class SpatialMatcher:
             y2 + expansion_factor
         ]
 
-    def adaptive_spatial_threshold(self, bbox):
+    def adaptive_spatial_threshold(self, bbox: list) -> float:
         """
         Calculate adaptive distance threshold based on bbox size.
 
@@ -98,7 +98,7 @@ class SpatialMatcher:
 
         return threshold
 
-    def find_spatial_match(self, new_box, lost_pid_buffer, current_time):
+    def find_spatial_match(self, new_box: list, lost_pid_buffer: dict, current_time: float) -> tuple[int | None, float]:
         """
         Find best spatial match from lost PIDs.
 

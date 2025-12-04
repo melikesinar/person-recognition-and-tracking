@@ -30,13 +30,13 @@ class PersonManager:
 
         print("Person manager initialized.")
 
-    def set_next_id(self, next_id):
+    def set_next_id(self, next_id: int):
         """Set the next available permanent ID."""
         self.next_permanent_id = next_id
 
 
 
-    def enroll_person(self, vectors):
+    def enroll_person(self, vectors: list) -> int:
         """
         Enrolls a new person with a unique Permanent ID.
 
@@ -82,7 +82,7 @@ class PersonManager:
 
         return new_pid
 
-    def incremental_update(self, perm_id, new_vector):
+    def incremental_update(self, perm_id: int, new_vector: np.ndarray):
         """
         Updates master vector using EMA (Exponential Moving Average).
 
@@ -117,7 +117,7 @@ class PersonManager:
         # Queue async update
         self.async_writer.queue_update(perm_id, mongo_update_doc)
 
-    def delete_person(self, pid):
+    def delete_person(self, pid: int):
         """
         Deletes a person from database and cache.
 
