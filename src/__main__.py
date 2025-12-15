@@ -182,6 +182,43 @@ class PersonTrackerApp:
         """Wrapper for FaissManager.search()."""
         return self.faiss_manager.search(query_vector, self.current_match_threshold)
 
+    def _verify_and_correct_identities(self):
+        """
+        Periodically checks if the currently assigned identities are correct.
+        If a track's vector strongly matches a different person in the DB,
+        it corrects the assignment (Identity Switch Correction).
+        """
+        for track_id, pid in list(self.buffer_manager.track_id_to_permanent_id_map.items()):
+            # Get track buffer
+            buf = self.buffer_manager.active_track_buffers.get(track_id)
+            if not buf or not buf["vectors"]:
+                continue
+
+            # Use average of recent vectors for stability
+            recent_vectors = buf["vectors"][-10:]  # Last 10 vectors
+            if not recent_vectors:
+                continue
+                
+            avg_vector = np.mean(np.stack(recent_vectors, axis=0), axis=0)
+            avg_vector = avg_vector / np.linalg.norm(avg_vector)  # Re-normalize
+
+            # Query Faiss to find who this REALLY looks like
+            best_pid, best_score = self.faiss_manager.search(avg_vector, threshold=0.0)
+
+            # If Faiss found a match
+            if best_pid is not None:
+                # 1. Correction: We think it's PID X, but DB says it's PID Y (and Y is much stronger)
+                if best_pid != pid:
+                    # To switch, the new match must be significantly better than the threshold 
+                    # AND significantly high in absolute terms to avoid noise.
+                    if best_score > (self.current_match_threshold + Config.ID_SWITCH_THRESHOLD_MARGIN):
+                        print(f"CORRECTION: Switched T{track_id} from P{pid} -> P{best_pid} (Score: {best_score:.2f})")
+                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = best_pid
+                        # Optional: Clear buffer history to prevent pollution, or keep it if we trust the switch
+                        
+            # 2. Re-Evaluation: We assigned a PID, but the score dropped drastically
+            # (This part is tricky, handled implicitly by future tracking updates)
+
     def _process_tracking_and_reid(self, detections, frame):
         """
         Handles BoostTrack update and batch Re-ID feature extraction.
@@ -234,6 +271,7 @@ class PersonTrackerApp:
         """
         Processes tracker results for matching, enrollment, and updates.
         Handles both High-Quality (ReID available) and Low-Quality (Spatial only) tracks.
+        Enforces UNIQUE PID CONSTRAINT: A PID can only appear once per frame.
 
         Args:
             frame (np.ndarray): The current video frame.
@@ -244,6 +282,24 @@ class PersonTrackerApp:
             set: A set of track IDs present in the current frame.
         """
         current_frame_track_ids = set()
+        
+        # --- PHASE 1: Reservation (Priority to existing tracks) ---
+        # We identify which PIDs are "owned" by tracks that are currently on screen.
+        # This prevents a new/ambiguous track from "stealing" an ID that is already consistently tracked.
+        used_pids = set()
+        for (_, track_id, _, _, _, _) in tracker_results_list:
+            existing_pid = self.buffer_manager.track_id_to_permanent_id_map.get(track_id)
+            if existing_pid:
+                # If multiple tracks somehow have the same PID (legacy error), the first one keeps it.
+                if existing_pid in used_pids:
+                    # Conflict! Two tracks think they are the same person.
+                    # Since we can't easily judge who is "more real" here without complex logic,
+                    # we let the first one keep it and strip the second one.
+                    del self.buffer_manager.track_id_to_permanent_id_map[track_id]
+                else:
+                    used_pids.add(existing_pid)
+
+        # --- PHASE 2: Processing & Assignment ---
         for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
             current_frame_track_ids.add(track_id)
             current_vector = vector_map.get(track_id)
@@ -255,27 +311,46 @@ class PersonTrackerApp:
             # --- High Quality: Re-ID Vector Available ---
             if current_vector is not None:
                 if pid:
+                    # Existing consistent track
                     label, color = f"P{pid}", (0, 255, 0)
                     if (time.time() - self.buffer_manager.last_update_time_for_pid.get(pid, 0)) > Config.UPDATE_INTERVAL:
                         self.incremental_update(pid, current_vector)
                         self.buffer_manager.last_update_time_for_pid[pid] = time.time()
                 else:
+                    # New or Unknown Track -> Needs Identification
                     now = time.time()
+                    
+                    # 1. Try Spatial Match (Fastest)
                     spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
                         box, self.buffer_manager.lost_pid_buffer, now
                     )
+                    
+                    # Check uniqueness for spatial match
+                    if spatial_match_pid is not None and spatial_match_pid in used_pids:
+                        spatial_match_pid = None # Blocked: PID already in use
+                    
                     if spatial_match_pid is not None:
                         pid = spatial_match_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
+                        used_pids.add(pid) # Mark as used
                         label = f"P{pid} (ReAcq:{best_match_score:.2f})"
                         color = (0, 255, 128)
                         if pid in self.buffer_manager.lost_pid_buffer:
                             del self.buffer_manager.lost_pid_buffer[pid]
                     else:
+                        # 2. Try Re-ID Match (Most Accurate)
                         match_id, match_sim = self.find_best_match(current_vector)
+                        
+                        # Check uniqueness for Re-ID match
+                        if match_id is not None and match_id in used_pids:
+                            # Conflict! We matched Px, but Px is already on screen.
+                            # We cannot be Px.
+                            match_id = None 
+                        
                         if match_id is not None:
                             pid = match_id
                             self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
+                            used_pids.add(pid) # Mark as used
                             label, color = f"P{pid} (S:{match_sim:.2f})", (0, 255, 0)
                         else:
                             # --- Enrollment Logic ---
@@ -296,6 +371,7 @@ class PersonTrackerApp:
                                     new_pid = self.enroll_person(buf["vectors"])
                                     if new_pid:
                                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
+                                        used_pids.add(new_pid)
                                         if track_id in self.buffer_manager.active_track_buffers:
                                             del self.buffer_manager.active_track_buffers[track_id]
                                 else:
@@ -312,9 +388,15 @@ class PersonTrackerApp:
                     spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
                         box, self.buffer_manager.lost_pid_buffer, now
                     )
+                    
+                    # Check uniqueness
+                    if spatial_match_pid is not None and spatial_match_pid in used_pids:
+                        spatial_match_pid = None
+                        
                     if spatial_match_pid is not None:
                         pid = spatial_match_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
+                        used_pids.add(pid)
                         label = f"P{pid} (LowQ-ReAcq)"
                         color = (100, 255, 128)
                         if pid in self.buffer_manager.lost_pid_buffer:
@@ -415,6 +497,11 @@ class PersonTrackerApp:
 
                 tracker_results_list, vector_map = self._process_tracking_and_reid(detections, frame)
                 current_frame_track_ids = self._process_results(frame, tracker_results_list, vector_map)
+                
+                # --- Periodic Identity Verification ---
+                if frame_count % Config.ID_VERIFICATION_INTERVAL == 0:
+                    self._verify_and_correct_identities()
+
                 self._perform_cleanup(current_frame_track_ids)
 
                 self.visualizer.draw_hud(

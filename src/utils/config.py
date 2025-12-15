@@ -33,7 +33,7 @@ class Config:
     MATCH_SIMILARITY_THRESHOLD = 0.73
 
     # --- Enrollment Parameters ---
-    MIN_ENROLL_FRAMES = 30
+    MIN_ENROLL_FRAMES = 50
     MIN_BBOX_AREA_ENROLL = 10000
     MIN_SHARPNESS_ENROLL = 50
     MAX_VECTORS_FOR_UPDATE = 500
@@ -48,6 +48,10 @@ class Config:
     # --- Re-ID Model Settings ---
     REID_INPUT_SIZE = (128, 256)
     VECTOR_DIMENSION = 512
+
+    # --- Identity Verification / Self-Correction ---
+    ID_VERIFICATION_INTERVAL = 15  # Check every 15 frames
+    ID_SWITCH_THRESHOLD_MARGIN = 0.10  # New match must be 10% better than current to switch
 
     # ImageNet normalization (for pretrained models)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
