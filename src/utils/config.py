@@ -34,8 +34,8 @@ class Config:
 
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 50
-    MIN_BBOX_AREA_ENROLL = 10000
-    MIN_SHARPNESS_ENROLL = 50
+    MIN_BBOX_AREA_ENROLL = 7500
+    MIN_SHARPNESS_ENROLL = 35
     MAX_VECTORS_FOR_UPDATE = 500
 
     # --- Buffer & Timing Settings ---
@@ -49,6 +49,7 @@ class Config:
     REID_INPUT_SIZE = (128, 256)
     VECTOR_DIMENSION = 512
 
+    # ID switch threshold times 5
     # --- Identity Verification / Self-Correction ---
     ID_VERIFICATION_INTERVAL = 15  # Check every 15 frames
     ID_SWITCH_THRESHOLD_MARGIN = 0.10  # New match must be 10% better than current to switch
@@ -91,7 +92,7 @@ class Config:
         'brightness': 1.0,
         'position': 0.5
     }
-    Q_MIN_QUALITY_THRESHOLD = 0.3
+    Q_MIN_QUALITY_THRESHOLD = 0.25
     Q_MAX_ASPECT_RATIO = 5.0
     Q_MIN_ASPECT_RATIO = 0.3
     Q_ASPECT_RATIO_OPTIMAL_MIN = 1.5
