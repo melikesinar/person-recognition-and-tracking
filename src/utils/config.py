@@ -36,7 +36,7 @@ class Config:
 
     # --- Buffer & Timing Settings ---
     RECENT_VECTOR_BUFFER_SIZE = 200
-    DETECTION_INTERVAL = 2
+    DETECTION_INTERVAL = 2 # Check every 2 frames
     UPDATE_INTERVAL = 1.0
     BUFFER_CLEANUP_INTERVAL = 60.0
     BUFFER_MAX_IDLE_TIME = 3600.0
@@ -48,13 +48,15 @@ class Config:
     # --- Identity Verification / Self-Correction ---
     ID_VERIFICATION_INTERVAL = 15  # Check every 15 frames
     ID_SWITCH_THRESHOLD_MARGIN = 0.10  # New match must be 10% better than current to switch
+    ID_SWITCH_CONFIRMATION_THRESHOLD = 3  # Number of consistent matches required to switch ID
+    ID_SWITCH_COUNTER_TTL_SECONDS = 5.0  # Reset counter if no confirmation within this duration
 
     # ImageNet normalization (for pretrained models)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD = [0.229, 0.224, 0.225]
 
     # --- Tracking Parameters ---
-    SHORT_TERM_MEMORY_TTL = 10  # seconds
+    SHORT_TERM_MEMORY_TTL = 10  # Remember for 10 seconds
     SPATIAL_PREDICTION_FACTOR_1 = 50
     SPATIAL_PREDICTION_FACTOR_2 = 100
     ADAPTIVE_THRESHOLD_FACTOR = 0.75
