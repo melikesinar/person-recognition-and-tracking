@@ -21,6 +21,7 @@ from database.mongo_handler import MongoHandler
 from tracking.person_manager import PersonManager
 from tracking.buffer_manager import BufferManager
 from tracking.spatial_matcher import SpatialMatcher
+from tracking.identity_verifier import IdentityVerifier
 
 # Validate configuration
 Config.validate()
@@ -74,6 +75,7 @@ class PersonTrackerApp:
         self.buffer_manager = BufferManager()
         self.quality_checker = QualityChecker()
         self.visualizer = Visualizer()
+        self.identity_verifier = IdentityVerifier()
 
         # --- Thread/Process Communication (for detector) ---
         # Use multiprocessing Queues for inter-process communication
@@ -184,40 +186,13 @@ class PersonTrackerApp:
 
     def _verify_and_correct_identities(self):
         """
-        Periodically checks if the currently assigned identities are correct.
-        If a track's vector strongly matches a different person in the DB,
-        it corrects the assignment (Identity Switch Correction).
+        Delegates the identity verification and correction logic to the IdentityVerifier instance.
         """
-        for track_id, pid in list(self.buffer_manager.track_id_to_permanent_id_map.items()):
-            # Get track buffer
-            buf = self.buffer_manager.active_track_buffers.get(track_id)
-            if not buf or not buf["vectors"]:
-                continue
-
-            # Use average of recent vectors for stability
-            recent_vectors = buf["vectors"][-10:]  # Last 10 vectors
-            if not recent_vectors:
-                continue
-                
-            avg_vector = np.mean(np.stack(recent_vectors, axis=0), axis=0)
-            avg_vector = avg_vector / np.linalg.norm(avg_vector)  # Re-normalize
-
-            # Query Faiss to find who this REALLY looks like
-            best_pid, best_score = self.faiss_manager.search(avg_vector, threshold=0.0)
-
-            # If Faiss found a match
-            if best_pid is not None:
-                # 1. Correction: We think it's PID X, but DB says it's PID Y (and Y is much stronger)
-                if best_pid != pid:
-                    # To switch, the new match must be significantly better than the threshold 
-                    # AND significantly high in absolute terms to avoid noise.
-                    if best_score > (self.current_match_threshold + Config.ID_SWITCH_THRESHOLD_MARGIN):
-                        print(f"CORRECTION: Switched T{track_id} from P{pid} -> P{best_pid} (Score: {best_score:.2f})")
-                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = best_pid
-                        # Optional: Clear buffer history to prevent pollution, or keep it if we trust the switch
-                        
-            # 2. Re-Evaluation: We assigned a PID, but the score dropped drastically
-            # (This part is tricky, handled implicitly by future tracking updates)
+        self.identity_verifier.verify_and_correct(
+            self.buffer_manager,
+            self.faiss_manager,
+            self.current_match_threshold
+        )
 
     def _process_tracking_and_reid(self, detections, frame):
         """
@@ -432,6 +407,10 @@ class PersonTrackerApp:
         ]
         for tid in disappeared_track_ids:
             pid = self.buffer_manager.track_id_to_permanent_id_map.pop(tid, None)
+            
+            # Also clear any pending verification state for this track
+            self.identity_verifier.clear_state_for_track(tid)
+
             if pid and pid in self.buffer_manager.last_known_box_for_pid:
                 self.buffer_manager.add_to_lost_buffer(
                     pid, self.buffer_manager.last_known_box_for_pid[pid], now
@@ -555,6 +534,14 @@ class PersonTrackerApp:
             stats = self.faiss_manager.get_index_stats()
             print(f"Vectors in Faiss index: {stats['ntotal']}")
             print(f"Next ID: {self.person_manager.next_permanent_id}")
+            
+            if self.known_persons_db:
+                print("Vector Counts:")
+                for pid, data in sorted(self.known_persons_db.items()):
+                    count = data.get("count", 0)
+                    max_count = Config.MAX_VECTORS_FOR_UPDATE
+                    print(f"  - P{pid}: {count}/{max_count} vectors")
+
             print("------------------\n")
 
         elif key == ord('k'):
