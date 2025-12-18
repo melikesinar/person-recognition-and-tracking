@@ -23,17 +23,13 @@ class Config:
     COLLECTION = os.getenv("COLLECTION")
     FAISS_COLLECTION = os.getenv("FAISS_COLLECTION")
     FAISS_INDEX_KEY = "primary_person_index"
-    TEMP_FAISS_FILENAME = "temp_faiss.index"
 
     # --- Detection & Matching Thresholds ---
-    DEFAULT_DETECTION_SCORE = 0.7
-    DEFAULT_MATCH_THRESHOLD = 0.85
-
     DETECTION_SCORE_THRESHOLD = 0.65
     MATCH_SIMILARITY_THRESHOLD = 0.73
 
     # --- Enrollment Parameters ---
-    MIN_ENROLL_FRAMES = 50
+    MIN_ENROLL_FRAMES = 40
     MIN_BBOX_AREA_ENROLL = 7500
     MIN_SHARPNESS_ENROLL = 35
     MAX_VECTORS_FOR_UPDATE = 500
@@ -49,7 +45,6 @@ class Config:
     REID_INPUT_SIZE = (128, 256)
     VECTOR_DIMENSION = 512
 
-    # ID switch threshold times 5
     # --- Identity Verification / Self-Correction ---
     ID_VERIFICATION_INTERVAL = 15  # Check every 15 frames
     ID_SWITCH_THRESHOLD_MARGIN = 0.10  # New match must be 10% better than current to switch
@@ -59,7 +54,7 @@ class Config:
     IMAGENET_STD = [0.229, 0.224, 0.225]
 
     # --- Tracking Parameters ---
-    SHORT_TERM_MEMORY_TTL = 4.0  # seconds
+    SHORT_TERM_MEMORY_TTL = 10  # seconds
     SPATIAL_PREDICTION_FACTOR_1 = 50
     SPATIAL_PREDICTION_FACTOR_2 = 100
     ADAPTIVE_THRESHOLD_FACTOR = 0.75
@@ -81,7 +76,7 @@ class Config:
     EMA_ALPHA = 0.1
 
     # --- Async DB Writer ---
-    ASYNC_DB_WRITER_QUEUE_SIZE = 1000
+    ASYNC_DB_WRITER_QUEUE_SIZE = 500
 
     # --- Quality Checker Settings ---
     Q_WEIGHTS = {
