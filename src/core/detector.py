@@ -74,14 +74,17 @@ class DetectorWorker(multiprocessing.Process):
             
             while True:
                 try:
-                    frame = self.frame_queue.get()
+                    # Expecting tuple (metadata, frame)
+                    input_data = self.frame_queue.get()
                 except Exception:
                     break
 
                 # Exit signal
-                if frame is None:
+                if input_data is None:
                     print("Detector process stopping...")
                     break
+                
+                metadata, frame = input_data
 
                 # Perform YOLO detection
                 # verbose=False prevents stdout spam
@@ -104,7 +107,7 @@ class DetectorWorker(multiprocessing.Process):
                             new_det = new_det[:, :6]
 
                 self._clear_detection_queue()
-                self.detection_queue.put(new_det)
+                self.detection_queue.put((metadata, new_det))
                 
         except Exception as e:
             print(f"!!!! CRITICAL ERROR in Detector Process !!!!: {e}")
