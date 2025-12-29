@@ -110,14 +110,9 @@ class Config:
     YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8l.pt")
     REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
-    # --- Video Sources ---
-    # List of cameras. ID must be unique.
-    VIDEO_SOURCES = [
-        {"id": "cam_main", "source": str(BASE_DIR / "videos" / "3.mp4"), "description": "Main View"},
-    ]
-    
-    # Legacy fallback (optional, can be removed if not used elsewhere)
+    # --- Video Source ---
     VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
+    # VIDEO_SOURCE = 0  # Uncomment for webcam
 
     # --- TTA Settings ---
     USE_TTA_DEFAULT = True

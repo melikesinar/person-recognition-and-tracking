@@ -45,6 +45,17 @@ class DetectorWorker(multiprocessing.Process):
         self.frame_queue.put(None)
         self.join()
 
+    def _clear_detection_queue(self):
+        """
+        Removes all pending items from the detection queue.
+        Ensures only the *latest* detection result is kept.
+        """
+        while not self.detection_queue.empty():
+            try:
+                self.detection_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def run(self):
         """
         Main execution loop for the worker process.
@@ -63,17 +74,14 @@ class DetectorWorker(multiprocessing.Process):
             
             while True:
                 try:
-                    # Expecting tuple: (camera_id, frame)
-                    item = self.frame_queue.get()
+                    frame = self.frame_queue.get()
                 except Exception:
                     break
 
                 # Exit signal
-                if item is None:
+                if frame is None:
                     print("Detector process stopping...")
                     break
-                
-                camera_id, frame = item
 
                 # Perform YOLO detection
                 # verbose=False prevents stdout spam
@@ -95,8 +103,8 @@ class DetectorWorker(multiprocessing.Process):
                         if new_det.shape[1] > 6:
                             new_det = new_det[:, :6]
 
-                # Output tuple: (camera_id, detections)
-                self.detection_queue.put((camera_id, new_det))
+                self._clear_detection_queue()
+                self.detection_queue.put(new_det)
                 
         except Exception as e:
             print(f"!!!! CRITICAL ERROR in Detector Process !!!!: {e}")
