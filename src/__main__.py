@@ -75,9 +75,6 @@ class CameraNode(threading.Thread):
         
         # Local Spatial Matcher
         self.spatial_matcher = SpatialMatcher()
-        
-        # Local Identity Verifier for self-correction
-        self.identity_verifier = IdentityVerifier()
 
     def run(self):
         print(f"[{self.cam_id}] Connecting to source: {self.source}")
@@ -130,14 +127,6 @@ class CameraNode(threading.Thread):
             tracker_results_list, vector_map = self._process_tracking_and_reid(detections, frame)
             
             current_frame_track_ids = self._process_results(frame, tracker_results_list, vector_map)
-
-            # --- Periodic Identity Verification ---
-            if frame_count % Config.ID_VERIFICATION_INTERVAL == 0:
-                 self.identity_verifier.verify_and_correct(
-                    self.buffer_manager,
-                    self.shared['faiss_manager'],
-                    self.shared['match_threshold']
-                )
 
             # 4. Cleanup & Vis
             self._perform_cleanup(current_frame_track_ids)
@@ -248,8 +237,6 @@ class CameraNode(threading.Thread):
                             # Enroll
                             buf = self.buffer_manager.active_track_buffers[tid]
                             buf["vectors"].append(vec)
-                            label = f"New? T{tid} ({len(buf['vectors'])}/{Config.MIN_ENROLL_FRAMES})"
-                            
                             if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
                                 # Global Enrollment
                                 new_pid = self.shared['person_manager'].enroll_person(buf["vectors"])
