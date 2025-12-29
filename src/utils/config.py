@@ -111,11 +111,7 @@ class Config:
     REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
     # --- Video Source ---
-    # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
-    VIDEO_SOURCE = [
-        str(BASE_DIR / "videos" / "3.mp4"),
-        str(BASE_DIR / "videos" / "3.mp4")
-    ]
+    VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
     # VIDEO_SOURCE = 0  # Uncomment for webcam
 
     # --- TTA Settings ---
