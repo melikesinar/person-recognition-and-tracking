@@ -16,8 +16,8 @@ class DetectorWorker(multiprocessing.Process):
         Initializes the background detector worker.
 
         Args:
-            frame_queue (multiprocessing.Queue): Queue for incoming frames to process.
-            detection_queue (multiprocessing.Queue): Queue to push processed detection results.
+            frame_queue (multiprocessing.Queue): Queue for incoming (cam_id, frame) tuples.
+            detection_queue (multiprocessing.Queue): Queue to push processed (cam_id, detections) tuples.
             detection_threshold_value (multiprocessing.Value): Shared float for live tuning.
             device_str (str): "cuda" or "cpu" string.
             ready_event (multiprocessing.Event): Event to signal when model is loaded.
@@ -45,17 +45,6 @@ class DetectorWorker(multiprocessing.Process):
         self.frame_queue.put(None)
         self.join()
 
-    def _clear_detection_queue(self):
-        """
-        Removes all pending items from the detection queue.
-        Ensures only the *latest* detection result is kept.
-        """
-        while not self.detection_queue.empty():
-            try:
-                self.detection_queue.get_nowait()
-            except queue.Empty:
-                break
-
     def run(self):
         """
         Main execution loop for the worker process.
@@ -66,22 +55,28 @@ class DetectorWorker(multiprocessing.Process):
         try:
             # Load model INSIDE the process to avoid pickling issues
             detector = YOLO(Config.YOLO_MODEL_PATH)
-            # Force device if needed, though YOLO usually auto-detects. 
-            # Passing device to YOLO(...) or detector.to() can be done if strictly required.
             
             print("SUCCESS: YOLOv8 Detector Loaded in background process.")
             self.ready_event.set()  # Signal that the model is ready
             
             while True:
                 try:
-                    frame = self.frame_queue.get()
+                    item = self.frame_queue.get()
                 except Exception:
                     break
 
                 # Exit signal
-                if frame is None:
+                if item is None:
                     print("Detector process stopping...")
                     break
+                
+                # Unpack item (cam_id, frame)
+                if isinstance(item, tuple):
+                    cam_id, frame = item
+                else:
+                    # Fallback for legacy single-frame calls
+                    cam_id = 0
+                    frame = item
 
                 # Perform YOLO detection
                 # verbose=False prevents stdout spam
@@ -103,9 +98,8 @@ class DetectorWorker(multiprocessing.Process):
                         if new_det.shape[1] > 6:
                             new_det = new_det[:, :6]
 
-                self._clear_detection_queue()
-                self.detection_queue.put(new_det)
+                # We send back (cam_id, detection_result)
+                self.detection_queue.put((cam_id, new_det))
                 
         except Exception as e:
             print(f"!!!! CRITICAL ERROR in Detector Process !!!!: {e}")
-

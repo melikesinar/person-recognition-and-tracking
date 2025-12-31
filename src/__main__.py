@@ -1,4 +1,4 @@
-# main_reid_vectors.py
+# main_multi_camera.py
 import cv2
 import time
 import queue
@@ -27,185 +27,85 @@ from tracking.identity_verifier import IdentityVerifier
 Config.validate()
 Config.print_config()
 
-class PersonTrackerApp:
+class CameraNode:
     """
-    Main class that encapsulates all logic for the person Re-ID and tracking system,
-    including thread management, database operations, and live processing.
+    Represents a completely independent tracking system for a SINGLE camera source.
+    It has its own Tracker, BufferManager, SpatialMatcher, and Visualization state.
+    It only shares the global Identity Database (PersonManager/Faiss).
     """
-
-    def __init__(self):
-        """
-        Initializes the application with modular components.
-        """
-        print("System initializing...")
-
-        # --- Core State ---
-        self.known_persons_db = {}
-        self.stop_event = threading.Event()
-
-        # Live tuning thresholds
-        self.current_match_threshold = Config.MATCH_SIMILARITY_THRESHOLD
+    def __init__(self, camera_id, video_source, global_resources):
+        self.camera_id = camera_id
+        self.video_source = video_source
+        self.resources = global_resources # Shared: person_manager, faiss_manager, reid_extractor, quality_checker
         
-        # Shared value for detection threshold (multiprocessing safe)
-        self.detection_threshold_value = multiprocessing.Value('d', Config.DETECTION_SCORE_THRESHOLD)
-
-        # TTA settings
-        self.USE_TTA = Config.USE_TTA_DEFAULT
-        self.TTA_HORIZONTAL_FLIP = Config.TTA_HORIZONTAL_FLIP
-
-        # --- Database Connection ---
-        try:
-            self.mongo_handler = MongoHandler()
-        except RuntimeError as e:
-            raise RuntimeError(f"Failed to initialize MongoDB handler: {e}")
-
-        # --- Initialize Modular Components ---
-        self.faiss_manager = FaissManager(self.mongo_handler)
-        self.async_writer = AsyncDBWriter(
-            self.mongo_handler.persons_collection,
-            self.mongo_handler.faiss_collection,
-            self.stop_event
-        )
-        self.person_manager = PersonManager(
-            self.known_persons_db,
-            self.async_writer,
-            self.faiss_manager
-        )
-        self.spatial_matcher = SpatialMatcher()
+        print(f"Initializing CameraNode {camera_id} for source: {video_source}")
+        
+        # --- Independent State Components ---
         self.buffer_manager = BufferManager()
-        self.quality_checker = QualityChecker()
+        self.spatial_matcher = SpatialMatcher()
         self.visualizer = Visualizer()
         self.identity_verifier = IdentityVerifier()
-
-        # --- Thread/Process Communication (for detector) ---
-        # Use multiprocessing Queues for inter-process communication
-        self.frame_queue = multiprocessing.Queue(maxsize=1)
-        self.detection_queue = multiprocessing.Queue(maxsize=1)
-        self.detector_ready_event = multiprocessing.Event()
-
-        # --- Load Models ---
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        device_str = 0 if self.device.type == 'cuda' else 'cpu'
-        print(f"Using device: {self.device} (passed to worker as {device_str})")
-
-        # --- Load Detector ---
-        self.detector_worker_instance = DetectorWorker(
-            self.frame_queue,
-            self.detection_queue,
-            self.detection_threshold_value,
-            device_str,
-            self.detector_ready_event
-        )
-
-        # --- Load ReidExtractor ---
-        print("Loading Re-ID Model (OSNet)...")
+        
+        # --- Independent Tracker Instance ---
+        # Each camera gets its own BoostTrack instance to maintain separate track histories.
         self.tracker = BoostTrack(
             reid_weights=Path(Config.REID_MODEL_PATH),
-            device=(0 if self.device.type == 'cuda' else 'cpu'),
+            device=(0 if self.resources['device'].type == 'cuda' else 'cpu'),
             half=False,
             with_reid=True,
             max_age=60,
             max_obs=100
         )
+        
+        # Video Capture
+        self.cap = cv2.VideoCapture(self.video_source)
+        if not self.cap.isOpened():
+            print(f"!!!! ERROR: Could not open video source for Cam {camera_id}: {video_source}")
+        
+        self.frame_count = 0
+        self.prev_time = time.time()
+        self.fps = 0.0
 
-        try:
-            self.reid_extractor = ReidExtractor(self.device, self.tracker)
-        except RuntimeError as e:
-            raise RuntimeError(e)
-
-        # --- Load Data ---
-        self.load_db()
-
-    def advanced_quality_check(self, crop, bbox, frame_shape):
+    def process_frame(self, frame, detections):
         """
-        Wrapper for QualityChecker.assess_quality().
-        Maintained for backward compatibility.
+        Runs the full tracking and Re-ID pipeline for this specific camera using the provided frame and detections.
         """
-        return self.quality_checker.assess_quality(crop, bbox, frame_shape)
-
-    def calculate_sharpness(self, image):
-        """
-        Wrapper for QualityChecker.calculate_sharpness().
-        Maintained for backward compatibility.
-        """
-        return self.quality_checker.calculate_sharpness(image)
-
-    def load_db(self):
-        """
-        Initializes the system by loading the Faiss index and setting the next person ID.
-        The known_persons_db now acts as a lazy-loaded cache and starts empty.
-        """
-        try:
-            # 1. FaissManager now loads its index directly from MongoDB data
-            self.faiss_manager.load_index_from_db()
-
-            # 2. PersonManager gets the next available ID from MongoDB
-            next_id = self.mongo_handler.get_next_id()
-            self.person_manager.set_next_id(next_id)
-
-            print("System ready. In-memory cache is empty and will be populated on-demand.")
-
-        except Exception as e:
-            print(f"!!!! Error during initialization process !!!!: {e}")
-            # Ensure a fresh start if loading fails
-            self.faiss_manager.build_index()
-            self.known_persons_db.clear()
-            self.person_manager.set_next_id(1)
-
-    def get_box_center(self, box):
-        """Wrapper for SpatialMatcher.get_box_center()."""
-        return self.spatial_matcher.get_box_center(box)
-
-    def calculate_iou(self, box1, box2):
-        """Wrapper for SpatialMatcher.calculate_iou()."""
-        return self.spatial_matcher.calculate_iou(box1, box2)
-
-    def predict_next_position(self, last_box, time_elapsed):
-        """Wrapper for SpatialMatcher.predict_next_position()."""
-        return self.spatial_matcher.predict_next_position(last_box, time_elapsed)
-
-    def adaptive_spatial_threshold(self, bbox):
-        """Wrapper for SpatialMatcher.adaptive_spatial_threshold()."""
-        return self.spatial_matcher.adaptive_spatial_threshold(bbox)
-
-    def enroll_person(self, vectors):
-        """Wrapper for PersonManager.enroll_person()."""
-        return self.person_manager.enroll_person(vectors)
-
-    def cleanup_stale_buffers(self, current_time):
-        """Wrapper for BufferManager.cleanup_stale_buffers()."""
-        return self.buffer_manager.cleanup_stale_buffers(current_time, self.known_persons_db)
-
-    def incremental_update(self, perm_id, new_vector):
-        """Wrapper for PersonManager.incremental_update()."""
-        return self.person_manager.incremental_update(perm_id, new_vector)
-
-    def find_best_match(self, query_vector):
-        """Wrapper for FaissManager.search()."""
-        return self.faiss_manager.search(query_vector, self.current_match_threshold)
-
-    def _verify_and_correct_identities(self):
-        """
-        Delegates the identity verification and correction logic to the IdentityVerifier instance.
-        """
-        self.identity_verifier.verify_and_correct(
-            self.buffer_manager,
-            self.faiss_manager,
-            self.current_match_threshold
+        self.frame_count += 1
+        
+        # 1. Update Tracker & Extract Crops
+        tracker_results_list, vector_map = self._process_tracking_and_reid(detections, frame)
+        
+        # 2. Process Identifies (Match/Enroll)
+        current_frame_track_ids = self._process_results(frame, tracker_results_list, vector_map)
+        
+        # 3. Verify & Cleanup
+        if self.frame_count % Config.ID_VERIFICATION_INTERVAL == 0:
+            self._verify_and_correct_identities()
+            
+        self._perform_cleanup(current_frame_track_ids)
+        
+        # 4. Visualization
+        # Calculate FPS for this camera
+        curr_time = time.time()
+        time_diff = curr_time - self.prev_time
+        if time_diff > 0.0001:
+            self.fps = 1.0 / time_diff
+        self.prev_time = curr_time
+        
+        self.visualizer.draw_hud(
+            frame, self.fps, self.resources['detection_threshold'].value,
+            self.resources['match_threshold'], 
+            len(self.resources['person_manager'].known_persons_db), 
+            self.resources['use_tta']
         )
+        
+        # Add Camera ID to HUD
+        cv2.putText(frame, f"CAM {self.camera_id}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        return frame
 
     def _process_tracking_and_reid(self, detections, frame):
-        """
-        Handles BoostTrack update and batch Re-ID feature extraction.
-        Implements QUALITY GATING: Only extracts features from high-quality crops.
-
-        Args:
-            detections (np.ndarray): Detections from the detector.
-            frame (np.ndarray): The current video frame.
-
-        Returns:
-            tuple: (tracker_results_list, vector_map)
-        """
+        """Same logic as original, but uses local self.tracker and shared self.resources['reid_extractor']"""
         res = self.tracker.update(detections, frame)
         crops_to_process, track_ids_for_crops, tracker_results_list = [], [], []
 
@@ -219,62 +119,41 @@ class PersonTrackerApp:
             
             crop = frame[y1:y2, x1:x2]
             if crop.size > 0:
-                # --- Quality Gating ---
-                # Check quality BEFORE heavy ReID extraction
-                is_good, _, _ = self.quality_checker.assess_quality(crop, box, frame.shape)
-                
+                is_good, _, _ = self.resources['quality_checker'].assess_quality(crop, box, frame.shape)
                 if is_good:
                     crops_to_process.append(crop)
                     track_ids_for_crops.append(track_id)
-                
-                # We store the result regardless of quality so we can still draw the box
                 tracker_results_list.append((box, track_id, conf, cls, ind, crop))
 
         all_vectors = []
         if crops_to_process:
-            all_vectors = self.reid_extractor.extract_embeddings_from_crops(crops_to_process)
+            # Use SHARED ReID extractor (thread-safety implied by sequential processing in main loop)
+            all_vectors = self.resources['reid_extractor'].extract_embeddings_from_crops(crops_to_process)
 
         vector_map = {}
         if len(all_vectors) == len(track_ids_for_crops):
             vector_map = {tid: vec for tid, vec in zip(track_ids_for_crops, all_vectors)}
-        else:
-            print(f"!!!! WARNING: Mismatch in batch Re-ID. Crops: {len(crops_to_process)}, Vectors: {len(all_vectors)}")
-
+        
         return tracker_results_list, vector_map
 
     def _process_results(self, frame, tracker_results_list, vector_map):
         """
-        Processes tracker results for matching, enrollment, and updates.
-        Handles both High-Quality (ReID available) and Low-Quality (Spatial only) tracks.
-        Enforces UNIQUE PID CONSTRAINT: A PID can only appear once per frame.
-
-        Args:
-            frame (np.ndarray): The current video frame.
-            tracker_results_list (list): List of tracker results.
-            vector_map (dict): Map of track IDs to feature vectors (only for high-quality crops).
-
-        Returns:
-            set: A set of track IDs present in the current frame.
+        Matches local tracks to GLOBAL identities.
+        Uses local self.buffer_manager but shared self.resources['person_manager'] / 'faiss_manager'.
         """
         current_frame_track_ids = set()
-        
-        # --- PHASE 1: Reservation (Priority to existing tracks) ---
-        # We identify which PIDs are "owned" by tracks that are currently on screen.
-        # This prevents a new/ambiguous track from "stealing" an ID that is already consistently tracked.
         used_pids = set()
+        
+        # Phase 1: Reservation
         for (_, track_id, _, _, _, _) in tracker_results_list:
             existing_pid = self.buffer_manager.track_id_to_permanent_id_map.get(track_id)
             if existing_pid:
-                # If multiple tracks somehow have the same PID (legacy error), the first one keeps it.
                 if existing_pid in used_pids:
-                    # Conflict! Two tracks think they are the same person.
-                    # Since we can't easily judge who is "more real" here without complex logic,
-                    # we let the first one keep it and strip the second one.
                     del self.buffer_manager.track_id_to_permanent_id_map[track_id]
                 else:
                     used_pids.add(existing_pid)
 
-        # --- PHASE 2: Processing & Assignment ---
+        # Phase 2: Assignment
         for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
             current_frame_track_ids.add(track_id)
             current_vector = vector_map.get(track_id)
@@ -283,307 +162,315 @@ class PersonTrackerApp:
             label, color = f"T{track_id}", (0, 165, 255)
             pid = self.buffer_manager.track_id_to_permanent_id_map.get(track_id)
 
-            # --- High Quality: Re-ID Vector Available ---
             if current_vector is not None:
                 if pid:
-                    # Existing consistent track
                     label, color = f"P{pid}", (0, 255, 0)
-                    if (time.time() - self.buffer_manager.last_update_time_for_pid.get(pid, 0)) > Config.UPDATE_INTERVAL:
-                        self.incremental_update(pid, current_vector)
+                    last_update = self.buffer_manager.last_update_time_for_pid.get(pid, 0)
+                    if (time.time() - last_update) > Config.UPDATE_INTERVAL:
+                        self.resources['person_manager'].incremental_update(pid, current_vector)
                         self.buffer_manager.last_update_time_for_pid[pid] = time.time()
                 else:
-                    # New or Unknown Track -> Needs Identification
+                    # New Track -> Try Spatial -> Try ReID -> Enroll
                     now = time.time()
-                    
-                    # 1. Try Spatial Match (Fastest)
-                    spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
+                    spatial_pid, score = self.spatial_matcher.find_spatial_match(
                         box, self.buffer_manager.lost_pid_buffer, now
                     )
                     
-                    # Check uniqueness for spatial match
-                    if spatial_match_pid is not None and spatial_match_pid in used_pids:
-                        spatial_match_pid = None # Blocked: PID already in use
+                    if spatial_pid and spatial_pid in used_pids: spatial_pid = None
                     
-                    if spatial_match_pid is not None:
-                        pid = spatial_match_pid
+                    if spatial_pid:
+                        pid = spatial_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
-                        used_pids.add(pid) # Mark as used
-                        label = f"P{pid} (ReAcq:{best_match_score:.2f})"
+                        used_pids.add(pid)
+                        label = f"P{pid} (ReAcq)"
                         color = (0, 255, 128)
                         if pid in self.buffer_manager.lost_pid_buffer:
                             del self.buffer_manager.lost_pid_buffer[pid]
                     else:
-                        # 2. Try Re-ID Match (Most Accurate)
-                        match_id, match_sim = self.find_best_match(current_vector)
+                        # ReID Match (GLOBAL SEARCH)
+                        match_id, match_sim = self.resources['faiss_manager'].search(
+                            current_vector, self.resources['match_threshold']
+                        )
                         
-                        # Check uniqueness for Re-ID match
-                        if match_id is not None and match_id in used_pids:
-                            # Conflict! We matched Px, but Px is already on screen.
-                            # We cannot be Px.
-                            match_id = None 
+                        if match_id and match_id in used_pids: match_id = None
                         
-                        if match_id is not None:
+                        if match_id:
                             pid = match_id
                             self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
-                            used_pids.add(pid) # Mark as used
+                            used_pids.add(pid)
                             label, color = f"P{pid} (S:{match_sim:.2f})", (0, 255, 0)
                         else:
-                            # --- Enrollment Logic ---
-                            # Note: Crop is already known to be "good" quality by _process_tracking_and_reid
-                            # But we re-check 'reason' and 'q_score' if we want detailed logs/display
-                            is_good, reason, q_score = self.advanced_quality_check(crop, box, frame.shape)
+                            # Enrollment (GLOBAL ENROLLMENT)
+                            is_good, _, q_score = self.resources['quality_checker'].assess_quality(crop, box, frame.shape)
                             buf = self.buffer_manager.active_track_buffers[track_id]
                             
                             buf["vectors"].append(current_vector)
                             buf.setdefault("quality_scores", []).append(q_score)
-                            avg_q = np.mean(buf["quality_scores"])
-                            label = f"New? T{track_id} ({len(buf['vectors'])}/{Config.MIN_ENROLL_FRAMES})"
                             
+                            label = f"New? T{track_id} ({len(buf['vectors'])})"
                             buf["last_seen"] = time.time()
+                            
                             if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
                                 avg_q = np.mean(buf.get("quality_scores", [0.5]))
                                 if avg_q >= 0.65:
-                                    new_pid = self.enroll_person(buf["vectors"])
+                                    new_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
                                     if new_pid:
                                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
                                         used_pids.add(new_pid)
                                         if track_id in self.buffer_manager.active_track_buffers:
                                             del self.buffer_manager.active_track_buffers[track_id]
                                 else:
-                                    buf["vectors"].clear(); buf.get("quality_scores", []).clear()
-
-            # --- Low Quality: Spatial Tracking Only ---
+                                    buf["vectors"].clear(); buf["quality_scores"].clear()
             else:
+                # Low Quality logic
                 if pid:
-                    # We know who this is, but the image is currently bad
-                    label, color = f"P{pid} (LowQ)", (100, 255, 100) # Slightly dimmer green
+                    label, color = f"P{pid} (LowQ)", (100, 255, 100)
                 else:
-                    # Unknown person and bad quality -> Try spatial recovery only
                     now = time.time()
-                    spatial_match_pid, best_match_score = self.spatial_matcher.find_spatial_match(
+                    spatial_pid, _ = self.spatial_matcher.find_spatial_match(
                         box, self.buffer_manager.lost_pid_buffer, now
                     )
-                    
-                    # Check uniqueness
-                    if spatial_match_pid is not None and spatial_match_pid in used_pids:
-                        spatial_match_pid = None
-                        
-                    if spatial_match_pid is not None:
-                        pid = spatial_match_pid
+                    if spatial_pid and spatial_pid in used_pids: spatial_pid = None
+                    if spatial_pid:
+                        pid = spatial_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
                         used_pids.add(pid)
-                        label = f"P{pid} (LowQ-ReAcq)"
+                        label = f"P{pid} (LQ-ReAcq)"
                         color = (100, 255, 128)
                         if pid in self.buffer_manager.lost_pid_buffer:
                             del self.buffer_manager.lost_pid_buffer[pid]
                     else:
                         label, color = f"T{track_id} (LowQ)", (0, 100, 155)
 
-            # --- Common Update Logic ---
-            if pid is not None:
+            # Common Updates
+            if pid:
                 self.buffer_manager.last_known_box_for_pid[pid] = box
-                if pid not in self.known_persons_db:
-                    person_doc = self.mongo_handler.get_person_by_id(pid)
-                    if person_doc: self.known_persons_db[pid] = person_doc
-                
-                if pid in self.known_persons_db:
-                    self.known_persons_db[pid]['last_seen_timestamp'] = time.time()
+                # Sync with global DB cache
+                if pid not in self.resources['person_manager'].known_persons_db:
+                    p_doc = self.resources['mongo_handler'].get_person_by_id(pid)
+                    if p_doc: self.resources['person_manager'].known_persons_db[pid] = p_doc
+                if pid in self.resources['person_manager'].known_persons_db:
+                    self.resources['person_manager'].known_persons_db[pid]['last_seen_timestamp'] = time.time()
 
             self.visualizer.draw_person_bbox(frame, (x1, y1, x2, y2), label, color)
         return current_frame_track_ids
 
-    def _perform_cleanup(self, current_frame_track_ids):
-        """
-        Performs periodic cleanup of stale tracks and buffers.
+    def _verify_and_correct_identities(self):
+        self.identity_verifier.verify_and_correct(
+            self.buffer_manager,
+            self.resources['faiss_manager'],
+            self.resources['match_threshold']
+        )
 
-        Args:
-            current_frame_track_ids (set): Set of track IDs in the current frame.
-        """
+    def _perform_cleanup(self, current_frame_track_ids):
         now = time.time()
         self.buffer_manager.cleanup_stale_tracks(now)
-        disappeared_track_ids = [
-            tid for tid in self.buffer_manager.track_id_to_permanent_id_map
-            if tid not in current_frame_track_ids
-        ]
-        for tid in disappeared_track_ids:
+        
+        disappeared = [tid for tid in self.buffer_manager.track_id_to_permanent_id_map if tid not in current_frame_track_ids]
+        for tid in disappeared:
             pid = self.buffer_manager.track_id_to_permanent_id_map.pop(tid, None)
-            
-            # Also clear any pending verification state for this track
             self.identity_verifier.clear_state_for_track(tid)
-
             if pid and pid in self.buffer_manager.last_known_box_for_pid:
-                self.buffer_manager.add_to_lost_buffer(
-                    pid, self.buffer_manager.last_known_box_for_pid[pid], now
-                )
-        # Clean up persons from the active cache if they haven't been seen for a while
-        # This is optional but good for memory management over very long runs
-        # Example: remove if not seen for 10 minutes
-        pids_to_evict = [
-            pid for pid, data in self.known_persons_db.items()
-            if now - data.get('last_seen_timestamp', 0) > 600
-        ]
-        for pid in pids_to_evict:
-            del self.known_persons_db[pid]
-            print(f"Evicted P{pid} from active cache due to inactivity.")
+                self.buffer_manager.add_to_lost_buffer(pid, self.buffer_manager.last_known_box_for_pid[pid], now)
 
         self.buffer_manager.cleanup_lost_pids(now)
         if self.buffer_manager.should_run_cleanup(now):
-            self.cleanup_stale_buffers(now)
+            self.buffer_manager.cleanup_stale_buffers(now, self.resources['person_manager'].known_persons_db)
+
+
+class MultiCameraSystem:
+    def __init__(self):
+        print("System initializing (Multi-Camera Mode)...")
+        self.stop_event = threading.Event()
+
+        # --- Global Shared State ---
+        self.match_threshold = Config.MATCH_SIMILARITY_THRESHOLD
+        self.detection_threshold_value = multiprocessing.Value('d', Config.DETECTION_SCORE_THRESHOLD)
+        self.use_tta = Config.USE_TTA_DEFAULT
+        
+        # --- Database & Global Components ---
+        try:
+            self.mongo_handler = MongoHandler()
+        except RuntimeError as e:
+            raise RuntimeError(f"MongoDB Init Failed: {e}")
+
+        self.faiss_manager = FaissManager(self.mongo_handler)
+        self.async_writer = AsyncDBWriter(
+            self.mongo_handler.persons_collection,
+            self.mongo_handler.faiss_collection,
+            self.stop_event
+        )
+        # Global cache of "Known People" - shared across cameras
+        self.known_persons_db = {} 
+        self.person_manager = PersonManager(
+            self.known_persons_db,
+            self.async_writer,
+            self.faiss_manager
+        )
+        self.quality_checker = QualityChecker()
+        
+        # --- AI Models ---
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device_str = 0 if self.device.type == 'cuda' else 'cpu'
+        print(f"Using device: {self.device}")
+
+        # Shared ReID
+        print("Loading Re-ID Model...")
+        # We need a dummy tracker to init ReidExtractor, or refactor ReidExtractor.
+        # ReidExtractor currently requires a 'tracker' arg for 'extract' method if it calls self.tracker.model
+        # Actually looking at reid_extractor.py (implied), it likely holds the model.
+        # Let's create a temporary tracker just to pass the model, or instantiate ReID standalone.
+        # For safety/compat, I'll pass a dummy BoostTrack or modify the extractor.
+        # Assuming ReidExtractor uses the tracker object only to access .model or similar, 
+        # I'll create a standalone extractor or just pass the first camera's tracker later.
+        # WAIT: The `ReidExtractor` usually takes `device` and `tracker` (which holds the model).
+        # I will initialize a "Master Tracker" just for the model weights to be shared or load it once.
+        self.master_tracker = BoostTrack(
+            reid_weights=Path(Config.REID_MODEL_PATH),
+            device=device_str,
+            half=False,
+            with_reid=True
+        )
+        self.reid_extractor = ReidExtractor(self.device, self.master_tracker)
+
+        # Shared Detector
+        self.frame_queue = multiprocessing.Queue(maxsize=len(Config.VIDEO_SOURCES) * 2)
+        self.detection_queue = multiprocessing.Queue(maxsize=len(Config.VIDEO_SOURCES) * 2)
+        self.detector_ready = multiprocessing.Event()
+        
+        self.detector_worker = DetectorWorker(
+            self.frame_queue, self.detection_queue, 
+            self.detection_threshold_value, device_str, self.detector_ready
+        )
+
+        # --- Resources Dict ---
+        self.global_resources = {
+            'person_manager': self.person_manager,
+            'faiss_manager': self.faiss_manager,
+            'mongo_handler': self.mongo_handler,
+            'reid_extractor': self.reid_extractor,
+            'quality_checker': self.quality_checker,
+            'detection_threshold': self.detection_threshold_value,
+            'match_threshold': self.match_threshold,
+            'use_tta': self.use_tta,
+            'device': self.device
+        }
+        
+        # --- Initialize Camera Nodes ---
+        self.camera_nodes = []
+        for i, src in enumerate(Config.VIDEO_SOURCES):
+            node = CameraNode(i, src, self.global_resources)
+            self.camera_nodes.append(node)
+
+        self.load_db()
+
+    def load_db(self):
+        try:
+            self.faiss_manager.load_index_from_db()
+            next_id = self.mongo_handler.get_next_id()
+            self.person_manager.set_next_id(next_id)
+            print("System ready. DB loaded.")
+        except Exception as e:
+            print(f"DB Load Error: {e}")
+            self.faiss_manager.build_index()
+            self.person_manager.set_next_id(1)
 
     def run(self):
-        """
-        The main application loop. It handles video capture, tracking update,
-        batch feature extraction, Re-ID matching, spatial re-acquisition,
-        enrollment logic, drawing results, and user input processing.
-        """
-        self.detector_worker_instance.start()
-        
-        print("Waiting for YOLO model to load in background process...")
-        self.detector_ready_event.wait()
-        print("YOLO model loaded. Starting video stream.")
+        self.detector_worker.start()
+        print("Waiting for Detector...")
+        self.detector_ready.wait()
+        print("Detector Ready. Starting Streams...")
 
-        cap = cv2.VideoCapture(Config.VIDEO_SOURCE)
-        if not cap.isOpened():
-            print(f"!!!! ERROR: Could not open video source: {Config.VIDEO_SOURCE} !!!!")
-            return
-
-        with torch.inference_mode():
-            detections = np.empty((0, 6), dtype=np.float32)
-            prev_time = 0
-            frame_count = 0
-
+        try:
             while True:
-                success, frame = cap.read()
-                if not success:
-                    print("Video stream ended.")
-                    break
+                # 1. Read Frames from all cameras
+                frames = {}
+                for node in self.camera_nodes:
+                    ret, frame = node.cap.read()
+                    if ret:
+                        frames[node.camera_id] = frame
+                        # Send to detector
+                        try:
+                            self.frame_queue.put_nowait((node.camera_id, frame.copy()))
+                        except queue.Full:
+                            pass # Skip frame if detector is busy
+                    else:
+                        # Handle video end (loop or stop)
+                        print(f"Cam {node.camera_id} ended. Rewinding...")
+                        node.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-                frame_count += 1
-                current_time = time.time()
-                time_diff = current_time - prev_time
-                fps = 1.0 / time_diff if time_diff > 0.0001 else 0.0
-                prev_time = current_time
-
-                if frame_count % Config.DETECTION_INTERVAL == 0:
+                # 2. Collect Detections
+                # We expect roughly one result per frame sent, but async means we check what's available
+                detections_map = {}
+                while not self.detection_queue.empty():
                     try:
-                        self.frame_queue.put_nowait(frame.copy())
-                    except queue.Full:
-                        pass
-                try:
-                    detections = self.detection_queue.get_nowait()
-                except queue.Empty:
-                    pass
+                        cam_id, dets = self.detection_queue.get_nowait()
+                        detections_map[cam_id] = dets
+                    except queue.Empty:
+                        break
 
-                tracker_results_list, vector_map = self._process_tracking_and_reid(detections, frame)
-                current_frame_track_ids = self._process_results(frame, tracker_results_list, vector_map)
-                
-                # --- Periodic Identity Verification ---
-                if frame_count % Config.ID_VERIFICATION_INTERVAL == 0:
-                    self._verify_and_correct_identities()
+                # 3. Process Per Camera
+                display_frames = []
+                for node in self.camera_nodes:
+                    if node.camera_id in frames:
+                        frame = frames[node.camera_id]
+                        dets = detections_map.get(node.camera_id, np.empty((0, 6)))
+                        
+                        annotated_frame = node.process_frame(frame, dets)
+                        display_frames.append(annotated_frame)
 
-                self._perform_cleanup(current_frame_track_ids)
+                # 4. Display Combined
+                if display_frames:
+                    # Simple horizontal stack for now. For many cams, grid needed.
+                    # Resize to same height for stacking
+                    h_min = min(f.shape[0] for f in display_frames)
+                    resized = [cv2.resize(f, (int(f.shape[1] * h_min / f.shape[0]), h_min)) for f in display_frames]
+                    combined = np.hstack(resized)
+                    cv2.imshow("Multi-Camera Tracking", combined)
 
-                self.visualizer.draw_hud(
-                    frame, fps, self.detection_threshold_value.value,
-                    self.current_match_threshold, len(self.known_persons_db), self.USE_TTA
-                )
-                cv2.imshow("ReID Vectors (MongoDB - Faiss)", frame)
-                if self.handle_keyboard_input() == 'q':
+                key = self.handle_input()
+                if key == 'q':
                     break
+                    
+                # Update shared vars if changed by input
+                self.global_resources['match_threshold'] = self.match_threshold
+                self.global_resources['use_tta'] = self.use_tta
 
-    def handle_keyboard_input(self):
-        """
-        Processes user keyboard input for control actions, including quitting,
-        live-tuning thresholds, resetting the database, and debugging status.
+        finally:
+            self.cleanup()
 
-        Returns:
-            str | int: The key pressed, or 'q' for quit signal.
-        """
+    def handle_input(self):
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            print("Quitting...")
-            self.detector_worker_instance.stop()  # Signal detector thread to stop
-            return 'q'
-
-        # Live-tuning and other controls...
-        elif key == ord('u'):
-            new_val = min(1.0, self.detection_threshold_value.value + 0.05)
-            self.detector_worker_instance.set_detection_threshold(new_val)
-        elif key == ord('j'):
-            new_val = max(0.0, self.detection_threshold_value.value - 0.05)
-            self.detector_worker_instance.set_detection_threshold(new_val)
-        elif key == ord('y'):
-            self.current_match_threshold = min(1.0, self.current_match_threshold + 0.05)
-        elif key == ord('h'):
-            self.current_match_threshold = max(0.0, self.current_match_threshold - 0.05)
-        elif key == ord('t'):
-            self.USE_TTA = not self.USE_TTA
-            self.reid_extractor.set_tta_status(self.USE_TTA)
-
-        elif key == ord('r'):
-            print("RESET: Queuing MongoDB clear operation...")
+        if key == ord('q'): return 'q'
+        if key == ord('u'): self.detection_threshold_value.value = min(1.0, self.detection_threshold_value.value + 0.05)
+        if key == ord('j'): self.detection_threshold_value.value = max(0.0, self.detection_threshold_value.value - 0.05)
+        if key == ord('y'): self.match_threshold = min(1.0, self.match_threshold + 0.05)
+        if key == ord('h'): self.match_threshold = max(0.0, self.match_threshold - 0.05)
+        if key == ord('t'): 
+            self.use_tta = not self.use_tta
+            self.reid_extractor.set_tta_status(self.use_tta)
+        if key == ord('r'):
+            print("RESET DB...")
             self.person_manager.reset_all()
-            self.buffer_manager.reset_all()
-            self.faiss_manager.build_index()  # No longer needs persons_db
-            print("Program memory (cache and index) has been cleared.")
-
-        elif key == ord('d'):
-            # Debugging status...
-            print("\n--- DB STATUS (d) ---")
-            print(f"Persons in ACTIVE CACHE: {len(self.known_persons_db)}")
-            stats = self.faiss_manager.get_index_stats()
-            print(f"Vectors in Faiss index: {stats['ntotal']}")
-            print(f"Next ID: {self.person_manager.next_permanent_id}")
-            
-            if self.known_persons_db:
-                print("Vector Counts:")
-                for pid, data in sorted(self.known_persons_db.items()):
-                    count = data.get("count", 0)
-                    max_count = Config.MAX_VECTORS_FOR_UPDATE
-                    print(f"  - P{pid}: {count}/{max_count} vectors")
-
-            print("------------------\n")
-
-        elif key == ord('k'):
-            if self.known_persons_db:
-                try:
-                    last_id = max(self.known_persons_db.keys())
-                    self.person_manager.delete_person(last_id)
-                    # Clear from cache
-                    if last_id in self.known_persons_db:
-                        del self.known_persons_db[last_id]
-                    # Clear associated buffers
-                    self.buffer_manager.active_track_buffers.clear()
-                    self.buffer_manager.track_id_to_permanent_id_map.clear()
-                    self.buffer_manager.lost_pid_buffer.clear()
-                    print(f"DELETED (k): P{last_id} delete command issued.")
-                except Exception as e:
-                    print(f"Error deleting person: {e}")
-            else:
-                print("DB is already empty. Nothing to delete.")
-
+            self.faiss_manager.build_index()
+            for node in self.camera_nodes:
+                node.buffer_manager.reset_all()
         return key
-    
+
     def cleanup(self):
-        """Releases all resources gracefully."""
         self.stop_event.set()
-        print("Cleaning up and exiting...")
-        self.detector_worker_instance.stop()
+        self.detector_worker.stop()
         self.async_writer.shutdown()
+        for node in self.camera_nodes:
+            node.cap.release()
         cv2.destroyAllWindows()
         self.mongo_handler.close()
-        print(f"Exited cleanly. DB entries in active cache: {len(self.known_persons_db)}")
 
-# --- Start the Application ---
 if __name__ == "__main__":
-    app = None
     try:
-        app = PersonTrackerApp()
+        app = MultiCameraSystem()
         app.run()
-    except RuntimeError as e:
-        print(f"!!!! CRITICAL RUNTIME ERROR !!!!: {e}")
     except Exception as e:
-        print(f"!!!! UNEXPECTED ERROR OCCURRED !!!!: {e}")
-    finally:
-        if app:
-            app.cleanup()
+        print(f"CRITICAL: {e}")
+        import traceback
+        traceback.print_exc()
