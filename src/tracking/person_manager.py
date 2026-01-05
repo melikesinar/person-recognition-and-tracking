@@ -130,6 +130,48 @@ class PersonManager:
         # Queue async update
         self.async_writer.queue_update(perm_id, mongo_update_doc)
 
+    def merge_identities(self, keep_pid: int, drop_pid: int):
+        """
+        Merges two identities into one. 'drop_pid' is removed, its data influences 'keep_pid'.
+        """
+        if keep_pid not in self.known_persons_db or drop_pid not in self.known_persons_db:
+            print(f"MERGE ERROR: P{keep_pid} or P{drop_pid} not found in cache.")
+            return
+
+        print(f"!!! MERGING IDENTITIES: P{drop_pid} -> INTO -> P{keep_pid} !!!")
+        
+        # 1. Get Data
+        keep_data = self.known_persons_db[keep_pid]
+        drop_data = self.known_persons_db[drop_pid]
+        
+        # 2. Update Master Vector (Weighted Average or Simple Average)
+        v1 = keep_data["master_vector"]
+        v2 = drop_data["master_vector"]
+        
+        # New master = (v1 + v2) / 2 normalized
+        new_master = l2_normalize(v1 + v2)
+        
+        # 3. Update 'keep_pid' in DB and Cache
+        new_count = keep_data["count"] + drop_data["count"]
+        
+        mongo_update_doc = {
+            "$set": {
+                "master_vector": Binary(new_master.tobytes()),
+                "count": new_count,
+                "last_seen": datetime.now()
+            }
+        }
+        
+        self.async_writer.queue_update(keep_pid, mongo_update_doc)
+        
+        keep_data["master_vector"] = new_master
+        keep_data["count"] = new_count
+        
+        # 4. Delete 'drop_pid'
+        self.delete_person(drop_pid)
+        
+        print(f"MERGE SUCCESS: P{drop_pid} deleted. P{keep_pid} updated.")
+
     def delete_person(self, pid: int):
         """
         Deletes a person from database and cache.
