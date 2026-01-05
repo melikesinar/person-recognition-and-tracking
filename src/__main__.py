@@ -23,7 +23,6 @@ from tracking.buffer_manager import BufferManager
 from tracking.spatial_matcher import SpatialMatcher
 from tracking.identity_verifier import IdentityVerifier
 
-# Validate configuration
 Config.validate()
 Config.print_config()
 
@@ -38,13 +37,11 @@ class CameraNode:
         
         print(f"Initializing CameraNode {camera_id} for source: {video_source}")
         
-        # --- Independent State Components ---
         self.buffer_manager = BufferManager()
         self.spatial_matcher = SpatialMatcher()
         self.visualizer = Visualizer()
         self.identity_verifier = IdentityVerifier()
         
-        # --- Independent Tracker Instance ---
         self.tracker = BoostTrack(
             reid_weights=Path(Config.REID_MODEL_PATH),
             device=(0 if self.resources['device'].type == 'cuda' else 'cpu'),
@@ -54,7 +51,6 @@ class CameraNode:
             max_obs=100
         )
         
-        # Video Capture
         self.cap = cv2.VideoCapture(self.video_source)
         if not self.cap.isOpened():
             print(f"!!!! ERROR: Could not open video source for Cam {camera_id}: {video_source}")
@@ -234,7 +230,7 @@ class CameraNode:
                         pid = spatial_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
                         used_pids.add(pid)
-                        label = f"P{pid} (LQ)", (100, 255, 128)
+                        label = f"P{pid} (LQ)"
                         color = (100, 255, 128)
                         if pid in self.buffer_manager.lost_pid_buffer:
                             del self.buffer_manager.lost_pid_buffer[pid]
