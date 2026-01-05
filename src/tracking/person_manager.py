@@ -83,6 +83,7 @@ class PersonManager:
     def incremental_update(self, perm_id: int, new_vector: np.ndarray):
         """
         Updates master vector using EMA (Exponential Moving Average).
+        Includes strict checks to prevent 'Model Drift' (Pollution).
 
         Args:
             perm_id (int): Permanent ID
@@ -92,13 +93,27 @@ class PersonManager:
         if entry is None:
             return
 
+        # 1. DRIFT CHECK (Guard Rail)
+        # Calculate similarity between new vector and existing master vector
+        master = entry["master_vector"]
+        similarity = np.dot(master, new_vector)
+
+        if similarity < Config.VECTOR_UPDATE_THRESHOLD:
+            # Although the tracker thinks this is P{perm_id}, the visual match is too weak.
+            # We TRUST the ID for tracking/display, but we DO NOT TRUST it for learning.
+            # This prevents pollution.
+            # print(f"GUARD: Ignored update for P{perm_id}. Sim {similarity:.2f} < {Config.VECTOR_UPDATE_THRESHOLD}")
+            
+            # Still update 'last_seen' so we don't delete them as stale
+            mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
+            self.async_writer.queue_update(perm_id, mongo_update_doc)
+            return
+
+        # 2. Proceed with Update
         n = entry.get("count", 1)
         mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
 
-        # Update master vector if under limit
         if n < Config.MAX_VECTORS_FOR_UPDATE:
-            master = entry["master_vector"]
-
             # EMA update
             updated_master = l2_normalize((1 - Config.EMA_ALPHA) * master + Config.EMA_ALPHA * new_vector)
 
@@ -135,7 +150,6 @@ class PersonManager:
 
         # Trigger index rebuild to remove the person from search results
         self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True, force=True)
-
 
     def reset_all(self):
         """Resets entire database and cache."""
