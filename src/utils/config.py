@@ -25,12 +25,12 @@ class Config:
     FAISS_INDEX_KEY = "primary_person_index"
 
     # --- Detection & Matching Thresholds ---
-    DETECTION_SCORE_THRESHOLD = 0.60
-    MATCH_SIMILARITY_THRESHOLD = 0.78
+    DETECTION_SCORE_THRESHOLD = 0.65
+    MATCH_SIMILARITY_THRESHOLD = 0.85
     
     # Threshold required to UPDATE the database vector. 
     # Must be higher than match threshold to prevent "Model Drift/Pollution".
-    VECTOR_UPDATE_THRESHOLD = 0.82 
+    VECTOR_UPDATE_THRESHOLD = 0.90
 
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 40
@@ -50,14 +50,17 @@ class Config:
     VECTOR_DIMENSION = 512
 
     # --- Identity Verification / Self-Correction ---
-    ID_VERIFICATION_INTERVAL = 15  # Check every 15 frames
-    ID_SWITCH_THRESHOLD_MARGIN = 0.10  # New match must be 10% better than current to switch
-    ID_SWITCH_CONFIRMATION_THRESHOLD = 10  # Number of consistent matches required to switch ID
+    ID_VERIFICATION_INTERVAL = 10  # Check every 15 frames
+    ID_SWITCH_THRESHOLD_MARGIN = 0.01  # Lowered: Easier to switch ID
+    ID_SWITCH_CONFIRMATION_THRESHOLD = 3  # Number of consistent matches required to switch ID
     ID_SWITCH_COUNTER_TTL_SECONDS = 5.0  # Reset counter if no confirmation within this duration
-    ID_SWITCH_COOLDOWN = 30.0 # Seconds to lock ID after a switch
+    ID_SWITCH_COOLDOWN = 10.0 # Seconds to lock ID after a switch
 
     # Threshold for merging during enrollment (High = Strict, only merge if very sure)
     ENROLLMENT_MERGE_THRESHOLD = 0.85
+    
+    # Maximum age (in seconds) of an ID to be considered for Auto-Merge.
+    MERGE_MAX_AGE_SECONDS = 5.0
 
     # ImageNet normalization (for pretrained models)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -115,14 +118,15 @@ class Config:
 
     # --- Model Paths ---
     # Use dynamic paths based on project root
-    YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8m.pt")
+    YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8l.pt")
     REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
     # --- Video Source ---
     # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
     VIDEO_SOURCES = [
-        str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
-        str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi")
+        str(BASE_DIR / "videos" / "3.mp4")
+        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
+        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi")
     ]
     # VIDEO_SOURCES = [0, 1]  # Uncomment for multi-webcam
 
