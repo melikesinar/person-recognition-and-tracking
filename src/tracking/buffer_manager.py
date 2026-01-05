@@ -24,6 +24,9 @@ class BufferManager:
         self.track_id_to_permanent_id_map = {}
         self.lost_pid_buffer = {}
         self.last_known_box_for_pid = {}
+        
+        # Locks track IDs from switching identity until a timestamp
+        self.locked_tracks = {} 
 
         # Update tracking
         self.last_update_time_for_pid = defaultdict(float)

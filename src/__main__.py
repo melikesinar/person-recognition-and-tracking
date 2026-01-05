@@ -135,19 +135,24 @@ class CameraNode:
         return tracker_results_list, vector_map
 
     def _process_results(self, frame, tracker_results_list, vector_map):
+        """
+        Original Sequential ID Assignment Logic.
+        No Global Resolution, No Hysteresis.
+        """
         current_frame_track_ids = set()
-        used_pids = set()
         
-        # Phase 1: Reservation
+        # --- PHASE 1: Reservation (Priority to existing tracks) ---
+        used_pids = set()
         for (_, track_id, _, _, _, _) in tracker_results_list:
             existing_pid = self.buffer_manager.track_id_to_permanent_id_map.get(track_id)
             if existing_pid:
                 if existing_pid in used_pids:
+                    # Conflict! Two tracks think they are the same person.
                     del self.buffer_manager.track_id_to_permanent_id_map[track_id]
                 else:
                     used_pids.add(existing_pid)
 
-        # Phase 2: Assignment
+        # --- PHASE 2: Processing & Assignment ---
         for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
             current_frame_track_ids.add(track_id)
             current_vector = vector_map.get(track_id)
@@ -165,7 +170,6 @@ class CameraNode:
                         self.resources['person_manager'].incremental_update(pid, current_vector)
                         self.buffer_manager.last_update_time_for_pid[pid] = time.time()
                 else:
-                    # New Track -> Try Spatial -> Try ReID -> Enroll
                     now = time.time()
                     spatial_pid, score = self.spatial_matcher.find_spatial_match(
                         box, self.buffer_manager.lost_pid_buffer, now
@@ -182,7 +186,6 @@ class CameraNode:
                         if pid in self.buffer_manager.lost_pid_buffer:
                             del self.buffer_manager.lost_pid_buffer[pid]
                     else:
-                        # ReID Match (GLOBAL SEARCH)
                         match_id, match_sim = self.resources['faiss_manager'].search(
                             current_vector, self.resources['match_threshold']
                         )
@@ -195,7 +198,6 @@ class CameraNode:
                             used_pids.add(pid)
                             label, color = f"P{pid} (S:{match_sim:.2f})", (0, 255, 0)
                         else:
-                            # Enrollment (GLOBAL ENROLLMENT)
                             is_good, _, q_score = self.resources['quality_checker'].assess_quality(crop, box, frame.shape)
                             buf = self.buffer_manager.active_track_buffers[track_id]
                             
@@ -208,16 +210,31 @@ class CameraNode:
                             if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
                                 avg_q = np.mean(buf.get("quality_scores", [0.5]))
                                 if avg_q >= 0.65:
-                                    new_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
-                                    if new_pid:
-                                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
-                                        used_pids.add(new_pid)
+                                    # Enrollment Check Logic (Preserved)
+                                    candidate_vector = np.mean(np.stack(buf["vectors"], axis=0), axis=0)
+                                    candidate_vector = candidate_vector / np.linalg.norm(candidate_vector)
+
+                                    found_pid, found_score = self.resources['faiss_manager'].search(
+                                        candidate_vector, 
+                                        threshold=Config.ENROLLMENT_MERGE_THRESHOLD
+                                    )
+
+                                    final_pid = None
+                                    if found_pid is not None:
+                                        print(f"Enroll Check: T{track_id} -> P{found_pid}. Merging.")
+                                        final_pid = found_pid
+                                        self.resources['person_manager'].incremental_update(final_pid, candidate_vector)
+                                    else:
+                                        final_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
+
+                                    if final_pid:
+                                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = final_pid
+                                        used_pids.add(final_pid)
                                         if track_id in self.buffer_manager.active_track_buffers:
                                             del self.buffer_manager.active_track_buffers[track_id]
                                 else:
                                     buf["vectors"].clear(); buf["quality_scores"].clear()
             else:
-                # Low Quality logic
                 if pid:
                     label, color = f"P{pid} (LQ)", (100, 255, 100)
                 else:
@@ -237,7 +254,6 @@ class CameraNode:
                     else:
                         label, color = f"T{track_id} (LQ)", (0, 100, 155)
 
-            # Common Updates
             if pid:
                 self.buffer_manager.last_known_box_for_pid[pid] = box
                 if pid not in self.resources['person_manager'].known_persons_db:
@@ -276,6 +292,7 @@ class MultiCameraSystem:
     def __init__(self):
         print("System initializing (Multi-Camera Mode)...")
         self.stop_event = threading.Event()
+        self.paused = False # New PAUSE flag
 
         # --- Global Shared State ---
         self.match_threshold = Config.MATCH_SIMILARITY_THRESHOLD
@@ -365,54 +382,68 @@ class MultiCameraSystem:
         print("Waiting for Detector...")
         self.detector_ready.wait()
         print("Detector Ready. Starting Streams...")
+        
+        # Create a blank image for pause screen
+        pause_overlay = None
 
         try:
             while True:
-                # 1. Read Frames from all cameras
-                frames = {}
-                for node in self.camera_nodes:
-                    ret, frame = node.cap.read()
-                    if ret:
-                        frames[node.camera_id] = frame
+                if not self.paused:
+                    # 1. Read Frames from all cameras
+                    frames = {}
+                    for node in self.camera_nodes:
+                        ret, frame = node.cap.read()
+                        if ret:
+                            frames[node.camera_id] = frame
+                            try:
+                                self.frame_queue.put_nowait((node.camera_id, frame.copy()))
+                            except queue.Full:
+                                pass 
+                        else:
+                            # Auto-rewind for testing
+                            node.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+                    # 2. Collect Detections
+                    detections_map = {}
+                    while not self.detection_queue.empty():
                         try:
-                            self.frame_queue.put_nowait((node.camera_id, frame.copy()))
-                        except queue.Full:
-                            pass 
-                    else:
-                        # Auto-rewind for testing
-                        node.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            cam_id, dets = self.detection_queue.get_nowait()
+                            detections_map[cam_id] = dets
+                        except queue.Empty:
+                            break
 
-                # 2. Collect Detections
-                detections_map = {}
-                while not self.detection_queue.empty():
-                    try:
-                        cam_id, dets = self.detection_queue.get_nowait()
-                        detections_map[cam_id] = dets
-                    except queue.Empty:
-                        break
+                    # 3. Process Per Camera
+                    display_frames = []
+                    for node in self.camera_nodes:
+                        if node.camera_id in frames:
+                            frame = frames[node.camera_id]
+                            dets = detections_map.get(node.camera_id, np.empty((0, 6)))
+                            
+                            annotated_frame = node.process_frame(frame, dets)
+                            display_frames.append(annotated_frame)
 
-                # 3. Process Per Camera
-                display_frames = []
-                for node in self.camera_nodes:
-                    if node.camera_id in frames:
-                        frame = frames[node.camera_id]
-                        dets = detections_map.get(node.camera_id, np.empty((0, 6)))
+                    # 4. Display Combined (Resize to fixed height for consistent stack)
+                    if display_frames:
+                        target_h = 480
+                        resized_frames = []
+                        for f in display_frames:
+                            h, w = f.shape[:2]
+                            scale = target_h / h
+                            new_w = int(w * scale)
+                            resized_frames.append(cv2.resize(f, (new_w, target_h)))
                         
-                        annotated_frame = node.process_frame(frame, dets)
-                        display_frames.append(annotated_frame)
-
-                # 4. Display Combined (Resize to fixed height for consistent stack)
-                if display_frames:
-                    target_h = 480
-                    resized_frames = []
-                    for f in display_frames:
-                        h, w = f.shape[:2]
-                        scale = target_h / h
-                        new_w = int(w * scale)
-                        resized_frames.append(cv2.resize(f, (new_w, target_h)))
-                    
-                    combined = np.hstack(resized_frames)
-                    cv2.imshow("Multi-Camera Tracking", combined)
+                        combined = np.hstack(resized_frames)
+                        pause_overlay = combined.copy() # Save for pause
+                        cv2.imshow("Multi-Camera Tracking", combined)
+                
+                else:
+                    # Show Paused State
+                    if pause_overlay is not None:
+                        display = pause_overlay.copy()
+                        cv2.putText(display, "PAUSED", (display.shape[1]//2 - 100, display.shape[0]//2), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+                        cv2.imshow("Multi-Camera Tracking", display)
+                    time.sleep(0.1) # Reduce CPU usage
 
                 key = self.handle_input()
                 if key == 'q':
@@ -427,6 +458,10 @@ class MultiCameraSystem:
     def handle_input(self):
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'): return 'q'
+        if key == ord('p'): 
+            self.paused = not self.paused
+            print(f"System {'PAUSED' if self.paused else 'RESUMED'}")
+            
         if key == ord('u'): self.detection_threshold_value.value = min(1.0, self.detection_threshold_value.value + 0.05)
         if key == ord('j'): self.detection_threshold_value.value = max(0.0, self.detection_threshold_value.value - 0.05)
         if key == ord('y'): self.match_threshold = min(1.0, self.match_threshold + 0.05)
