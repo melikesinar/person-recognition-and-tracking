@@ -136,8 +136,8 @@ class CameraNode:
 
     def _process_results(self, frame, tracker_results_list, vector_map):
         """
-        Original Sequential ID Assignment Logic.
-        No Global Resolution, No Hysteresis.
+        Processes tracker results with UNIQUENESS CONSTRAINT.
+        A PID can only appear once per frame.
         """
         current_frame_track_ids = set()
         
@@ -148,6 +148,7 @@ class CameraNode:
             if existing_pid:
                 if existing_pid in used_pids:
                     # Conflict! Two tracks think they are the same person.
+                    # First one keeps it, second one loses it.
                     del self.buffer_manager.track_id_to_permanent_id_map[track_id]
                 else:
                     used_pids.add(existing_pid)
@@ -170,12 +171,15 @@ class CameraNode:
                         self.resources['person_manager'].incremental_update(pid, current_vector)
                         self.buffer_manager.last_update_time_for_pid[pid] = time.time()
                 else:
+                    # New Track -> Try Spatial -> Try ReID -> Enroll
                     now = time.time()
                     spatial_pid, score = self.spatial_matcher.find_spatial_match(
                         box, self.buffer_manager.lost_pid_buffer, now
                     )
                     
-                    if spatial_pid and spatial_pid in used_pids: spatial_pid = None
+                    # Uniqueness Check for Spatial
+                    if spatial_pid and spatial_pid in used_pids:
+                        spatial_pid = None
                     
                     if spatial_pid:
                         pid = spatial_pid
@@ -186,11 +190,14 @@ class CameraNode:
                         if pid in self.buffer_manager.lost_pid_buffer:
                             del self.buffer_manager.lost_pid_buffer[pid]
                     else:
+                        # ReID Match (GLOBAL SEARCH)
                         match_id, match_sim = self.resources['faiss_manager'].search(
                             current_vector, self.resources['match_threshold']
                         )
                         
-                        if match_id and match_id in used_pids: match_id = None
+                        # Uniqueness Check for ReID
+                        if match_id and match_id in used_pids:
+                            match_id = None
                         
                         if match_id:
                             pid = match_id
@@ -198,6 +205,7 @@ class CameraNode:
                             used_pids.add(pid)
                             label, color = f"P{pid} (S:{match_sim:.2f})", (0, 255, 0)
                         else:
+                            # Enrollment (GLOBAL ENROLLMENT)
                             is_good, _, q_score = self.resources['quality_checker'].assess_quality(crop, box, frame.shape)
                             buf = self.buffer_manager.active_track_buffers[track_id]
                             
@@ -210,10 +218,11 @@ class CameraNode:
                             if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
                                 avg_q = np.mean(buf.get("quality_scores", [0.5]))
                                 if avg_q >= 0.65:
-                                    # Enrollment Check Logic (Preserved)
+                                    # 1. Create a candidate vector
                                     candidate_vector = np.mean(np.stack(buf["vectors"], axis=0), axis=0)
                                     candidate_vector = candidate_vector / np.linalg.norm(candidate_vector)
 
+                                    # 2. Final "Self-Check"
                                     found_pid, found_score = self.resources['faiss_manager'].search(
                                         candidate_vector, 
                                         threshold=Config.ENROLLMENT_MERGE_THRESHOLD
@@ -221,9 +230,18 @@ class CameraNode:
 
                                     final_pid = None
                                     if found_pid is not None:
-                                        print(f"Enroll Check: T{track_id} -> P{found_pid}. Merging.")
-                                        final_pid = found_pid
-                                        self.resources['person_manager'].incremental_update(final_pid, candidate_vector)
+                                        # Check uniqueness before merging? 
+                                        # Merging into an existing ID is fine even if it's on screen (it updates the model)
+                                        # But assigning it to THIS track if P1 is already on screen is tricky.
+                                        # If P1 is on screen, we can't be P1.
+                                        if found_pid in used_pids:
+                                            # We are a duplicate of someone on screen.
+                                            # Do not enroll, do not merge. Wait.
+                                            pass
+                                        else:
+                                            print(f"Enroll Check: T{track_id} -> P{found_pid}. Merging.")
+                                            final_pid = found_pid
+                                            self.resources['person_manager'].incremental_update(final_pid, candidate_vector)
                                     else:
                                         final_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
 
@@ -235,6 +253,7 @@ class CameraNode:
                                 else:
                                     buf["vectors"].clear(); buf["quality_scores"].clear()
             else:
+                # Low Quality logic
                 if pid:
                     label, color = f"P{pid} (LQ)", (100, 255, 100)
                 else:
@@ -242,7 +261,10 @@ class CameraNode:
                     spatial_pid, _ = self.spatial_matcher.find_spatial_match(
                         box, self.buffer_manager.lost_pid_buffer, now
                     )
-                    if spatial_pid and spatial_pid in used_pids: spatial_pid = None
+                    
+                    if spatial_pid and spatial_pid in used_pids:
+                        spatial_pid = None
+                        
                     if spatial_pid:
                         pid = spatial_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
@@ -254,6 +276,7 @@ class CameraNode:
                     else:
                         label, color = f"T{track_id} (LQ)", (0, 100, 155)
 
+            # Common Updates
             if pid:
                 self.buffer_manager.last_known_box_for_pid[pid] = box
                 if pid not in self.resources['person_manager'].known_persons_db:
@@ -319,6 +342,9 @@ class MultiCameraSystem:
             self.faiss_manager
         )
         self.quality_checker = QualityChecker()
+        
+        # Global Verifier for Cross-Camera Redundancy Check
+        self.global_verifier = IdentityVerifier()
         
         # --- AI Models ---
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -422,7 +448,13 @@ class MultiCameraSystem:
                             annotated_frame = node.process_frame(frame, dets)
                             display_frames.append(annotated_frame)
 
-                    # 4. Display Combined (Resize to fixed height for consistent stack)
+                    # 4. GLOBAL REDUNDANCY CHECK (Auto-Merge P1/P2)
+                    self.global_verifier.check_redundant_identities(
+                        self.person_manager, 
+                        self.camera_nodes
+                    )
+
+                    # 5. Display Combined (Resize to fixed height for consistent stack)
                     if display_frames:
                         target_h = 480
                         resized_frames = []
