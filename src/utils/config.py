@@ -25,18 +25,18 @@ class Config:
     FAISS_INDEX_KEY = "primary_person_index"
 
     # --- Detection & Matching Thresholds ---
-    DETECTION_SCORE_THRESHOLD = 0.65
+    DETECTION_SCORE_THRESHOLD = 0.60
     MATCH_SIMILARITY_THRESHOLD = 0.73
 
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 40
-    MIN_BBOX_AREA_ENROLL = 7500
+    MIN_BBOX_AREA_ENROLL = 5000
     MIN_SHARPNESS_ENROLL = 35
     MAX_VECTORS_FOR_UPDATE = 500
 
     # --- Buffer & Timing Settings ---
     RECENT_VECTOR_BUFFER_SIZE = 200
-    DETECTION_INTERVAL = 2 # Check every 2 frames
+    DETECTION_INTERVAL = 1 # Process EVERY frame for stable tracking
     UPDATE_INTERVAL = 1.0
     BUFFER_CLEANUP_INTERVAL = 60.0
     BUFFER_MAX_IDLE_TIME = 3600.0
@@ -107,19 +107,26 @@ class Config:
 
     # --- Model Paths ---
     # Use dynamic paths based on project root
-    YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8l.pt")
+    YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8m.pt")
     REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
     # --- Video Source ---
     # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
     VIDEO_SOURCES = [
-        str(BASE_DIR / "videos" / "3.mp4"),
-        str(BASE_DIR / "videos" / "2.mp4")
+        str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
+        str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi")
     ]
     # VIDEO_SOURCES = [0, 1]  # Uncomment for multi-webcam
 
+    # --- Multi-Camera Topology ---
+    # Define pairs of cameras that have overlapping views (e.g., opposite ends of a hallway).
+    # If cameras are defined as a pair, the system will attempt to fuse identities
+    # appearing simultaneously in both views (e.g., front view in Cam 0, back view in Cam 1).
+    # Format: [(cam_id_A, cam_id_B), ...]
+    CAMERA_PAIRS = [(0, 1)]
+
     # --- TTA Settings ---
-    USE_TTA_DEFAULT = True
+    USE_TTA_DEFAULT = False
     TTA_HORIZONTAL_FLIP = True
     TTA_MULTI_SCALE = False
 
