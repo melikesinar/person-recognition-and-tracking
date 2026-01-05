@@ -38,6 +38,12 @@ class IdentityVerifier:
         current_time = time.time()
 
         for track_id, pid in list(buffer_manager.track_id_to_permanent_id_map.items()):
+            # 1. COOLDOWN CHECK
+            # If this track recently switched, do not touch it.
+            lock_expiry = buffer_manager.locked_tracks.get(track_id, 0)
+            if current_time < lock_expiry:
+                continue
+
             buf = buffer_manager.active_track_buffers.get(track_id)
             if not buf or not buf["vectors"]:
                 continue
@@ -73,8 +79,14 @@ class IdentityVerifier:
 
                     # Check if the confirmation threshold is met
                     if self.verification_state[track_id]["count"] >= Config.ID_SWITCH_CONFIRMATION_THRESHOLD:
-                        print(f"SWITCH CONFIRMED: T{track_id} switched from P{pid} -> P{best_pid} after {self.verification_state[track_id]['count']} checks.")
+                        print(f"SWITCH CONFIRMED: T{track_id} switched from P{pid} -> P{best_pid}. Locking for {Config.ID_SWITCH_COOLDOWN}s.")
+                        
+                        # Apply Switch
                         buffer_manager.track_id_to_permanent_id_map[track_id] = best_pid
+                        
+                        # Apply Lock
+                        buffer_manager.locked_tracks[track_id] = current_time + Config.ID_SWITCH_COOLDOWN
+                        
                         self.clear_state_for_track(track_id) # Clean up state after switch
                 
                 elif state:
