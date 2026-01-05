@@ -118,13 +118,6 @@ class Config:
     ]
     # VIDEO_SOURCES = [0, 1]  # Uncomment for multi-webcam
 
-    # --- Multi-Camera Topology ---
-    # Define pairs of cameras that have overlapping views (e.g., opposite ends of a hallway).
-    # If cameras are defined as a pair, the system will attempt to fuse identities
-    # appearing simultaneously in both views (e.g., front view in Cam 0, back view in Cam 1).
-    # Format: [(cam_id_A, cam_id_B), ...]
-    CAMERA_PAIRS = [(0, 1)]
-
     # --- TTA Settings ---
     USE_TTA_DEFAULT = False
     TTA_HORIZONTAL_FLIP = True

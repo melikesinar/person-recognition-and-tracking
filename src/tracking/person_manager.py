@@ -34,8 +34,6 @@ class PersonManager:
         """Set the next available permanent ID."""
         self.next_permanent_id = next_id
 
-
-
     def enroll_person(self, vectors: list) -> int:
         """
         Enrolls a new person with a unique Permanent ID.

@@ -30,13 +30,11 @@ Config.print_config()
 class CameraNode:
     """
     Represents a completely independent tracking system for a SINGLE camera source.
-    It has its own Tracker, BufferManager, SpatialMatcher, and Visualization state.
-    It only shares the global Identity Database (PersonManager/Faiss).
     """
     def __init__(self, camera_id, video_source, global_resources):
         self.camera_id = camera_id
         self.video_source = video_source
-        self.resources = global_resources # Shared: person_manager, faiss_manager, reid_extractor, quality_checker
+        self.resources = global_resources 
         
         print(f"Initializing CameraNode {camera_id} for source: {video_source}")
         
@@ -47,7 +45,6 @@ class CameraNode:
         self.identity_verifier = IdentityVerifier()
         
         # --- Independent Tracker Instance ---
-        # Each camera gets its own BoostTrack instance to maintain separate track histories.
         self.tracker = BoostTrack(
             reid_weights=Path(Config.REID_MODEL_PATH),
             device=(0 if self.resources['device'].type == 'cuda' else 'cpu'),
@@ -65,11 +62,13 @@ class CameraNode:
         self.frame_count = 0
         self.prev_time = time.time()
         self.fps = 0.0
+        
+        # FPS Limiter Settings
+        self.target_fps = 30.0
+        self.frame_duration = 1.0 / self.target_fps
 
     def process_frame(self, frame, detections):
-        """
-        Runs the full tracking and Re-ID pipeline for this specific camera using the provided frame and detections.
-        """
+        start_time = time.time()
         self.frame_count += 1
         
         # 1. Update Tracker & Extract Crops
@@ -84,8 +83,13 @@ class CameraNode:
             
         self._perform_cleanup(current_frame_track_ids)
         
-        # 4. Visualization
-        # Calculate FPS for this camera
+        # 4. FPS Limiter
+        process_time = time.time() - start_time
+        wait_time = self.frame_duration - process_time
+        if wait_time > 0:
+            time.sleep(wait_time)
+        
+        # 5. Visualization (FPS Calc)
         curr_time = time.time()
         time_diff = curr_time - self.prev_time
         if time_diff > 0.0001:
@@ -105,7 +109,6 @@ class CameraNode:
         return frame
 
     def _process_tracking_and_reid(self, detections, frame):
-        """Same logic as original, but uses local self.tracker and shared self.resources['reid_extractor']"""
         res = self.tracker.update(detections, frame)
         crops_to_process, track_ids_for_crops, tracker_results_list = [], [], []
 
@@ -127,7 +130,6 @@ class CameraNode:
 
         all_vectors = []
         if crops_to_process:
-            # Use SHARED ReID extractor (thread-safety implied by sequential processing in main loop)
             all_vectors = self.resources['reid_extractor'].extract_embeddings_from_crops(crops_to_process)
 
         vector_map = {}
@@ -137,10 +139,6 @@ class CameraNode:
         return tracker_results_list, vector_map
 
     def _process_results(self, frame, tracker_results_list, vector_map):
-        """
-        Matches local tracks to GLOBAL identities.
-        Uses local self.buffer_manager but shared self.resources['person_manager'] / 'faiss_manager'.
-        """
         current_frame_track_ids = set()
         used_pids = set()
         
@@ -159,7 +157,8 @@ class CameraNode:
             current_vector = vector_map.get(track_id)
             
             x1, y1, x2, y2 = map(int, box)
-            label, color = f"T{track_id}", (0, 165, 255)
+            label = f"T{track_id}"
+            color = (0, 165, 255)
             pid = self.buffer_manager.track_id_to_permanent_id_map.get(track_id)
 
             if current_vector is not None:
@@ -182,7 +181,7 @@ class CameraNode:
                         pid = spatial_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
                         used_pids.add(pid)
-                        label = f"P{pid} (ReAcq)"
+                        label = f"P{pid} (RA)"
                         color = (0, 255, 128)
                         if pid in self.buffer_manager.lost_pid_buffer:
                             del self.buffer_manager.lost_pid_buffer[pid]
@@ -224,7 +223,7 @@ class CameraNode:
             else:
                 # Low Quality logic
                 if pid:
-                    label, color = f"P{pid} (LowQ)", (100, 255, 100)
+                    label, color = f"P{pid} (LQ)", (100, 255, 100)
                 else:
                     now = time.time()
                     spatial_pid, _ = self.spatial_matcher.find_spatial_match(
@@ -235,17 +234,16 @@ class CameraNode:
                         pid = spatial_pid
                         self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
                         used_pids.add(pid)
-                        label = f"P{pid} (LQ-ReAcq)"
+                        label = f"P{pid} (LQ)", (100, 255, 128)
                         color = (100, 255, 128)
                         if pid in self.buffer_manager.lost_pid_buffer:
                             del self.buffer_manager.lost_pid_buffer[pid]
                     else:
-                        label, color = f"T{track_id} (LowQ)", (0, 100, 155)
+                        label, color = f"T{track_id} (LQ)", (0, 100, 155)
 
             # Common Updates
             if pid:
                 self.buffer_manager.last_known_box_for_pid[pid] = box
-                # Sync with global DB cache
                 if pid not in self.resources['person_manager'].known_persons_db:
                     p_doc = self.resources['mongo_handler'].get_person_by_id(pid)
                     if p_doc: self.resources['person_manager'].known_persons_db[pid] = p_doc
@@ -316,15 +314,6 @@ class MultiCameraSystem:
 
         # Shared ReID
         print("Loading Re-ID Model...")
-        # We need a dummy tracker to init ReidExtractor, or refactor ReidExtractor.
-        # ReidExtractor currently requires a 'tracker' arg for 'extract' method if it calls self.tracker.model
-        # Actually looking at reid_extractor.py (implied), it likely holds the model.
-        # Let's create a temporary tracker just to pass the model, or instantiate ReID standalone.
-        # For safety/compat, I'll pass a dummy BoostTrack or modify the extractor.
-        # Assuming ReidExtractor uses the tracker object only to access .model or similar, 
-        # I'll create a standalone extractor or just pass the first camera's tracker later.
-        # WAIT: The `ReidExtractor` usually takes `device` and `tracker` (which holds the model).
-        # I will initialize a "Master Tracker" just for the model weights to be shared or load it once.
         self.master_tracker = BoostTrack(
             reid_weights=Path(Config.REID_MODEL_PATH),
             device=device_str,
@@ -389,18 +378,15 @@ class MultiCameraSystem:
                     ret, frame = node.cap.read()
                     if ret:
                         frames[node.camera_id] = frame
-                        # Send to detector
                         try:
                             self.frame_queue.put_nowait((node.camera_id, frame.copy()))
                         except queue.Full:
-                            pass # Skip frame if detector is busy
+                            pass 
                     else:
-                        # Handle video end (loop or stop)
-                        print(f"Cam {node.camera_id} ended. Rewinding...")
+                        # Auto-rewind for testing
                         node.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
                 # 2. Collect Detections
-                # We expect roughly one result per frame sent, but async means we check what's available
                 detections_map = {}
                 while not self.detection_queue.empty():
                     try:
@@ -419,20 +405,23 @@ class MultiCameraSystem:
                         annotated_frame = node.process_frame(frame, dets)
                         display_frames.append(annotated_frame)
 
-                # 4. Display Combined
+                # 4. Display Combined (Resize to fixed height for consistent stack)
                 if display_frames:
-                    # Simple horizontal stack for now. For many cams, grid needed.
-                    # Resize to same height for stacking
-                    h_min = min(f.shape[0] for f in display_frames)
-                    resized = [cv2.resize(f, (int(f.shape[1] * h_min / f.shape[0]), h_min)) for f in display_frames]
-                    combined = np.hstack(resized)
+                    target_h = 480
+                    resized_frames = []
+                    for f in display_frames:
+                        h, w = f.shape[:2]
+                        scale = target_h / h
+                        new_w = int(w * scale)
+                        resized_frames.append(cv2.resize(f, (new_w, target_h)))
+                    
+                    combined = np.hstack(resized_frames)
                     cv2.imshow("Multi-Camera Tracking", combined)
 
                 key = self.handle_input()
                 if key == 'q':
                     break
                     
-                # Update shared vars if changed by input
                 self.global_resources['match_threshold'] = self.match_threshold
                 self.global_resources['use_tta'] = self.use_tta
 
