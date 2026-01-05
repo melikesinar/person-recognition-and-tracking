@@ -26,7 +26,11 @@ class Config:
 
     # --- Detection & Matching Thresholds ---
     DETECTION_SCORE_THRESHOLD = 0.60
-    MATCH_SIMILARITY_THRESHOLD = 0.73
+    MATCH_SIMILARITY_THRESHOLD = 0.78
+    
+    # Threshold required to UPDATE the database vector. 
+    # Must be higher than match threshold to prevent "Model Drift/Pollution".
+    VECTOR_UPDATE_THRESHOLD = 0.82 
 
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 40
@@ -48,8 +52,12 @@ class Config:
     # --- Identity Verification / Self-Correction ---
     ID_VERIFICATION_INTERVAL = 15  # Check every 15 frames
     ID_SWITCH_THRESHOLD_MARGIN = 0.10  # New match must be 10% better than current to switch
-    ID_SWITCH_CONFIRMATION_THRESHOLD = 3  # Number of consistent matches required to switch ID
+    ID_SWITCH_CONFIRMATION_THRESHOLD = 10  # Number of consistent matches required to switch ID
     ID_SWITCH_COUNTER_TTL_SECONDS = 5.0  # Reset counter if no confirmation within this duration
+    ID_SWITCH_COOLDOWN = 30.0 # Seconds to lock ID after a switch
+
+    # Threshold for merging during enrollment (High = Strict, only merge if very sure)
+    ENROLLMENT_MERGE_THRESHOLD = 0.85
 
     # ImageNet normalization (for pretrained models)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -78,7 +86,7 @@ class Config:
     EMA_ALPHA = 0.1
 
     # --- Async DB Writer ---
-    ASYNC_DB_WRITER_QUEUE_SIZE = 500
+    ASYNC_DB_WRITER_QUEUE_SIZE = 100
 
     # --- Quality Checker Settings ---
     Q_WEIGHTS = {
