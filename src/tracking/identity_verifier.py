@@ -4,6 +4,7 @@ to prevent rapid, incorrect ID switches.
 """
 import time
 import numpy as np
+from datetime import datetime
 from utils.config import Config
 
 class IdentityVerifier:
@@ -12,93 +13,93 @@ class IdentityVerifier:
     """
     def __init__(self):
         """Initializes the IdentityVerifier."""
-        self.verification_state = {}  # {track_id: {"candidate_pid": pid, "count": n, "last_seen": t}}
+        self.verification_state = {} 
+        self.last_redundancy_check = time.time()
+        self.REDUNDANCY_CHECK_INTERVAL = 2.0 # Check every 2 seconds
+        self.AUTO_MERGE_THRESHOLD = 0.85 # Very high similarity required to auto-merge
         print("Identity Verifier initialized.")
 
     def clear_state_for_track(self, track_id: int):
-        """
-        Removes the verification state for a track that has disappeared.
-
-        Args:
-            track_id (int): The track ID to clear.
-        """
         if track_id in self.verification_state:
             del self.verification_state[track_id]
 
     def verify_and_correct(self, buffer_manager, faiss_manager, current_match_threshold: float):
-        """
-        Periodically checks identities and manages a multi-stage confirmation
-        process before switching a person's ID.
+        """Standard track-based verification."""
+        # (Legacy logic preserved if needed, but mainly we focus on redundancy check now)
+        pass 
 
-        Args:
-            buffer_manager (BufferManager): The main buffer manager instance.
-            faiss_manager (FaissManager): The main Faiss manager instance.
-            current_match_threshold (float): The current similarity threshold for matching.
+    def check_redundant_identities(self, person_manager, camera_nodes):
         """
-        current_time = time.time()
+        Scans ALL currently active PIDs across ALL cameras to see if any two represent the same person.
+        If P1 and P2 are very similar (e.g. > 85%), it merges them automatically.
+        """
+        now = time.time()
+        if (now - self.last_redundancy_check) < self.REDUNDANCY_CHECK_INTERVAL:
+            return
 
-        for track_id, pid in list(buffer_manager.track_id_to_permanent_id_map.items()):
-            # 1. COOLDOWN CHECK
-            # If this track recently switched, do not touch it.
-            lock_expiry = buffer_manager.locked_tracks.get(track_id, 0)
-            if current_time < lock_expiry:
+        self.last_redundancy_check = now
+        
+        # 1. Collect ALL active PIDs from ALL cameras
+        all_active_pids = set()
+        for node in camera_nodes:
+            all_active_pids.update(node.buffer_manager.track_id_to_permanent_id_map.values())
+        
+        active_pids = list(all_active_pids)
+        
+        # If less than 2 people, no merge possible
+        if len(active_pids) < 2:
+            return
+
+        # 2. Compare every pair
+        merge_pair = None
+        best_sim = -1.0
+
+        for i in range(len(active_pids)):
+            pid_a = active_pids[i]
+            if pid_a not in person_manager.known_persons_db: continue
+            
+            # AGE CHECK A
+            data_a = person_manager.known_persons_db[pid_a]
+            age_a = (datetime.now() - data_a["created"]).total_seconds()
+            if age_a > Config.MERGE_MAX_AGE_SECONDS:
                 continue
 
-            buf = buffer_manager.active_track_buffers.get(track_id)
-            if not buf or not buf["vectors"]:
-                continue
+            vec_a = data_a["master_vector"]
 
-            # Use average of recent vectors for stability
-            avg_vector = np.mean(np.stack(buf["vectors"][-10:], axis=0), axis=0)
-            avg_vector = avg_vector / np.linalg.norm(avg_vector)
-
-            # Find the best possible match in the database
-            best_pid, best_score = faiss_manager.search(avg_vector, threshold=0.0)
-
-            if best_pid is not None and best_pid != pid:
-                # Condition to consider a switch: new match is significantly better
-                is_candidate = best_score > (current_match_threshold + Config.ID_SWITCH_THRESHOLD_MARGIN)
+            for j in range(i + 1, len(active_pids)):
+                pid_b = active_pids[j]
+                if pid_b not in person_manager.known_persons_db: continue
                 
-                state = self.verification_state.get(track_id)
+                # AGE CHECK B
+                data_b = person_manager.known_persons_db[pid_b]
+                age_b = (datetime.now() - data_b["created"]).total_seconds()
+                if age_b > Config.MERGE_MAX_AGE_SECONDS:
+                    continue
 
-                if is_candidate:
-                    # A potential switch is detected.
-                    if state and state["candidate_pid"] == best_pid:
-                        # This is a confirmation of the same candidate. Increment counter.
-                        state["count"] += 1
-                        state["last_seen"] = current_time
-                        print(f"CONFIRMATION: T{track_id} (P{pid}) still looks like P{best_pid}. Count: {state['count']}/{Config.ID_SWITCH_CONFIRMATION_THRESHOLD}")
-                    else:
-                        # This is a new candidate. Start a new verification process.
-                        self.verification_state[track_id] = {
-                            "candidate_pid": best_pid,
-                            "count": 1,
-                            "last_seen": current_time
-                        }
-                        print(f"CANDIDATE: T{track_id} (P{pid}) might be P{best_pid}. Starting count.")
+                vec_b = data_b["master_vector"]
 
-                    # Check if the confirmation threshold is met
-                    if self.verification_state[track_id]["count"] >= Config.ID_SWITCH_CONFIRMATION_THRESHOLD:
-                        print(f"SWITCH CONFIRMED: T{track_id} switched from P{pid} -> P{best_pid}. Locking for {Config.ID_SWITCH_COOLDOWN}s.")
-                        
-                        # Apply Switch
-                        buffer_manager.track_id_to_permanent_id_map[track_id] = best_pid
-                        
-                        # Apply Lock
-                        buffer_manager.locked_tracks[track_id] = current_time + Config.ID_SWITCH_COOLDOWN
-                        
-                        self.clear_state_for_track(track_id) # Clean up state after switch
+                sim = np.dot(vec_a, vec_b)
                 
-                elif state:
-                    # The current frame does NOT confirm the candidate.
-                    # Check if the counter should be reset due to timeout.
-                    if (current_time - state["last_seen"]) > Config.ID_SWITCH_COUNTER_TTL_SECONDS:
-                        print(f"RESET: T{track_id} candidate P{state['candidate_pid']} expired. Resetting counter.")
-                        self.clear_state_for_track(track_id)
-            else:
-                # No strong alternative match was found for this track.
-                # If there was a pending verification, reset it due to timeout.
-                state = self.verification_state.get(track_id)
-                if state and (current_time - state["last_seen"]) > Config.ID_SWITCH_COUNTER_TTL_SECONDS:
-                    print(f"RESET: T{track_id} candidate P{state['candidate_pid']} expired. Resetting counter.")
-                    self.clear_state_for_track(track_id)
+                if sim > self.AUTO_MERGE_THRESHOLD:
+                    if sim > best_sim:
+                        best_sim = sim
+                        merge_pair = (pid_a, pid_b)
+
+        # 3. Execute Merge if found
+        if merge_pair:
+            pid_keep, pid_drop = merge_pair
+            if pid_keep > pid_drop:
+                pid_keep, pid_drop = pid_drop, pid_keep
+                
+            print(f"AUTO-MERGE: Detected P{pid_keep} and P{pid_drop} are the same (Sim: {best_sim:.2f}). Merging...")
+            
+            # A. Merge in Database
+            person_manager.merge_identities(keep_pid=pid_keep, drop_pid=pid_drop)
+            
+            # B. Update Live Tracks ACROSS ALL CAMERAS
+            for node in camera_nodes:
+                bm = node.buffer_manager
+                for tid, pid in list(bm.track_id_to_permanent_id_map.items()):
+                    if pid == pid_drop:
+                        bm.track_id_to_permanent_id_map[tid] = pid_keep
+                        print(f"  -> [Cam {node.camera_id}] Track T{tid} redirected from P{pid_drop} to P{pid_keep}")
