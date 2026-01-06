@@ -12,6 +12,7 @@ from boxmot import BoostTrack
 # Import modular components
 from utils.config import Config
 from utils.visualizer import Visualizer
+from utils.math_utils import check_occlusions
 from core.detector import DetectorWorker
 from core.reid_extractor import ReidExtractor
 from core.quality_checker import QualityChecker
@@ -70,22 +71,25 @@ class CameraNode:
         # 1. Update Tracker & Extract Crops
         tracker_results_list, vector_map = self._process_tracking_and_reid(detections, frame)
         
-        # 2. Process Identifies (Match/Enroll)
-        current_frame_track_ids = self._process_results(frame, tracker_results_list, vector_map)
+        # 2. OCCLUSION CHECK
+        occlusion_map = check_occlusions(tracker_results_list)
         
-        # 3. Verify & Cleanup
+        # 3. Process Identifies (Match/Enroll)
+        current_frame_track_ids = self._process_results(frame, tracker_results_list, vector_map, occlusion_map)
+        
+        # 4. Verify & Cleanup
         if self.frame_count % Config.ID_VERIFICATION_INTERVAL == 0:
             self._verify_and_correct_identities()
             
         self._perform_cleanup(current_frame_track_ids)
         
-        # 4. FPS Limiter
+        # 5. FPS Limiter
         process_time = time.time() - start_time
         wait_time = self.frame_duration - process_time
         if wait_time > 0:
             time.sleep(wait_time)
         
-        # 5. Visualization (FPS Calc)
+        # 6. Visualization (FPS Calc)
         curr_time = time.time()
         time_diff = curr_time - self.prev_time
         if time_diff > 0.0001:
@@ -134,7 +138,7 @@ class CameraNode:
         
         return tracker_results_list, vector_map
 
-    def _process_results(self, frame, tracker_results_list, vector_map):
+    def _process_results(self, frame, tracker_results_list, vector_map, occlusion_map):
         """
         Processes tracker results with UNIQUENESS CONSTRAINT.
         A PID can only appear once per frame.
@@ -157,6 +161,7 @@ class CameraNode:
         for (box, track_id, conf, cls, ind, crop) in tracker_results_list:
             current_frame_track_ids.add(track_id)
             current_vector = vector_map.get(track_id)
+            is_occluded = occlusion_map.get(track_id, False)
             
             x1, y1, x2, y2 = map(int, box)
             label = f"T{track_id}"
@@ -167,8 +172,11 @@ class CameraNode:
                 if pid:
                     label, color = f"P{pid}", (0, 255, 0)
                     last_update = self.buffer_manager.last_update_time_for_pid.get(pid, 0)
+                    # Use is_occluded to BLOCK update
                     if (time.time() - last_update) > Config.UPDATE_INTERVAL:
-                        self.resources['person_manager'].incremental_update(pid, current_vector)
+                        self.resources['person_manager'].incremental_update(
+                            pid, current_vector, is_occluded=is_occluded
+                        )
                         self.buffer_manager.last_update_time_for_pid[pid] = time.time()
                 else:
                     # New Track -> Try Spatial -> Try ReID -> Enroll
@@ -191,6 +199,8 @@ class CameraNode:
                             del self.buffer_manager.lost_pid_buffer[pid]
                     else:
                         # ReID Match (GLOBAL SEARCH)
+                        # CRITICAL: If occluded, do not trust ReID blindly? 
+                        # For now, we trust match but won't enroll if occluded.
                         match_id, match_sim = self.resources['faiss_manager'].search(
                             current_vector, self.resources['match_threshold']
                         )
@@ -206,52 +216,66 @@ class CameraNode:
                             label, color = f"P{pid} (S:{match_sim:.2f})", (0, 255, 0)
                         else:
                             # Enrollment (GLOBAL ENROLLMENT)
-                            is_good, _, q_score = self.resources['quality_checker'].assess_quality(crop, box, frame.shape)
-                            buf = self.buffer_manager.active_track_buffers[track_id]
-                            
-                            buf["vectors"].append(current_vector)
-                            buf.setdefault("quality_scores", []).append(q_score)
-                            
-                            label = f"New? T{track_id} ({len(buf['vectors'])})"
-                            buf["last_seen"] = time.time()
-                            
-                            if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
-                                avg_q = np.mean(buf.get("quality_scores", [0.5]))
-                                if avg_q >= 0.65:
-                                    # 1. Create a candidate vector
-                                    candidate_vector = np.mean(np.stack(buf["vectors"], axis=0), axis=0)
-                                    candidate_vector = candidate_vector / np.linalg.norm(candidate_vector)
+                            # Do not enroll if occluded!
+                            if not is_occluded:
+                                is_good, _, q_score = self.resources['quality_checker'].assess_quality(crop, box, frame.shape)
+                                buf = self.buffer_manager.active_track_buffers[track_id]
+                                
+                                buf["vectors"].append(current_vector)
+                                buf.setdefault("quality_scores", []).append(q_score)
+                                
+                                # Rolling Buffer: Keep only the most recent N frames
+                                if len(buf["vectors"]) > Config.MIN_ENROLL_FRAMES:
+                                    buf["vectors"].pop(0)
+                                    buf["quality_scores"].pop(0)
+                                
+                                label = f"New? T{track_id} ({len(buf['vectors'])})"
+                                buf["last_seen"] = time.time()
+                                
+                                if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
+                                    avg_q = np.mean(buf.get("quality_scores", [0.5]))
+                                    if avg_q >= 0.65:
+                                        avg_vector = np.mean(buf["vectors"], axis=0)
+                                        avg_vector = avg_vector / np.linalg.norm(avg_vector)
 
-                                    # 2. Final "Self-Check"
-                                    found_pid, found_score = self.resources['faiss_manager'].search(
-                                        candidate_vector, 
-                                        threshold=Config.ENROLLMENT_MERGE_THRESHOLD
-                                    )
-
-                                    final_pid = None
-                                    if found_pid is not None:
-                                        # Check uniqueness before merging? 
-                                        # Merging into an existing ID is fine even if it's on screen (it updates the model)
-                                        # But assigning it to THIS track if P1 is already on screen is tricky.
-                                        # If P1 is on screen, we can't be P1.
-                                        if found_pid in used_pids:
-                                            # We are a duplicate of someone on screen.
-                                            # Do not enroll, do not merge. Wait.
-                                            pass
+                                        # SEARCH GLOBAL
+                                        found_pid, sim = self.resources['faiss_manager'].search(avg_vector, threshold=self.resources['match_threshold'])
+                                        
+                                        final_pid = None
+                                        
+                                        if found_pid:
+                                            # Strict check: Do not merge if person is ALREADY active elsewhere
+                                            # logic: is_person_active checks if any track currently holds this PID
+                                            # We need to ensure we don't count OURSELVES (track_id) as active (though we aren't mapped yet)
+                                            
+                                            is_already_active = False
+                                            for active_tid, active_pid in self.buffer_manager.track_id_to_permanent_id_map.items():
+                                                if active_pid == found_pid and active_tid != track_id:
+                                                    is_already_active = True
+                                                    break
+                                            
+                                            if is_already_active:
+                                                print(f"Enroll Conflict: T{track_id} matched P{found_pid} but P{found_pid} is already active. Waiting.")
+                                                final_pid = None
+                                            else:
+                                                print(f"Enroll Check: T{track_id} -> P{found_pid}. Merging.")
+                                                final_pid = found_pid
+                                                self.resources['person_manager'].incremental_update(final_pid, avg_vector)
                                         else:
-                                            print(f"Enroll Check: T{track_id} -> P{found_pid}. Merging.")
-                                            final_pid = found_pid
-                                            self.resources['person_manager'].incremental_update(final_pid, candidate_vector)
-                                    else:
-                                        final_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
+                                            # New Person
+                                            final_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
 
-                                    if final_pid:
-                                        self.buffer_manager.track_id_to_permanent_id_map[track_id] = final_pid
-                                        used_pids.add(final_pid)
-                                        if track_id in self.buffer_manager.active_track_buffers:
-                                            del self.buffer_manager.active_track_buffers[track_id]
-                                else:
-                                    buf["vectors"].clear(); buf["quality_scores"].clear()
+                                        if final_pid:
+                                            self.buffer_manager.track_id_to_permanent_id_map[track_id] = final_pid
+                                            used_pids.add(final_pid)
+                                            # Clear buffer after successful enrollment
+                                            if track_id in self.buffer_manager.active_track_buffers:
+                                                del self.buffer_manager.active_track_buffers[track_id]
+                                    else:
+                                        # Quality not good enough yet, wait for better frames (rolling buffer handles cleanup)
+                                        pass
+                            else:
+                                label = f"T{track_id} (Occ)"
             else:
                 # Low Quality logic
                 if pid:
@@ -284,6 +308,11 @@ class CameraNode:
                     if p_doc: self.resources['person_manager'].known_persons_db[pid] = p_doc
                 if pid in self.resources['person_manager'].known_persons_db:
                     self.resources['person_manager'].known_persons_db[pid]['last_seen_timestamp'] = time.time()
+            
+            # Add (!) marker if occluded
+            if is_occluded:
+                label += " (!)"
+                color = (0, 0, 255) # Warning RED
 
             self.visualizer.draw_person_bbox(frame, (x1, y1, x2, y2), label, color)
         return current_frame_track_ids
@@ -292,7 +321,8 @@ class CameraNode:
         self.identity_verifier.verify_and_correct(
             self.buffer_manager,
             self.resources['faiss_manager'],
-            self.resources['match_threshold']
+            self.resources['match_threshold'],
+            self.resources['person_manager']
         )
 
     def _perform_cleanup(self, current_frame_track_ids):
