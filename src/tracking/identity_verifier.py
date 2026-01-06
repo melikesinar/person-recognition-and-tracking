@@ -31,7 +31,7 @@ class IdentityVerifier:
     def check_redundant_identities(self, person_manager, camera_nodes):
         """
         Scans ALL currently active PIDs across ALL cameras to see if any two represent the same person.
-        If P1 and P2 are very similar (e.g. > 85%), it merges them automatically.
+        Uses Multi-Vector comparison: If ANY vector of P1 matches ANY vector of P2 > Threshold, merge.
         """
         now = time.time()
         if (now - self.last_redundancy_check) < self.REDUNDANCY_CHECK_INTERVAL:
@@ -64,7 +64,9 @@ class IdentityVerifier:
             if age_a > Config.MERGE_MAX_AGE_SECONDS:
                 continue
 
-            vec_a = data_a["master_vector"]
+            # Multi-Vector Retrieval
+            vectors_a = data_a.get("vectors")
+            if not vectors_a: continue
 
             for j in range(i + 1, len(active_pids)):
                 pid_b = active_pids[j]
@@ -76,13 +78,22 @@ class IdentityVerifier:
                 if age_b > Config.MERGE_MAX_AGE_SECONDS:
                     continue
 
-                vec_b = data_b["master_vector"]
+                vectors_b = data_b.get("vectors")
+                if not vectors_b: continue
 
-                sim = np.dot(vec_a, vec_b)
+                # --- Multi-Vector Similarity Check ---
+                # Find max similarity between any vector in A and any vector in B
+                # Optimization: We can break early if we exceed threshold, but finding max is safer for stats.
+                pair_max_sim = -1.0
+                for va in vectors_a:
+                    for vb in vectors_b:
+                        s = np.dot(va, vb)
+                        if s > pair_max_sim:
+                            pair_max_sim = s
                 
-                if sim > self.AUTO_MERGE_THRESHOLD:
-                    if sim > best_sim:
-                        best_sim = sim
+                if pair_max_sim > self.AUTO_MERGE_THRESHOLD:
+                    if pair_max_sim > best_sim:
+                        best_sim = pair_max_sim
                         merge_pair = (pid_a, pid_b)
 
         # 3. Execute Merge if found
