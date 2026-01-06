@@ -25,18 +25,24 @@ class Config:
     FAISS_INDEX_KEY = "primary_person_index"
 
     # --- Detection & Matching Thresholds ---
-    DETECTION_SCORE_THRESHOLD = 0.65
-    MATCH_SIMILARITY_THRESHOLD = 0.85
+    DETECTION_SCORE_THRESHOLD = 0.55
+    MATCH_SIMILARITY_THRESHOLD = 0.80
     
     # Threshold required to UPDATE the database vector. 
     # Must be higher than match threshold to prevent "Model Drift/Pollution".
+    # DEPRECATED in Multi-Vector mode, but keeping for legacy ref if needed.
     VECTOR_UPDATE_THRESHOLD = 0.90
 
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 40
     MIN_BBOX_AREA_ENROLL = 5000
     MIN_SHARPNESS_ENROLL = 35
-    MAX_VECTORS_FOR_UPDATE = 500
+    
+    # --- Multi-Vector Gallery Settings ---
+    GALLERY_SIZE = 10  # Max number of diverse vectors per person (Front, Back, Side, etc.)
+    # Only add to gallery if similarity to existing vectors is LESS than this.
+    # If a new vector is > 0.92 similar to an existing one, we assume we already have that "pose".
+    GALLERY_UPDATE_THRESHOLD = 0.92 
 
     # --- Buffer & Timing Settings ---
     RECENT_VECTOR_BUFFER_SIZE = 200
@@ -51,7 +57,7 @@ class Config:
 
     # --- Identity Verification / Self-Correction ---
     ID_VERIFICATION_INTERVAL = 10  # Check every 15 frames
-    ID_SWITCH_THRESHOLD_MARGIN = 0.01  # Lowered: Easier to switch ID
+    ID_SWITCH_THRESHOLD_MARGIN = 0.05  # Lowered: Easier to switch ID
     ID_SWITCH_CONFIRMATION_THRESHOLD = 3  # Number of consistent matches required to switch ID
     ID_SWITCH_COUNTER_TTL_SECONDS = 5.0  # Reset counter if no confirmation within this duration
     ID_SWITCH_COOLDOWN = 10.0 # Seconds to lock ID after a switch
@@ -60,7 +66,7 @@ class Config:
     ENROLLMENT_MERGE_THRESHOLD = 0.85
     
     # Maximum age (in seconds) of an ID to be considered for Auto-Merge.
-    MERGE_MAX_AGE_SECONDS = 5.0
+    MERGE_MAX_AGE_SECONDS = 10.0
 
     # ImageNet normalization (for pretrained models)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -124,9 +130,10 @@ class Config:
     # --- Video Source ---
     # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
     VIDEO_SOURCES = [
-        str(BASE_DIR / "videos" / "3.mp4")
-        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
-        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi")
+        # 0,
+        # str(BASE_DIR / "videos" / "3.mp4")
+        str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
+        str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi")
     ]
     # VIDEO_SOURCES = [0, 1]  # Uncomment for multi-webcam
 
