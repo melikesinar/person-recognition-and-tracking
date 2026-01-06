@@ -85,17 +85,28 @@ class PersonManager:
 
         return new_pid
 
-    def incremental_update(self, perm_id: int, new_vector: np.ndarray):
+    def incremental_update(self, perm_id: int, new_vector: np.ndarray, is_occluded: bool = False):
         """
         Updates the person's gallery with a new vector if it represents a new angle/pose.
         Uses 'Merge Most Similar' strategy when gallery is full.
-
+        
         Args:
             perm_id (int): Permanent ID
             new_vector (np.ndarray): New feature vector
+            is_occluded (bool): If True, skips vector update to prevent pollution.
         """
         entry = self.known_persons_db.get(perm_id)
         if entry is None:
+            return
+        
+        # 0. OCCLUSION CHECK (Pollution Guard)
+        if is_occluded:
+            # If the person is occluded (overlapped by another), we TRUST the tracking
+            # but we DO NOT TRUST the visual features for learning.
+            # Just keep the ID alive.
+            # print(f"UPDATE SKIPPED: P{perm_id} is occluded. No gallery update.")
+            mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
+            self.async_writer.queue_update(perm_id, mongo_update_doc)
             return
         
         gallery = entry["vectors"] # List of np.ndarray
