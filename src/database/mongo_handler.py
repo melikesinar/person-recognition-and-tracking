@@ -51,6 +51,7 @@ class MongoHandler:
     def get_person_by_id(self, pid: int) -> dict | None:
         """
         Fetches a single person's document from MongoDB by permanent_id.
+        Supports Multi-Vector Gallery format.
 
         Args:
             pid (int): The permanent ID of the person.
@@ -60,9 +61,14 @@ class MongoHandler:
         """
         try:
             doc = self.persons_collection.find_one({"permanent_id": pid})
-            if doc:
-                # Convert BSON binary back to numpy array
-                doc["master_vector"] = np.frombuffer(doc['master_vector'], dtype=np.float32)
+            if doc and "vectors" in doc:
+                # Convert BSON binary list back to numpy array list
+                doc["vectors"] = [np.frombuffer(v, dtype=np.float32) for v in doc["vectors"]]
+            elif doc and "master_vector" in doc:
+                # Legacy Fallback: Convert old single master vector to a list of 1
+                master = np.frombuffer(doc['master_vector'], dtype=np.float32)
+                doc["vectors"] = [master]
+                
             return doc
         except Exception as e:
             print(f"!!!! Error fetching person P{pid} from MongoDB !!!!: {e}")
@@ -70,16 +76,16 @@ class MongoHandler:
 
     def load_vectors_for_faiss(self) -> tuple[list, list, int]:
         """
-        Loads only the necessary data (ID and vector) from MongoDB
-        to build the Faiss index, without loading the entire database into memory.
+        Loads ALL vectors from the gallery of EVERY person to build a dense Faiss index.
+        Flattens the structure: 1 Person with 5 vectors -> 5 Faiss entries pointing to same PID.
 
         Returns:
             tuple: (list_of_pids, list_of_vectors, next_pid)
         """
-        print("Loading vectors from MongoDB for Faiss index...")
+        print("Loading vectors from MongoDB for Faiss index (Multi-Vector)...")
         try:
-            # Projection: only retrieve the fields we absolutely need
-            cursor = self.persons_collection.find({}, {"permanent_id": 1, "master_vector": 1, "_id": 0})
+            # Projection: Retrieve ID and the list of vectors
+            cursor = self.persons_collection.find({}, {"permanent_id": 1, "vectors": 1, "master_vector": 1, "_id": 0})
 
             pids = []
             vectors = []
@@ -87,13 +93,22 @@ class MongoHandler:
 
             for doc in cursor:
                 pid = doc['permanent_id']
-                pids.append(pid)
-                vectors.append(np.frombuffer(doc['master_vector'], dtype=np.float32))
                 if pid > max_id:
                     max_id = pid
+                
+                # Handle Multi-Vector Gallery
+                if "vectors" in doc and doc["vectors"]:
+                    for v_blob in doc["vectors"]:
+                        pids.append(pid)
+                        vectors.append(np.frombuffer(v_blob, dtype=np.float32))
+                
+                # Handle Legacy (Single Master Vector)
+                elif "master_vector" in doc:
+                    pids.append(pid)
+                    vectors.append(np.frombuffer(doc['master_vector'], dtype=np.float32))
 
             next_pid = max_id + 1
-            print(f"Successfully loaded {len(pids)} vectors. Next available PID will be {next_pid}")
+            print(f"Successfully loaded {len(vectors)} vectors (from {len(set(pids))} identities). Next PID: {next_pid}")
             return pids, vectors, next_pid
 
         except Exception as e:
