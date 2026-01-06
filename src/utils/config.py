@@ -28,25 +28,18 @@ class Config:
     DETECTION_SCORE_THRESHOLD = 0.55
     MATCH_SIMILARITY_THRESHOLD = 0.80
     
-    # Threshold required to UPDATE the database vector. 
-    # Must be higher than match threshold to prevent "Model Drift/Pollution".
-    # DEPRECATED in Multi-Vector mode, but keeping for legacy ref if needed.
-    VECTOR_UPDATE_THRESHOLD = 0.90
-
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 40
     MIN_BBOX_AREA_ENROLL = 5000
     MIN_SHARPNESS_ENROLL = 35
     
     # --- Multi-Vector Gallery Settings ---
-    GALLERY_SIZE = 10  # Max number of diverse vectors per person (Front, Back, Side, etc.)
+    GALLERY_SIZE = 15  # Max number of diverse vectors per person (Front, Back, Side, etc.)
     # Only add to gallery if similarity to existing vectors is LESS than this.
     # If a new vector is > 0.92 similar to an existing one, we assume we already have that "pose".
     GALLERY_UPDATE_THRESHOLD = 0.92 
 
     # --- Buffer & Timing Settings ---
-    RECENT_VECTOR_BUFFER_SIZE = 200
-    DETECTION_INTERVAL = 1 # Process EVERY frame for stable tracking
     UPDATE_INTERVAL = 1.0
     BUFFER_CLEANUP_INTERVAL = 60.0
     BUFFER_MAX_IDLE_TIME = 3600.0
@@ -56,11 +49,12 @@ class Config:
     VECTOR_DIMENSION = 512
 
     # --- Identity Verification / Self-Correction ---
-    ID_VERIFICATION_INTERVAL = 10  # Check every 15 frames
-    ID_SWITCH_THRESHOLD_MARGIN = 0.05  # Lowered: Easier to switch ID
-    ID_SWITCH_CONFIRMATION_THRESHOLD = 3  # Number of consistent matches required to switch ID
+    ID_VERIFICATION_INTERVAL = 10  # Check every 10 frames
+    ID_SWITCH_THRESHOLD_MARGIN = 0.02  # Lowered: Easier to switch ID
+    ID_SWITCH_CONFIRMATION_THRESHOLD = 5  # Number of consistent matches required to switch ID
     ID_SWITCH_COUNTER_TTL_SECONDS = 5.0  # Reset counter if no confirmation within this duration
     ID_SWITCH_COOLDOWN = 10.0 # Seconds to lock ID after a switch
+    ID_DROP_THRESHOLD = 0.55 # Revocation logic
 
     # Threshold for merging during enrollment (High = Strict, only merge if very sure)
     ENROLLMENT_MERGE_THRESHOLD = 0.85
@@ -90,9 +84,6 @@ class Config:
     FAISS_EF_SEARCH = 64
     MIN_REBUILD_INTERVAL = 30  # seconds
     BATCH_SIZE_TRIGGER = 5  # enrollments
-
-    # --- EMA Parameters ---
-    EMA_ALPHA = 0.1
 
     # --- Async DB Writer ---
     ASYNC_DB_WRITER_QUEUE_SIZE = 100
@@ -131,16 +122,15 @@ class Config:
     # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
     VIDEO_SOURCES = [
         # 0,
-        # str(BASE_DIR / "videos" / "3.mp4")
-        str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
-        str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi")
+        str(BASE_DIR / "videos" / "3.mp4")
+        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
+        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi")
     ]
     # VIDEO_SOURCES = [0, 1]  # Uncomment for multi-webcam
 
     # --- TTA Settings ---
     USE_TTA_DEFAULT = False
     TTA_HORIZONTAL_FLIP = True
-    TTA_MULTI_SCALE = False
 
 
     @staticmethod
