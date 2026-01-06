@@ -1,5 +1,5 @@
 """
-Person enrollment and vector update management.
+Person enrollment and vector update management (Multi-Vector Gallery).
 """
 import numpy as np
 from datetime import datetime
@@ -10,7 +10,8 @@ from utils.math_utils import l2_normalize
 
 class PersonManager:
     """
-    Manages person enrollment, master vector updates, and ID assignment.
+    Manages person enrollment, gallery vector updates, and ID assignment.
+    Implements a 'Multi-Vector Gallery' strategy to handle varying poses/angles.
     """
 
     def __init__(self, known_persons_db, async_writer, faiss_manager):
@@ -27,8 +28,7 @@ class PersonManager:
         self.faiss_manager = faiss_manager
 
         self.next_permanent_id = 1
-
-        print("Person manager initialized.")
+        print("Person manager initialized (Multi-Vector Gallery Mode).")
 
     def set_next_id(self, next_id: int):
         """Set the next available permanent ID."""
@@ -37,6 +37,7 @@ class PersonManager:
     def enroll_person(self, vectors: list) -> int:
         """
         Enrolls a new person with a unique Permanent ID.
+        Initializes the gallery with a representative vector from the batch.
 
         Args:
             vectors (list): List of feature vectors for the person
@@ -47,43 +48,47 @@ class PersonManager:
         if not vectors:
             raise ValueError("No vectors provided to enroll.")
 
-        # Calculate master vector (mean of all vectors)
-        master = l2_normalize(np.mean(np.stack(vectors, axis=0), axis=0))
+        # Initialize gallery with the mean of the enrollment batch (Strong Seed)
+        # Future improvement: Run K-Means here to start with 2-3 diverse vectors.
+        initial_vector = l2_normalize(np.mean(np.stack(vectors, axis=0), axis=0))
+        
         current_dt = datetime.now()
         new_pid = self.next_permanent_id
 
+        # Gallery is a list of binary blobs for DB, list of arrays for Cache
+        gallery_vectors = [initial_vector]
+
         # Create MongoDB document
+        # We store 'vectors' as a list of Binaries
         new_person_doc = {
             "permanent_id": new_pid,
-            "master_vector": Binary(master.tobytes()),
-            "count": len(vectors),
+            "vectors": [Binary(v.tobytes()) for v in gallery_vectors],
             "created": current_dt,
             "last_seen": current_dt
         }
 
         # Queue async insert
         self.async_writer.queue_insert(new_person_doc)
-        print(f"MongoDB INSERT: New person (P{new_pid}) queued for async write.")
+        print(f"MongoDB INSERT: New person (P{new_pid}) queued. Gallery size: 1")
 
         # Add to local cache
         self.known_persons_db[new_pid] = {
-            "master_vector": master,
-            "count": len(vectors),
+            "vectors": gallery_vectors,
             "created": current_dt
         }
 
         print(f"CACHE ADD: P{new_pid} added to cache.")
         self.next_permanent_id += 1
 
-        # Trigger index rebuild if needed
+        # Trigger index rebuild (Faiss will now index ALL vectors for this ID)
         self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True)
 
         return new_pid
 
     def incremental_update(self, perm_id: int, new_vector: np.ndarray):
         """
-        Updates master vector using EMA (Exponential Moving Average).
-        Includes strict checks to prevent 'Model Drift' (Pollution).
+        Updates the person's gallery with a new vector if it represents a new angle/pose.
+        Uses 'Merge Most Similar' strategy when gallery is full.
 
         Args:
             perm_id (int): Permanent ID
@@ -92,105 +97,131 @@ class PersonManager:
         entry = self.known_persons_db.get(perm_id)
         if entry is None:
             return
+        
+        gallery = entry["vectors"] # List of np.ndarray
+        
+        # 1. Check similarity against ALL existing vectors in gallery
+        # We want to know if this new vector is "redundant"
+        similarities = [np.dot(v, new_vector) for v in gallery]
+        max_sim = max(similarities)
 
-        # 1. DRIFT CHECK (Guard Rail)
-        # Calculate similarity between new vector and existing master vector
-        master = entry["master_vector"]
-        similarity = np.dot(master, new_vector)
+        mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
 
-        if similarity < Config.VECTOR_UPDATE_THRESHOLD:
-            # Although the tracker thinks this is P{perm_id}, the visual match is too weak.
-            # We TRUST the ID for tracking/display, but we DO NOT TRUST it for learning.
-            # This prevents pollution.
-            # print(f"GUARD: Ignored update for P{perm_id}. Sim {similarity:.2f} < {Config.VECTOR_UPDATE_THRESHOLD}")
-            
-            # Still update 'last_seen' so we don't delete them as stale
-            mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
+        if max_sim > Config.GALLERY_UPDATE_THRESHOLD:
+            # We already have a vector very similar to this one.
+            # No need to add it. Just update timestamp.
+            # print(f"UPDATE SKIP: P{perm_id} new vector is redundant (Max Sim: {max_sim:.3f})")
             self.async_writer.queue_update(perm_id, mongo_update_doc)
             return
 
-        # 2. Proceed with Update
-        n = entry.get("count", 1)
-        mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
+        # 2. It is a NEW/DIFFERENT pose (max_sim < Threshold). Add to gallery.
+        # print(f"UPDATE DETECTED: P{perm_id} found new angle (Sim: {max_sim:.3f}). Adding to gallery.")
+        
+        if len(gallery) < Config.GALLERY_SIZE:
+            # Case A: Gallery has space. Just append.
+            gallery.append(new_vector)
+        else:
+            # Case B: Gallery is FULL.
+            # Strategy: Find the pair of vectors in the gallery that are MOST similar to each other.
+            # Merge them to free up 1 slot, then add the new vector.
+            # This ensures we always keep the "most diverse" set of vectors.
+            
+            best_pair = (0, 1)
+            highest_pair_sim = -1.0
+            
+            # Simple O(N^2) search (N=10, so it's tiny)
+            for i in range(len(gallery)):
+                for j in range(i + 1, len(gallery)):
+                    sim = np.dot(gallery[i], gallery[j])
+                    if sim > highest_pair_sim:
+                        highest_pair_sim = sim
+                        best_pair = (i, j)
+            
+            # Merge indices i and j
+            idx1, idx2 = best_pair
+            # print(f"GALLERY FULL: Merging similar vectors {idx1} and {idx2} (Sim: {highest_pair_sim:.3f})")
+            
+            merged_vec = l2_normalize(gallery[idx1] + gallery[idx2])
+            
+            # Remove the two old ones, add the merged one
+            # Be careful with indices shifting when popping
+            gallery.pop(max(idx1, idx2))
+            gallery.pop(min(idx1, idx2))
+            gallery.append(merged_vec)
+            
+            # Now we have space (N-1), add the NEW vector
+            gallery.append(new_vector)
 
-        if n < Config.MAX_VECTORS_FOR_UPDATE:
-            # EMA update
-            updated_master = l2_normalize((1 - Config.EMA_ALPHA) * master + Config.EMA_ALPHA * new_vector)
-
-            new_count = n + 1
-            mongo_update_doc["$set"]["master_vector"] = Binary(updated_master.tobytes())
-            mongo_update_doc["$set"]["count"] = new_count
-
-            entry["master_vector"] = updated_master
-            entry["count"] = new_count
-
-            if new_count == Config.MAX_VECTORS_FOR_UPDATE:
-                print(f"INFO: Person P{perm_id} vector locked after {new_count} updates.")
-
-        # Queue async update
+        # 3. Persist Changes
+        # Convert entire gallery to Binary list for MongoDB
+        # (Inefficient for huge lists, but for N=10 it's fine and safe)
+        mongo_update_doc["$set"]["vectors"] = [Binary(v.tobytes()) for v in gallery]
+        
         self.async_writer.queue_update(perm_id, mongo_update_doc)
+        
+        # Force a rebuild eventually because the index is now outdated
+        # (We added a vector, so Faiss needs to know)
+        # Optimization: We could just add to Faiss, but managing deletions is hard.
+        # Rebuilding is safer for consistency.
+        self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True)
+
 
     def merge_identities(self, keep_pid: int, drop_pid: int):
         """
-        Merges two identities into one. 'drop_pid' is removed, its data influences 'keep_pid'.
+        Merges two identities. Combines their galleries.
         """
         if keep_pid not in self.known_persons_db or drop_pid not in self.known_persons_db:
-            print(f"MERGE ERROR: P{keep_pid} or P{drop_pid} not found in cache.")
             return
 
         print(f"!!! MERGING IDENTITIES: P{drop_pid} -> INTO -> P{keep_pid} !!!")
         
-        # 1. Get Data
         keep_data = self.known_persons_db[keep_pid]
         drop_data = self.known_persons_db[drop_pid]
         
-        # 2. Update Master Vector (Weighted Average or Simple Average)
-        v1 = keep_data["master_vector"]
-        v2 = drop_data["master_vector"]
+        # Combine lists
+        combined_gallery = keep_data["vectors"] + drop_data["vectors"]
         
-        # New master = (v1 + v2) / 2 normalized
-        new_master = l2_normalize(v1 + v2)
+        # Prune logic: If combined > GALLERY_SIZE, apply the "Merge Most Similar" logic repeatedly
+        # until size is back to limit.
+        while len(combined_gallery) > Config.GALLERY_SIZE:
+            # Find most similar pair
+            best_pair = (0, 1)
+            highest_pair_sim = -1.0
+            for i in range(len(combined_gallery)):
+                for j in range(i + 1, len(combined_gallery)):
+                    sim = np.dot(combined_gallery[i], combined_gallery[j])
+                    if sim > highest_pair_sim:
+                        highest_pair_sim = sim
+                        best_pair = (i, j)
+            
+            idx1, idx2 = best_pair
+            merged_vec = l2_normalize(combined_gallery[idx1] + combined_gallery[idx2])
+            combined_gallery.pop(max(idx1, idx2))
+            combined_gallery.pop(min(idx1, idx2))
+            combined_gallery.append(merged_vec)
         
-        # 3. Update 'keep_pid' in DB and Cache
-        new_count = keep_data["count"] + drop_data["count"]
+        # Update keep_pid
+        keep_data["vectors"] = combined_gallery
         
         mongo_update_doc = {
             "$set": {
-                "master_vector": Binary(new_master.tobytes()),
-                "count": new_count,
+                "vectors": [Binary(v.tobytes()) for v in combined_gallery],
                 "last_seen": datetime.now()
             }
         }
-        
         self.async_writer.queue_update(keep_pid, mongo_update_doc)
         
-        keep_data["master_vector"] = new_master
-        keep_data["count"] = new_count
-        
-        # 4. Delete 'drop_pid'
+        # Delete drop_pid
         self.delete_person(drop_pid)
-        
-        print(f"MERGE SUCCESS: P{drop_pid} deleted. P{keep_pid} updated.")
 
     def delete_person(self, pid: int):
         """
         Deletes a person from database and cache.
-
-        Args:
-            pid (int): Permanent ID to delete
         """
-        # Queue async delete
         self.async_writer.queue_delete(pid)
-
-        # Remove from cache
         if pid in self.known_persons_db:
             del self.known_persons_db[pid]
-            print(f"DELETED: P{pid} removed from cache.")
-
-        # Ensure the delete is processed by DB before rebuilding index
         self.async_writer.flush()
-
-        # Trigger index rebuild to remove the person from search results
         self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True, force=True)
 
     def reset_all(self):
