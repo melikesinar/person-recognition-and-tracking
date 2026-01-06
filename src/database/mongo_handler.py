@@ -64,10 +64,6 @@ class MongoHandler:
             if doc and "vectors" in doc:
                 # Convert BSON binary list back to numpy array list
                 doc["vectors"] = [np.frombuffer(v, dtype=np.float32) for v in doc["vectors"]]
-            elif doc and "master_vector" in doc:
-                # Legacy Fallback: Convert old single master vector to a list of 1
-                master = np.frombuffer(doc['master_vector'], dtype=np.float32)
-                doc["vectors"] = [master]
                 
             return doc
         except Exception as e:
@@ -85,7 +81,7 @@ class MongoHandler:
         print("Loading vectors from MongoDB for Faiss index (Multi-Vector)...")
         try:
             # Projection: Retrieve ID and the list of vectors
-            cursor = self.persons_collection.find({}, {"permanent_id": 1, "vectors": 1, "master_vector": 1, "_id": 0})
+            cursor = self.persons_collection.find({}, {"permanent_id": 1, "vectors": 1, "_id": 0})
 
             pids = []
             vectors = []
@@ -101,11 +97,6 @@ class MongoHandler:
                     for v_blob in doc["vectors"]:
                         pids.append(pid)
                         vectors.append(np.frombuffer(v_blob, dtype=np.float32))
-                
-                # Handle Legacy (Single Master Vector)
-                elif "master_vector" in doc:
-                    pids.append(pid)
-                    vectors.append(np.frombuffer(doc['master_vector'], dtype=np.float32))
 
             next_pid = max_id + 1
             print(f"Successfully loaded {len(vectors)} vectors (from {len(set(pids))} identities). Next PID: {next_pid}")
