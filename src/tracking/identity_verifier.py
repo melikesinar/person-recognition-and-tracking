@@ -195,15 +195,16 @@ class IdentityVerifier:
                 vectors_b = data_b.get("vectors")
                 if not vectors_b: continue
 
-                # --- Multi-Vector Similarity Check ---
-                # Find max similarity between any vector in A and any vector in B
-                # Optimization: We can break early if we exceed threshold, but finding max is safer for stats.
-                pair_max_sim = -1.0
-                for va in vectors_a:
-                    for vb in vectors_b:
-                        s = np.dot(va, vb)
-                        if s > pair_max_sim:
-                            pair_max_sim = s
+                # --- Multi-Vector Similarity Check (Vectorized) ---
+                # Convert lists to numpy arrays for matrix multiplication
+                mat_a = np.array(vectors_a) # Shape: (Na, 512)
+                mat_b = np.array(vectors_b) # Shape: (Nb, 512)
+                
+                # Compute all pairs similarity at once: (Na, Nb)
+                sim_matrix = np.dot(mat_a, mat_b.T)
+                
+                # Find the maximum similarity in the matrix
+                pair_max_sim = np.max(sim_matrix)
                 
                 if pair_max_sim > self.AUTO_MERGE_THRESHOLD:
                     if pair_max_sim > best_sim:
