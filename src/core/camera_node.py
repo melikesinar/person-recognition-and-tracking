@@ -130,11 +130,17 @@ class CameraNode:
             is_occluded = occlusion_map.get(track_id, False)
             pid = self.buffer_manager.track_id_to_permanent_id_map.get(track_id)
             
+            label = ""
+            color = (0, 0, 0)
+            
             # --- Logic Branching ---
             if pid:
                 # Case A: Already Assigned
                 self._handle_existing_track(pid, vector, is_occluded)
-                label, color = f"P{pid}", (0, 255, 0)
+                if vector is None:
+                    label, color = f"P{pid} (Low Q)", (100, 255, 100)
+                else:
+                    label, color = f"P{pid}", (0, 255, 0)
             else:
                 # Case B: Unassigned -> Try Match or Enroll
                 pid, source = self._attempt_match_or_enroll(
@@ -154,8 +160,11 @@ class CameraNode:
                         label, color = f"New P{pid}", (255, 200, 0)
                 else:
                     # Still unknown
-                    buf_len = len(self.buffer_manager.active_track_buffers.get(track_id, {}).get("vectors", []))
-                    label, color = f"T{track_id} ({buf_len})", (0, 165, 255)
+                    if vector is None:
+                        label, color = f"T{track_id} (Low Q)", (0, 100, 155)
+                    else:
+                        buf_len = len(self.buffer_manager.active_track_buffers.get(track_id, {}).get("vectors", []))
+                        label, color = f"T{track_id} ({buf_len})", (0, 165, 255)
             
             # Update Visuals & DB State
             if pid:
