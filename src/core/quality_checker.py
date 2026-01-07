@@ -84,17 +84,21 @@ class QualityChecker:
             score = min(1.0, area / Config.Q_BBOX_AREA_EXCELLENT)
             return score, None
 
-    def check_sharpness(self, crop):
+    def check_sharpness(self, crop, gray_crop=None):
         """
         Validates image sharpness (blur detection).
 
         Args:
             crop (np.ndarray): BGR image crop
+            gray_crop (np.ndarray, optional): Pre-computed grayscale image
 
         Returns:
             tuple: (score: float, rejection_reason: str or None)
         """
-        sharpness = self.calculate_sharpness(crop)
+        if gray_crop is None:
+            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            
+        sharpness = cv2.Laplacian(gray_crop, cv2.CV_64F).var() if crop.size > 0 else 0.0
 
         if sharpness < self.min_sharpness:
             return 0.0, "too_blurry"
@@ -103,20 +107,23 @@ class QualityChecker:
             score = min(1.0, sharpness / Config.Q_SHARPNESS_EXCELLENT)
             return score, None
 
-    def check_edge_density(self, crop):
+    def check_edge_density(self, crop, gray_crop=None):
         """
         Evaluates edge density (occlusion and clutter detection).
 
         Args:
             crop (np.ndarray): BGR image crop
+            gray_crop (np.ndarray, optional): Pre-computed grayscale image
 
         Returns:
             tuple: (score: float, rejection_reason: str or None)
         """
         try:
             h, w = crop.shape[:2]
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            edges = cv2.Canny(gray, 50, 150)
+            if gray_crop is None:
+                gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                
+            edges = cv2.Canny(gray_crop, 50, 150)
             edge_density = np.sum(edges > 0) / (h * w)
 
             if edge_density < Config.Q_EDGE_DENSITY_MIN:  # Too smooth = occluded
@@ -131,20 +138,23 @@ class QualityChecker:
             print(f"Error in check_edge_density: {e}")
             return 0.5, None  # Neutral score on error
 
-    def check_brightness(self, crop):
+    def check_brightness(self, crop, gray_crop=None):
         """
         Evaluates brightness variance (illumination check).
 
         Args:
             crop (np.ndarray): BGR image crop
+            gray_crop (np.ndarray, optional): Pre-computed grayscale image
 
         Returns:
             tuple: (score: float, rejection_reason: str or None)
         """
         try:
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            brightness_std = gray.std()
-            brightness_mean = gray.mean()
+            if gray_crop is None:
+                gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                
+            brightness_std = gray_crop.std()
+            brightness_mean = gray_crop.mean()
 
             if brightness_std < Config.Q_BRIGHTNESS_STD_MIN:  # Too uniform
                 return 0.0, "poor_illumination"
@@ -196,6 +206,9 @@ class QualityChecker:
         """
         h, w = crop.shape[:2]
 
+        # Optimization: Compute grayscale once
+        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.size > 0 else None
+
         quality_scores = {}
         rejection_reasons = []
 
@@ -212,19 +225,19 @@ class QualityChecker:
             rejection_reasons.append(reason)
 
         # 3. Sharpness
-        score, reason = self.check_sharpness(crop)
+        score, reason = self.check_sharpness(crop, gray_crop=gray_crop)
         quality_scores['sharpness'] = score
         if reason:
             rejection_reasons.append(reason)
 
         # 4. Edge Density
-        score, reason = self.check_edge_density(crop)
+        score, reason = self.check_edge_density(crop, gray_crop=gray_crop)
         quality_scores['edges'] = score
         if reason:
             rejection_reasons.append(reason)
 
         # 5. Brightness
-        score, reason = self.check_brightness(crop)
+        score, reason = self.check_brightness(crop, gray_crop=gray_crop)
         quality_scores['brightness'] = score
         if reason:
             rejection_reasons.append(reason)
