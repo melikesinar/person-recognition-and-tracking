@@ -37,11 +37,10 @@ class CameraNode:
             max_obs=100
         )
         
-        # Verify source availability (non-blocking check)
-        cap = cv2.VideoCapture(self.video_source)
-        if not cap.isOpened():
+        # Verify source availability and keep it open for main loop
+        self.cap = cv2.VideoCapture(self.video_source)
+        if not self.cap.isOpened():
             print(f"!!!! ERROR: Could not open video source for Cam {camera_id}: {video_source}")
-        cap.release()
         
         self.frame_count = 0
         self.prev_time = time.time()
@@ -176,14 +175,8 @@ class CameraNode:
         used_pids = set()
         active_track_ids = {t[1] for t in tracker_results}
         
-        # Clean up stale mappings first
-        for tid in list(self.buffer_manager.track_id_to_permanent_id_map.keys()):
-            if tid not in active_track_ids:
-                # We don't remove immediately here, cleanup happens in _perform_cleanup
-                # But for reservation, we only care about what's physically present
-                pass
-            else:
-                pid = self.buffer_manager.track_id_to_permanent_id_map[tid]
+        for tid, pid in self.buffer_manager.track_id_to_permanent_id_map.items():
+            if tid in active_track_ids:
                 used_pids.add(pid)
         return used_pids
 
