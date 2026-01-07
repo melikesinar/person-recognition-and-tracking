@@ -70,12 +70,17 @@ class DetectorWorker(multiprocessing.Process):
                     print("Detector process stopping...")
                     break
                 
-                # Unpack item (cam_id, frame)
-                if isinstance(item, tuple):
+                # Unpack item (cam_id, frame_id, frame)
+                if isinstance(item, tuple) and len(item) == 3:
+                    cam_id, frame_id, frame = item
+                elif isinstance(item, tuple) and len(item) == 2:
+                    # Legacy support or fallback
                     cam_id, frame = item
+                    frame_id = -1
                 else:
                     # Fallback for legacy single-frame calls
                     cam_id = 0
+                    frame_id = -1
                     frame = item
 
                 # Perform YOLO detection
@@ -98,8 +103,8 @@ class DetectorWorker(multiprocessing.Process):
                         if new_det.shape[1] > 6:
                             new_det = new_det[:, :6]
 
-                # We send back (cam_id, detection_result)
-                self.detection_queue.put((cam_id, new_det))
+                # We send back (cam_id, frame_id, detection_result)
+                self.detection_queue.put((cam_id, frame_id, new_det))
                 
         except Exception as e:
             print(f"!!!! CRITICAL ERROR in Detector Process !!!!: {e}")
