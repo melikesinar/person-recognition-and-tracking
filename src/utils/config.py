@@ -26,18 +26,18 @@ class Config:
 
     # --- Detection & Matching Thresholds ---
     DETECTION_SCORE_THRESHOLD = 0.55
-    MATCH_SIMILARITY_THRESHOLD = 0.80
+    MATCH_SIMILARITY_THRESHOLD = 0.82
     
     # --- Enrollment Parameters ---
-    MIN_ENROLL_FRAMES = 40
+    MIN_ENROLL_FRAMES = 50
     MIN_BBOX_AREA_ENROLL = 5000
     MIN_SHARPNESS_ENROLL = 35
     
     # --- Multi-Vector Gallery Settings ---
-    GALLERY_SIZE = 15  # Max number of diverse vectors per person (Front, Back, Side, etc.)
+    GALLERY_SIZE = 20  # Max number of diverse vectors per person (Front, Back, Side, etc.)
     # Only add to gallery if similarity to existing vectors is LESS than this.
-    # If a new vector is > 0.92 similar to an existing one, we assume we already have that "pose".
-    GALLERY_UPDATE_THRESHOLD = 0.92 
+    # If a new vector is > 0.85 similar to an existing one, we assume we already have that "pose".
+    GALLERY_UPDATE_THRESHOLD = 0.85
 
     # --- Buffer & Timing Settings ---
     UPDATE_INTERVAL = 1.0
@@ -122,9 +122,12 @@ class Config:
     # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
     VIDEO_SOURCES = [
         # 0,
-        str(BASE_DIR / "videos" / "3.mp4")
+        # str(BASE_DIR / "videos" / "3.mp4"),
+        # str(BASE_DIR / "videos" / "1.mp4")
         # str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
-        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi")
+        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi"),
+        str(BASE_DIR / "videos" / "multi-angle" / "4p-c2.avi"),
+        str(BASE_DIR / "videos" / "multi-angle" / "4p-c3.avi")
     ]
     # VIDEO_SOURCES = [0, 1]  # Uncomment for multi-webcam
 
