@@ -4,6 +4,7 @@ Evaluates multiple criteria to determine enrollment suitability.
 """
 import cv2
 import numpy as np
+from typing import Tuple, Optional, Dict, Any
 from utils.config import Config
 
 
@@ -22,33 +23,19 @@ class QualityChecker:
         self.weights = Config.Q_WEIGHTS
         self.min_quality_threshold = Config.Q_MIN_QUALITY_THRESHOLD
 
-    def calculate_sharpness(self, image):
+    def calculate_sharpness(self, image: np.ndarray) -> float:
         """
         Calculates image sharpness using Laplacian variance.
-
-        Args:
-            image (np.ndarray): BGR image crop
-
-        Returns:
-            float: Laplacian variance (higher = sharper)
         """
         if image is None or image.size == 0:
             return 0.0
 
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-        return variance
+        return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-    def check_aspect_ratio(self, height, width):
+    def check_aspect_ratio(self, height: int, width: int) -> Tuple[float, Optional[str]]:
         """
         Validates aspect ratio (person should be ~2:1 height/width).
-
-        Args:
-            height (int): Crop height in pixels
-            width (int): Crop width in pixels
-
-        Returns:
-            tuple: (score: float, rejection_reason: str or None)
         """
         if width == 0:
             return 0.0, "zero_width"
@@ -64,16 +51,9 @@ class QualityChecker:
         else:
             return 0.5, None  # Acceptable but not ideal
 
-    def check_bbox_area(self, height, width):
+    def check_bbox_area(self, height: int, width: int) -> Tuple[float, Optional[str]]:
         """
         Validates bounding box area (sufficient detail).
-
-        Args:
-            height (int): Crop height in pixels
-            width (int): Crop width in pixels
-
-        Returns:
-            tuple: (score: float, rejection_reason: str or None)
         """
         area = height * width
 
@@ -81,19 +61,14 @@ class QualityChecker:
             return 0.0, "too_small"
         else:
             # Normalized score (10000 = min, 50000 = excellent)
-            score = min(1.0, area / Config.Q_BBOX_AREA_EXCELLENT)
+            # Avoid division by zero in config if carelessly set
+            max_area = max(1, Config.Q_BBOX_AREA_EXCELLENT)
+            score = min(1.0, area / max_area)
             return score, None
 
-    def check_sharpness(self, crop, gray_crop=None):
+    def check_sharpness(self, crop: np.ndarray, gray_crop: Optional[np.ndarray] = None) -> Tuple[float, Optional[str]]:
         """
         Validates image sharpness (blur detection).
-
-        Args:
-            crop (np.ndarray): BGR image crop
-            gray_crop (np.ndarray, optional): Pre-computed grayscale image
-
-        Returns:
-            tuple: (score: float, rejection_reason: str or None)
         """
         if gray_crop is None:
             gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -103,23 +78,19 @@ class QualityChecker:
         if sharpness < self.min_sharpness:
             return 0.0, "too_blurry"
         else:
-            # Normalized score (50 = min, 200 = excellent)
-            score = min(1.0, sharpness / Config.Q_SHARPNESS_EXCELLENT)
+            max_sharpness = max(1.0, Config.Q_SHARPNESS_EXCELLENT)
+            score = min(1.0, sharpness / max_sharpness)
             return score, None
 
-    def check_edge_density(self, crop, gray_crop=None):
+    def check_edge_density(self, crop: np.ndarray, gray_crop: Optional[np.ndarray] = None) -> Tuple[float, Optional[str]]:
         """
         Evaluates edge density (occlusion and clutter detection).
-
-        Args:
-            crop (np.ndarray): BGR image crop
-            gray_crop (np.ndarray, optional): Pre-computed grayscale image
-
-        Returns:
-            tuple: (score: float, rejection_reason: str or None)
         """
         try:
             h, w = crop.shape[:2]
+            if h == 0 or w == 0:
+                return 0.0, "empty_crop"
+
             if gray_crop is None:
                 gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
                 
@@ -131,23 +102,16 @@ class QualityChecker:
             elif edge_density > Config.Q_EDGE_DENSITY_MAX:  # Too busy = cluttered
                 return 0.5, None
             else:
-                # Optimal range: 0.05 - 0.20
+                # Optimal range
                 score = 1.0 if Config.Q_EDGE_DENSITY_OPTIMAL_MIN <= edge_density <= Config.Q_EDGE_DENSITY_OPTIMAL_MAX else 0.7
                 return score, None
         except Exception as e:
-            print(f"Error in check_edge_density: {e}")
-            return 0.5, None  # Neutral score on error
+            print(f"[{self.__class__.__name__}] Error in check_edge_density: {e}")
+            return 0.5, None
 
-    def check_brightness(self, crop, gray_crop=None):
+    def check_brightness(self, crop: np.ndarray, gray_crop: Optional[np.ndarray] = None) -> Tuple[float, Optional[str]]:
         """
         Evaluates brightness variance (illumination check).
-
-        Args:
-            crop (np.ndarray): BGR image crop
-            gray_crop (np.ndarray, optional): Pre-computed grayscale image
-
-        Returns:
-            tuple: (score: float, rejection_reason: str or None)
         """
         try:
             if gray_crop is None:
@@ -158,24 +122,17 @@ class QualityChecker:
 
             if brightness_std < Config.Q_BRIGHTNESS_STD_MIN:  # Too uniform
                 return 0.0, "poor_illumination"
-            elif brightness_mean < Config.Q_BRIGHTNESS_MEAN_MIN or brightness_mean > Config.Q_BRIGHTNESS_MEAN_MAX:  # Too dark/bright
+            elif brightness_mean < Config.Q_BRIGHTNESS_MEAN_MIN or brightness_mean > Config.Q_BRIGHTNESS_MEAN_MAX:
                 return 0.3, "extreme_lighting"
             else:
                 return 1.0, None
         except Exception as e:
-            print(f"Error in check_brightness: {e}")
+            print(f"[{self.__class__.__name__}] Error in check_brightness: {e}")
             return 0.5, None
 
-    def check_position(self, bbox, frame_shape):
+    def check_position(self, bbox: Any, frame_shape: Tuple[int, ...]) -> Tuple[float, Optional[str]]:
         """
         Checks if detection is too close to frame edges (truncation risk).
-
-        Args:
-            bbox (list): Bounding box [x1, y1, x2, y2]
-            frame_shape (tuple): Frame dimensions (H, W, C)
-
-        Returns:
-            tuple: (score: float, rejection_reason: str or None)
         """
         x1, y1, x2, y2 = map(int, bbox)
         frame_h, frame_w = frame_shape[:2]
@@ -187,27 +144,23 @@ class QualityChecker:
         margin_x = min(center_x, frame_w - center_x) / frame_w
         margin_y = min(center_y, frame_h - center_y) / frame_h
 
-        if margin_x < Config.Q_FRAME_EDGE_MARGIN or margin_y < Config.Q_FRAME_EDGE_MARGIN:  # Within 5% of edge
+        if margin_x < Config.Q_FRAME_EDGE_MARGIN or margin_y < Config.Q_FRAME_EDGE_MARGIN:
             return 0.0, "at_frame_edge"
         else:
             return 1.0, None
 
-    def assess_quality(self, crop, bbox, frame_shape):
+    def assess_quality(self, crop: np.ndarray, bbox: Any, frame_shape: Tuple[int, ...]) -> Tuple[bool, str, float]:
         """
         Performs comprehensive quality assessment.
-
-        Args:
-            crop (np.ndarray): BGR image crop of the person
-            bbox (list): Bounding box coordinates [x1, y1, x2, y2]
-            frame_shape (tuple): Original frame shape (H, W, C)
-
-        Returns:
-            tuple: (is_good_quality: bool, reason: str, quality_score: float)
+        Returns: (is_good_quality, reason_str, normalized_score)
         """
+        if crop.size == 0:
+            return False, "empty_crop", 0.0
+
         h, w = crop.shape[:2]
 
         # Optimization: Compute grayscale once
-        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.size > 0 else None
+        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
         quality_scores = {}
         rejection_reasons = []
@@ -251,7 +204,7 @@ class QualityChecker:
         # Aggregate Score (weighted average)
         total_score = sum(quality_scores[k] * self.weights[k] for k in quality_scores.keys())
         max_score = sum(self.weights.values())
-        normalized_score = total_score / max_score
+        normalized_score = total_score / max_score if max_score > 0 else 0.0
 
         # Decision: Require minimum quality AND no hard rejections
         is_good_quality = (normalized_score >= self.min_quality_threshold) and (len(rejection_reasons) == 0)
