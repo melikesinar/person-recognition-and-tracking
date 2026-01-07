@@ -78,25 +78,28 @@ class SpatialMatcher:
             y2 + expansion_factor
         ]
 
-    def adaptive_spatial_threshold(self, bbox: list) -> float:
+    def adaptive_spatial_threshold_sq(self, bbox: list) -> float:
         """
-        Calculate adaptive distance threshold based on bbox size.
+        Calculate SQUARED adaptive distance threshold based on bbox size.
+        Avoids sqrt calculation.
 
         Args:
             bbox (list): [x1, y1, x2, y2]
 
         Returns:
-            float: Adaptive threshold in pixels
+            float: Squared Adaptive threshold
         """
         x1, y1, x2, y2 = bbox
         bbox_width = x2 - x1
         bbox_height = y2 - y1
-        bbox_diag = np.sqrt(bbox_width ** 2 + bbox_height ** 2)
+        # bbox_diag_sq = width^2 + height^2
+        bbox_diag_sq = bbox_width ** 2 + bbox_height ** 2
 
-        threshold = min(bbox_diag * Config.ADAPTIVE_THRESHOLD_FACTOR, Config.ADAPTIVE_THRESHOLD_MAX)
-        threshold = max(threshold, Config.ADAPTIVE_THRESHOLD_MIN)
+        # threshold = diag * factor -> threshold_sq = diag_sq * factor^2
+        threshold_sq = min(bbox_diag_sq * (Config.ADAPTIVE_THRESHOLD_FACTOR ** 2), Config.ADAPTIVE_THRESHOLD_MAX ** 2)
+        threshold_sq = max(threshold_sq, Config.ADAPTIVE_THRESHOLD_MIN ** 2)
 
-        return threshold
+        return threshold_sq
 
     def find_spatial_match(self, new_box: list, lost_pid_buffer: dict, current_time: float) -> tuple[int | None, float]:
         """
@@ -113,6 +116,10 @@ class SpatialMatcher:
         new_box_center = self.get_box_center(new_box)
         best_match_pid = None
         best_match_score = -1.0
+        
+        # Pre-calculate adaptive threshold squared once
+        adaptive_thresh_sq = self.adaptive_spatial_threshold_sq(new_box)
+        adaptive_thresh = np.sqrt(adaptive_thresh_sq) # Needed for dist_score normalization only
 
         for pid, data in lost_pid_buffer.items():
             time_elapsed = current_time - data["disappear_time"]
@@ -124,21 +131,17 @@ class SpatialMatcher:
             # IoU calculation
             iou = self.calculate_iou(new_box, predicted_box)
 
-            # Center distance
+            # Center distance (Squared)
             lost_box_center = self.get_box_center(last_box)
-            center_dist = np.linalg.norm(
-                np.array(new_box_center) - np.array(lost_box_center)
-            )
-
-            # Adaptive threshold
-            adaptive_threshold = self.adaptive_spatial_threshold(new_box)
+            center_dist_sq = (new_box_center[0] - lost_box_center[0])**2 + (new_box_center[1] - lost_box_center[1])**2
+            center_dist = np.sqrt(center_dist_sq)
 
             # Time decay
             time_factor = np.exp(-time_elapsed / self.short_term_memory_ttl)
 
             # Combined score
             iou_score = iou * 2.0
-            dist_score = max(0, 1.0 - (center_dist / adaptive_threshold))
+            dist_score = max(0, 1.0 - (center_dist / adaptive_thresh))
             time_score = time_factor
 
             match_score = (iou_score * Config.SPATIAL_IOU_WEIGHT + dist_score * Config.SPATIAL_DIST_WEIGHT + time_score * Config.SPATIAL_TIME_WEIGHT)
