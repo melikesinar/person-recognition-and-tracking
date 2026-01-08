@@ -3,7 +3,6 @@ Asynchronous database writer for non-blocking MongoDB operations.
 """
 import queue
 import threading
-from bson.binary import Binary
 from utils.config import Config
 
 
@@ -32,46 +31,47 @@ class AsyncDBWriter:
 
         print("Async database writer started.")
 
-    def queue_insert(self, doc: dict):
+    def _safe_put(self, item: dict):
         """
-        Queue a document for insertion.
+        Safely puts an item into the queue without blocking the main thread.
+        If the queue is full (DB overload), the item is dropped to preserve realtime performance.
+        """
+        try:
+            self.write_queue.put(item, block=False)
+        except queue.Full:
+            # Drop the packet rather than freezing the video feed
+            op_type = item.get("type", "unknown")
+            print(f"!!!! WARNING: DB Queue Full! Dropping '{op_type}' operation to maintain FPS !!!!")
 
-        Args:
-            doc (dict): Document to insert
-        """
-        self.write_queue.put({"type": "insert", "doc": doc})
+    def queue_insert(self, doc: dict):
+        """Queue a document for insertion."""
+        self._safe_put({"type": "insert", "doc": doc})
 
     def queue_update(self, pid: int, update_doc: dict):
-        """
-        Queue a document update.
-
-        Args:
-            pid (int): Permanent ID
-            update_doc (dict): MongoDB update document
-        """
-        self.write_queue.put({"type": "update", "pid": pid, "update_doc": update_doc})
+        """Queue a document update."""
+        self._safe_put({"type": "update", "pid": pid, "update_doc": update_doc})
 
     def queue_delete(self, pid: int):
-        """
-        Queue a document deletion.
-
-        Args:
-            pid (int): Permanent ID to delete
-        """
-        self.write_queue.put({"type": "delete", "pid": pid})
+        """Queue a document deletion."""
+        self._safe_put({"type": "delete", "pid": pid})
 
     def queue_reset(self):
         """Queue a full database reset."""
-        self.write_queue.put({"type": "reset"})
+        self._safe_put({"type": "reset"})
 
     def flush(self):
         """
         Blocks until all currently queued operations are processed.
-        Useful for ensuring consistency before critical operations (like index rebuild).
+        Useful for ensuring consistency before critical operations.
+        Note: This blocks the caller explicitly.
         """
         barrier_event = threading.Event()
-        self.write_queue.put({"type": "barrier", "event": barrier_event})
-        barrier_event.wait()
+        try:
+            # We accept blocking here slightly just to ensure the barrier gets in
+            self.write_queue.put({"type": "barrier", "event": barrier_event}, timeout=2.0)
+            barrier_event.wait()
+        except queue.Full:
+            print("!!!! WARNING: Could not flush DB queue, it is completely stuck. !!!!")
 
     def _writer_worker(self):
         """Background worker thread that processes queued operations."""
@@ -79,6 +79,7 @@ class AsyncDBWriter:
 
         while not self.stop_event.is_set():
             try:
+                # Wait for a task, but timeout periodically to check stop_event
                 operation = self.write_queue.get(timeout=1.0)
 
                 if operation is None:  # Poison pill
@@ -122,7 +123,6 @@ class AsyncDBWriter:
                 {"permanent_id": int(pid)},
                 update_doc
             )
-            # Silent (too frequent to log)
         except Exception as e:
             print(f"!!!! [ASYNC] MongoDB UPDATE ERROR (P{pid}) !!!!: {e}")
 
@@ -146,16 +146,13 @@ class AsyncDBWriter:
     def shutdown(self, timeout=5.0):
         """
         Gracefully shutdown writer thread.
-
-        Args:
-            timeout (float): Maximum seconds to wait for pending writes
-
-        Returns:
-            bool: True if shutdown cleanly
         """
         print("Waiting for pending database writes to complete...")
-        self.write_queue.put(None)  # Poison pill
-        self.writer_thread.join(timeout=timeout)
+        try:
+            self.write_queue.put(None, block=True, timeout=1.0)
+            self.writer_thread.join(timeout=timeout)
+        except queue.Full:
+            print("WARNING: Queue full during shutdown. Forcing exit.")
 
         if self.writer_thread.is_alive():
             print("WARNING: Database writer thread did not exit cleanly.")
