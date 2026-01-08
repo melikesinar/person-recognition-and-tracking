@@ -4,7 +4,7 @@ Evaluates multiple criteria to determine enrollment suitability.
 """
 import cv2
 import numpy as np
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Any
 from utils.config import Config
 
 
@@ -23,6 +23,11 @@ class QualityChecker:
         self.weights = Config.Q_WEIGHTS
         self.min_quality_threshold = Config.Q_MIN_QUALITY_THRESHOLD
 
+        # Pre-calculate totals for weighted average to save time
+        self.total_weight = sum(self.weights.values())
+        if self.total_weight == 0:
+            self.total_weight = 1.0  # Avoid div/0
+
     def calculate_sharpness(self, image: np.ndarray) -> float:
         """
         Calculates image sharpness using Laplacian variance.
@@ -30,7 +35,12 @@ class QualityChecker:
         if image is None or image.size == 0:
             return 0.0
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # Optimization: Don't re-convert if already gray
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+            
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
     def check_aspect_ratio(self, height: int, width: int) -> Tuple[float, Optional[str]]:
@@ -61,7 +71,6 @@ class QualityChecker:
             return 0.0, "too_small"
         else:
             # Normalized score (10000 = min, 50000 = excellent)
-            # Avoid division by zero in config if carelessly set
             max_area = max(1, Config.Q_BBOX_AREA_EXCELLENT)
             score = min(1.0, area / max_area)
             return score, None
@@ -106,7 +115,7 @@ class QualityChecker:
                 score = 1.0 if Config.Q_EDGE_DENSITY_OPTIMAL_MIN <= edge_density <= Config.Q_EDGE_DENSITY_OPTIMAL_MAX else 0.7
                 return score, None
         except Exception as e:
-            print(f"[{self.__class__.__name__}] Error in check_edge_density: {e}")
+            # Fallback for unexpected errors
             return 0.5, None
 
     def check_brightness(self, crop: np.ndarray, gray_crop: Optional[np.ndarray] = None) -> Tuple[float, Optional[str]]:
@@ -116,9 +125,10 @@ class QualityChecker:
         try:
             if gray_crop is None:
                 gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                
-            brightness_std = gray_crop.std()
-            brightness_mean = gray_crop.mean()
+            
+            # Use mean and std computed on the flattened array (faster than full array ops sometimes)
+            brightness_std = np.std(gray_crop)
+            brightness_mean = np.mean(gray_crop)
 
             if brightness_std < Config.Q_BRIGHTNESS_STD_MIN:  # Too uniform
                 return 0.0, "poor_illumination"
@@ -126,8 +136,7 @@ class QualityChecker:
                 return 0.3, "extreme_lighting"
             else:
                 return 1.0, None
-        except Exception as e:
-            print(f"[{self.__class__.__name__}] Error in check_brightness: {e}")
+        except Exception:
             return 0.5, None
 
     def check_position(self, bbox: Any, frame_shape: Tuple[int, ...]) -> Tuple[float, Optional[str]]:
@@ -159,52 +168,47 @@ class QualityChecker:
 
         h, w = crop.shape[:2]
 
-        # Optimization: Compute grayscale once
+        # Optimization: Compute grayscale ONCE and pass it down
         gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-        quality_scores = {}
+        # Dictionary lookups are slower than direct variables, but this keeps code clean.
+        # Given Python 3.7+ dict ordering and speed, this is acceptable for now.
+        
         rejection_reasons = []
+        weighted_score_sum = 0.0
 
         # 1. Aspect Ratio
         score, reason = self.check_aspect_ratio(h, w)
-        quality_scores['aspect'] = score
-        if reason:
-            rejection_reasons.append(reason)
+        weighted_score_sum += score * self.weights['aspect']
+        if reason: rejection_reasons.append(reason)
 
         # 2. Bounding Box Area
         score, reason = self.check_bbox_area(h, w)
-        quality_scores['size'] = score
-        if reason:
-            rejection_reasons.append(reason)
+        weighted_score_sum += score * self.weights['size']
+        if reason: rejection_reasons.append(reason)
 
-        # 3. Sharpness
+        # 3. Sharpness (Pass gray_crop)
         score, reason = self.check_sharpness(crop, gray_crop=gray_crop)
-        quality_scores['sharpness'] = score
-        if reason:
-            rejection_reasons.append(reason)
+        weighted_score_sum += score * self.weights['sharpness']
+        if reason: rejection_reasons.append(reason)
 
-        # 4. Edge Density
+        # 4. Edge Density (Pass gray_crop)
         score, reason = self.check_edge_density(crop, gray_crop=gray_crop)
-        quality_scores['edges'] = score
-        if reason:
-            rejection_reasons.append(reason)
+        weighted_score_sum += score * self.weights['edges']
+        if reason: rejection_reasons.append(reason)
 
-        # 5. Brightness
+        # 5. Brightness (Pass gray_crop)
         score, reason = self.check_brightness(crop, gray_crop=gray_crop)
-        quality_scores['brightness'] = score
-        if reason:
-            rejection_reasons.append(reason)
+        weighted_score_sum += score * self.weights['brightness']
+        if reason: rejection_reasons.append(reason)
 
         # 6. Position
         score, reason = self.check_position(bbox, frame_shape)
-        quality_scores['position'] = score
-        if reason:
-            rejection_reasons.append(reason)
+        weighted_score_sum += score * self.weights['position']
+        if reason: rejection_reasons.append(reason)
 
-        # Aggregate Score (weighted average)
-        total_score = sum(quality_scores[k] * self.weights[k] for k in quality_scores.keys())
-        max_score = sum(self.weights.values())
-        normalized_score = total_score / max_score if max_score > 0 else 0.0
+        # Final Calculation
+        normalized_score = weighted_score_sum / self.total_weight
 
         # Decision: Require minimum quality AND no hard rejections
         is_good_quality = (normalized_score >= self.min_quality_threshold) and (len(rejection_reasons) == 0)
