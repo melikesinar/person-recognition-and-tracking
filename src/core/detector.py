@@ -1,7 +1,7 @@
 import multiprocessing
 import numpy as np
+import traceback
 from ultralytics import YOLO
-from typing import Tuple, Optional, Any
 from utils.config import Config
 
 class DetectorWorker(multiprocessing.Process):
@@ -47,7 +47,8 @@ class DetectorWorker(multiprocessing.Process):
             # Initialize model within the process context
             detector = YOLO(Config.YOLO_MODEL_PATH)
             
-            # Warmup or simple check could go here if needed
+            # Warmup is handled implicitly by the first inference, 
+            # but we signal ready immediately after load.
             print(f"[{self.__class__.__name__}] YOLOv8 Loaded Successfully.")
             self.ready_event.set()
             
@@ -68,35 +69,37 @@ class DetectorWorker(multiprocessing.Process):
                 try:
                     cam_id, frame_id, frame = item
                 except ValueError:
-                    # Malformed item, skip
+                    print(f"[{self.__class__.__name__}] Malformed item in queue, skipping.")
                     continue
 
                 # Run Inference
-                # verbose=False reduces log spam
-                # stream=False is default, returns list of Results
-                results = detector(frame, classes=0, verbose=False, device=self.device_str)
+                # Optimization: Pass 'conf' directly to the model.
+                # This lets the internal NMS engine filter low-confidence boxes on the GPU (if available),
+                # avoiding unnecessary memory transfer and CPU filtering.
+                current_thresh = self.shared_threshold.value
+                
+                results = detector(
+                    frame, 
+                    classes=0, 
+                    conf=current_thresh, 
+                    verbose=False, 
+                    device=self.device_str
+                )
 
                 final_dets = self.EMPTY_DETECTION
 
                 if results and results[0].boxes is not None:
-                    boxes = results[0].boxes
                     # Ultralytics boxes.data is (N, 6) -> [x1, y1, x2, y2, conf, cls]
-                    det = boxes.data.cpu().numpy()
+                    # Since we already filtered by conf and classes=0, we just take the data.
+                    det = results[0].boxes.data.cpu().numpy()
 
                     if det.size > 0:
-                        # Apply dynamic threshold filtering
-                        thresh = self.shared_threshold.value
-                        mask = det[:, 4] >= thresh
-                        filtered_det = det[mask]
-                        
-                        if filtered_det.size > 0:
-                            # Ensure exactly 6 columns (sometimes frameworks add extra info)
-                            final_dets = filtered_det[:, :6]
+                        # Ensure exactly 6 columns
+                        final_dets = det[:, :6]
 
                 # Push result: (cam_id, frame_id, detections)
                 self.detection_queue.put((cam_id, frame_id, final_dets))
 
         except Exception as e:
             print(f"!!!! CRITICAL ERROR in Detector Process !!!!: {e}")
-            import traceback
             traceback.print_exc()
