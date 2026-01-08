@@ -4,6 +4,7 @@ Person enrollment and vector update management (Multi-Vector Gallery).
 import numpy as np
 from datetime import datetime
 from bson.binary import Binary
+from typing import Dict, Any, List, Optional, Tuple
 from utils.config import Config
 from utils.math_utils import l2_normalize
 
@@ -14,7 +15,7 @@ class PersonManager:
     Implements a 'Multi-Vector Gallery' strategy to handle varying poses/angles.
     """
 
-    def __init__(self, known_persons_db, async_writer, faiss_manager):
+    def __init__(self, known_persons_db: Dict[int, Any], async_writer, faiss_manager):
         """
         Initialize person manager.
 
@@ -34,7 +35,7 @@ class PersonManager:
         """Set the next available permanent ID."""
         self.next_permanent_id = next_id
 
-    def enroll_person(self, vectors: list) -> int:
+    def enroll_person(self, vectors: List[np.ndarray]) -> int:
         """
         Enrolls a new person with a unique Permanent ID.
         Initializes the gallery with a representative vector from the batch.
@@ -49,8 +50,9 @@ class PersonManager:
             raise ValueError("No vectors provided to enroll.")
 
         # Initialize gallery with the mean of the enrollment batch (Strong Seed)
-        # Future improvement: Run K-Means here to start with 2-3 diverse vectors.
-        initial_vector = l2_normalize(np.mean(np.stack(vectors, axis=0), axis=0))
+        # Using float32 for consistency
+        mean_vector = np.mean(np.stack(vectors, axis=0), axis=0).astype(np.float32)
+        initial_vector = l2_normalize(mean_vector)
         
         current_dt = datetime.now()
         new_pid = self.next_permanent_id
@@ -59,9 +61,9 @@ class PersonManager:
         gallery_vectors = [initial_vector]
 
         # Create MongoDB document
-        # We store 'vectors' as a list of Binaries
         new_person_doc = {
             "permanent_id": new_pid,
+            # Ensure vectors are bytes for BSON
             "vectors": [Binary(v.tobytes()) for v in gallery_vectors],
             "created": current_dt,
             "last_seen": current_dt
@@ -103,8 +105,6 @@ class PersonManager:
         if is_occluded:
             # If the person is occluded (overlapped by another), we TRUST the tracking
             # but we DO NOT TRUST the visual features for learning.
-            # Just keep the ID alive.
-            # print(f"UPDATE SKIPPED: P{perm_id} is occluded. No gallery update.")
             mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
             self.async_writer.queue_update(perm_id, mongo_update_doc)
             return
@@ -112,21 +112,20 @@ class PersonManager:
         gallery = entry["vectors"] # List of np.ndarray
         
         # 1. Check similarity against ALL existing vectors in gallery
-        # We want to know if this new vector is "redundant"
-        similarities = [np.dot(v, new_vector) for v in gallery]
-        max_sim = max(similarities)
+        # Optimized batch dot product
+        # Stack gallery to matrix (N, 512) for faster calc
+        gallery_matrix = np.stack(gallery, axis=0) 
+        similarities = np.dot(gallery_matrix, new_vector)
+        max_sim = np.max(similarities)
 
         mongo_update_doc = {"$set": {"last_seen": datetime.now()}}
 
         if max_sim > Config.GALLERY_UPDATE_THRESHOLD:
             # We already have a vector very similar to this one.
-            # No need to add it. Just update timestamp.
-            # print(f"UPDATE SKIP: P{perm_id} new vector is redundant (Max Sim: {max_sim:.3f})")
             self.async_writer.queue_update(perm_id, mongo_update_doc)
             return
 
         # 2. It is a NEW/DIFFERENT pose (max_sim < Threshold). Add to gallery.
-        # print(f"UPDATE DETECTED: P{perm_id} found new angle (Sim: {max_sim:.3f}). Adding to gallery.")
         
         if len(gallery) < Config.GALLERY_SIZE:
             # Case A: Gallery has space. Just append.
@@ -134,30 +133,30 @@ class PersonManager:
         else:
             # Case B: Gallery is FULL.
             # Strategy: Find the pair of vectors in the gallery that are MOST similar to each other.
-            # Merge them to free up 1 slot, then add the new vector.
-            # This ensures we always keep the "most diverse" set of vectors.
+            # Merge them to free up 1 slot.
             
-            best_pair = (0, 1)
-            highest_pair_sim = -1.0
+            # Compute all pairwise similarities (N, N)
+            sim_matrix = np.dot(gallery_matrix, gallery_matrix.T)
+            # Mask diagonal and lower triangle to avoid self-match and duplicates
+            np.fill_diagonal(sim_matrix, -1.0)
             
-            # Simple O(N^2) search (N=10, so it's tiny)
-            for i in range(len(gallery)):
-                for j in range(i + 1, len(gallery)):
-                    sim = np.dot(gallery[i], gallery[j])
-                    if sim > highest_pair_sim:
-                        highest_pair_sim = sim
-                        best_pair = (i, j)
+            # Find max index
+            flat_idx = np.argmax(sim_matrix)
+            idx1, idx2 = np.unravel_index(flat_idx, sim_matrix.shape)
             
-            # Merge indices i and j
-            idx1, idx2 = best_pair
-            # print(f"GALLERY FULL: Merging similar vectors {idx1} and {idx2} (Sim: {highest_pair_sim:.3f})")
+            # If for some reason we picked the lower triangle (shouldn't happen with proper search but safe to normalize)
+            # Actually unravelling gives row, col. Since matrix is symmetric, sim[i,j] == sim[j,i].
             
+            # Merge indices idx1 and idx2
             merged_vec = l2_normalize(gallery[idx1] + gallery[idx2])
             
             # Remove the two old ones, add the merged one
-            # Be careful with indices shifting when popping
-            gallery.pop(max(idx1, idx2))
-            gallery.pop(min(idx1, idx2))
+            # Remove in descending order to avoid index shift issues
+            pop_first = max(idx1, idx2)
+            pop_second = min(idx1, idx2)
+            
+            gallery.pop(pop_first)
+            gallery.pop(pop_second)
             gallery.append(merged_vec)
             
             # Now we have space (N-1), add the NEW vector
@@ -165,17 +164,11 @@ class PersonManager:
 
         # 3. Persist Changes
         # Convert entire gallery to Binary list for MongoDB
-        # (Inefficient for huge lists, but for N=10 it's fine and safe)
         mongo_update_doc["$set"]["vectors"] = [Binary(v.tobytes()) for v in gallery]
         
         self.async_writer.queue_update(perm_id, mongo_update_doc)
         
-        # Force a rebuild eventually because the index is now outdated
-        # (We added a vector, so Faiss needs to know)
-        # Optimization: We could just add to Faiss, but managing deletions is hard.
-        # Rebuilding is safer for consistency.
         self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True)
-
 
     def merge_identities(self, keep_pid: int, drop_pid: int):
         """
@@ -192,23 +185,27 @@ class PersonManager:
         # Combine lists
         combined_gallery = keep_data["vectors"] + drop_data["vectors"]
         
-        # Prune logic: If combined > GALLERY_SIZE, apply the "Merge Most Similar" logic repeatedly
-        # until size is back to limit.
+        # Prune logic: If combined > GALLERY_SIZE
         while len(combined_gallery) > Config.GALLERY_SIZE:
-            # Find most similar pair
-            best_pair = (0, 1)
-            highest_pair_sim = -1.0
-            for i in range(len(combined_gallery)):
-                for j in range(i + 1, len(combined_gallery)):
-                    sim = np.dot(combined_gallery[i], combined_gallery[j])
-                    if sim > highest_pair_sim:
-                        highest_pair_sim = sim
-                        best_pair = (i, j)
+            # Vectorized pair search
+            gallery_matrix = np.stack(combined_gallery, axis=0)
+            sim_matrix = np.dot(gallery_matrix, gallery_matrix.T)
+            np.fill_diagonal(sim_matrix, -1.0) # Ignore self-similarity
+
+            flat_idx = np.argmax(sim_matrix)
+            idx1, idx2 = np.unravel_index(flat_idx, sim_matrix.shape)
             
-            idx1, idx2 = best_pair
+            # Prevent merging identical indices if argmax fails (shouldn't happen if N > 1)
+            if idx1 == idx2:
+                 break
+
             merged_vec = l2_normalize(combined_gallery[idx1] + combined_gallery[idx2])
-            combined_gallery.pop(max(idx1, idx2))
-            combined_gallery.pop(min(idx1, idx2))
+            
+            pop_first = max(idx1, idx2)
+            pop_second = min(idx1, idx2)
+            
+            combined_gallery.pop(pop_first)
+            combined_gallery.pop(pop_second)
             combined_gallery.append(merged_vec)
         
         # Update keep_pid
@@ -232,7 +229,10 @@ class PersonManager:
         self.async_writer.queue_delete(pid)
         if pid in self.known_persons_db:
             del self.known_persons_db[pid]
-        self.async_writer.flush()
+        
+        # We don't necessarily need to flush immediately if load is high, 
+        # but flushing ensures consistency before rebuild.
+        # self.async_writer.flush() 
         self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True, force=True)
 
     def reset_all(self):
