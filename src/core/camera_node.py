@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Optional, Set, Any
 from boxmot import BoostTrack
 from utils.config import Config
 from utils.visualizer import Visualizer
-from utils.math_utils import check_occlusions
+from utils.math_utils import check_occlusions, l2_normalize
 from tracking.buffer_manager import BufferManager
 from tracking.spatial_matcher import SpatialMatcher
 from tracking.identity_verifier import IdentityVerifier
@@ -28,6 +28,7 @@ class CameraNode:
         self.visualizer = Visualizer()
         self.identity_verifier = IdentityVerifier()
         
+        # Initialize Tracker
         self.tracker = BoostTrack(
             reid_weights=Path(Config.REID_MODEL_PATH),
             device=(0 if self.resources['device'].type == 'cuda' else 'cpu'),
@@ -88,16 +89,20 @@ class CameraNode:
             track_id = int(track_id)
             x1, y1, x2, y2 = map(int, box)
             
-            # Clip to frame
-            x1, x2 = max(0, min(w, x1)), max(0, min(w, x2))
-            y1, y2 = max(0, min(h, y1)), max(0, min(h, y2))
+            # Clip to frame dimensions
+            x1 = max(0, min(w, x1))
+            y1 = max(0, min(h, y1))
+            x2 = max(0, min(w, x2))
+            y2 = max(0, min(h, y2))
             
+            # Invalid box check
             if x2 <= x1 or y2 <= y1:
                 continue
             
             crop = frame[y1:y2, x1:x2]
             tracker_results.append((box, track_id, conf, cls, ind, crop))
 
+            # Quality check before ReID
             if crop.size > 0:
                 is_good, _, _ = self.resources['quality_checker'].assess_quality(crop, box, (h, w, 3))
                 if is_good:
@@ -249,8 +254,8 @@ class CameraNode:
             
             # Relaxed quality threshold for enrollment
             if avg_q >= 0.40:
-                avg_vector = np.mean(buf["vectors"], axis=0)
-                avg_vector /= np.linalg.norm(avg_vector)
+                # Use robust normalization
+                avg_vector = l2_normalize(np.mean(buf["vectors"], axis=0))
 
                 # Final Safety Check: Is this person actually known but missed by single-frame ReID?
                 found_pid, _ = self.resources['faiss_manager'].search(
