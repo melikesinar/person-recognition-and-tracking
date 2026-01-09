@@ -2,25 +2,46 @@
 Utility functions for mathematical operations.
 """
 import numpy as np
+from typing import List, Tuple, Dict, Any, Union
 
 def l2_normalize(v: np.ndarray) -> np.ndarray:
     """
     Normalizes a vector to unit length (L2 norm).
+    Safe against zero division.
 
     Args:
-        v (np.ndarray): Feature vector
+        v (np.ndarray): Feature vector (1D) or matrix of vectors (2D)
 
     Returns:
-        np.ndarray: L2 normalized vector
+        np.ndarray: L2 normalized vector/matrix
     """
     v = np.asarray(v, dtype=np.float32)
-    n = np.linalg.norm(v)
-    return v if n == 0 else v / n
+    
+    # Handle 1D case
+    if v.ndim == 1:
+        n = np.linalg.norm(v)
+        return v if n == 0 else v / n
+    
+    # Handle 2D case (N x D)
+    # Calculate norm along axis 1, keep dimensions for broadcasting
+    norm = np.linalg.norm(v, axis=1, keepdims=True)
+    
+    # Avoid division by zero
+    norm[norm == 0] = 1.0 
+    
+    return v / norm
 
-def calculate_iou(box1, box2):
+def calculate_iou(box1: Union[List[float], np.ndarray], box2: Union[List[float], np.ndarray]) -> float:
     """
     Calculate Intersection over Union (IoU) between two boxes.
     Box format: [x1, y1, x2, y2]
+    
+    Args:
+        box1: First bounding box
+        box2: Second bounding box
+        
+    Returns:
+        float: IoU value (0.0 to 1.0)
     """
     x1_1, y1_1, x2_1, y2_1 = box1
     x1_2, y1_2, x2_2, y2_2 = box2
@@ -40,7 +61,7 @@ def calculate_iou(box1, box2):
 
     return intersection_area / union_area if union_area > 0 else 0.0
 
-def check_occlusions(tracker_results_list, iou_threshold=0.15):
+def check_occlusions(tracker_results_list: List[Any], iou_threshold: float = 0.15) -> Dict[int, bool]:
     """
     Checks for occlusions among all detected boxes in the current frame.
     
@@ -58,29 +79,36 @@ def check_occlusions(tracker_results_list, iou_threshold=0.15):
         track_id = res[1]
         occlusion_map[track_id] = False
 
-    # Compare every pair
     n = len(tracker_results_list)
+    if n < 2:
+        return occlusion_map
+
+    # Extract boxes and IDs for faster processing
+    # Assuming box format in tracker_results_list is correct
+    boxes = np.array([res[0] for res in tracker_results_list])
+    ids = [res[1] for res in tracker_results_list]
+    
+    # Calculate centers
+    # box: x1, y1, x2, y2
+    centers_x = (boxes[:, 0] + boxes[:, 2]) / 2
+    centers_y = (boxes[:, 1] + boxes[:, 3]) / 2
+    widths = boxes[:, 2] - boxes[:, 0]
+    
+    # Compare every pair
     for i in range(n):
         for j in range(i + 1, n):
-            box1 = tracker_results_list[i][0]
-            tid1 = tracker_results_list[i][1]
+            # 1. Check IoU
+            iou = calculate_iou(boxes[i], boxes[j])
             
-            box2 = tracker_results_list[j][0]
-            tid2 = tracker_results_list[j][1]
+            # 2. Check Center Distance
+            dist_sq = (centers_x[i] - centers_x[j])**2 + (centers_y[i] - centers_y[j])**2
+            dist = np.sqrt(dist_sq)
             
-            iou = calculate_iou(box1, box2)
-            
-            # Distance based check (in case they are close but IoU is low, e.g. one above another)
-            # Center distance
-            c1 = ((box1[0]+box1[2])/2, (box1[1]+box1[3])/2)
-            c2 = ((box2[0]+box2[2])/2, (box2[1]+box2[3])/2)
-            dist = ((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)**0.5
-            
-            # Heuristic: If centers are closer than 1/3 of average width, it's risky
-            avg_width = ((box1[2]-box1[0]) + (box2[2]-box2[0])) / 2
+            # Heuristic: If centers are closer than 80% of average width
+            avg_width = (widths[i] + widths[j]) / 2
             
             if iou > iou_threshold or dist < (avg_width * 0.8):
-                occlusion_map[tid1] = True
-                occlusion_map[tid2] = True
+                occlusion_map[ids[i]] = True
+                occlusion_map[ids[j]] = True
                 
     return occlusion_map
