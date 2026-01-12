@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-
 class Config:
     """Central configuration class for all system parameters."""
 
@@ -26,7 +25,7 @@ class Config:
 
     # --- Detection & Matching Thresholds ---
     DETECTION_SCORE_THRESHOLD = 0.55
-    MATCH_SIMILARITY_THRESHOLD = 0.82
+    MATCH_SIMILARITY_THRESHOLD = 0.83
     
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 50
@@ -36,8 +35,8 @@ class Config:
     # --- Multi-Vector Gallery Settings ---
     GALLERY_SIZE = 20  # Max number of diverse vectors per person (Front, Back, Side, etc.)
     # Only add to gallery if similarity to existing vectors is LESS than this.
-    # If a new vector is > 0.85 similar to an existing one, we assume we already have that "pose".
-    GALLERY_UPDATE_THRESHOLD = 0.85
+    # If a new vector is > 0.75 similar to an existing one, we assume we already have that "pose".
+    GALLERY_UPDATE_THRESHOLD = 0.75
 
     # --- Buffer & Timing Settings ---
     UPDATE_INTERVAL = 1.0
@@ -50,8 +49,8 @@ class Config:
 
     # --- Identity Verification / Self-Correction ---
     ID_VERIFICATION_INTERVAL = 10  # Check every 10 frames
-    ID_SWITCH_THRESHOLD_MARGIN = 0.02  # Lowered: Easier to switch ID
-    ID_SWITCH_CONFIRMATION_THRESHOLD = 5  # Number of consistent matches required to switch ID
+    ID_SWITCH_THRESHOLD_MARGIN = 0.07  # Lowered: Easier to switch ID
+    ID_SWITCH_CONFIRMATION_THRESHOLD = 7  # Number of consistent matches required to switch ID
     ID_SWITCH_COUNTER_TTL_SECONDS = 5.0  # Reset counter if no confirmation within this duration
     ID_SWITCH_COOLDOWN = 10.0 # Seconds to lock ID after a switch
     ID_DROP_THRESHOLD = 0.55 # Revocation logic
@@ -67,7 +66,7 @@ class Config:
     IMAGENET_STD = [0.229, 0.224, 0.225]
 
     # --- Tracking Parameters ---
-    SHORT_TERM_MEMORY_TTL = 10  # Remember for 10 seconds
+    SHORT_TERM_MEMORY_TTL = 30  # Remember for 30 seconds
     SPATIAL_PREDICTION_FACTOR_1 = 50
     SPATIAL_PREDICTION_FACTOR_2 = 100
     ADAPTIVE_THRESHOLD_FACTOR = 0.75
@@ -76,7 +75,7 @@ class Config:
     SPATIAL_IOU_WEIGHT = 0.4
     SPATIAL_DIST_WEIGHT = 0.4
     SPATIAL_TIME_WEIGHT = 0.2
-    SPATIAL_MATCH_MIN_SCORE = 0.3
+    SPATIAL_MATCH_MIN_SCORE = 0.2
 
     # --- Faiss Index Parameters ---
     FAISS_M = 48  # HNSW M parameter
@@ -86,6 +85,7 @@ class Config:
     BATCH_SIZE_TRIGGER = 5  # enrollments
 
     # --- Async DB Writer ---
+
     ASYNC_DB_WRITER_QUEUE_SIZE = 100
 
     # --- Quality Checker Settings ---
@@ -119,17 +119,22 @@ class Config:
     REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
     # --- Video Source ---
-    # VIDEO_SOURCE = str(BASE_DIR / "videos" / "3.mp4")
     VIDEO_SOURCES = [
         # 0,
-        # str(BASE_DIR / "videos" / "3.mp4"),
-        # str(BASE_DIR / "videos" / "1.mp4")
+        str(BASE_DIR / "videos" / "3.mp4"),
+        str(BASE_DIR / "videos" / "1.mp4")
         # str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
         # str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi"),
-        str(BASE_DIR / "videos" / "multi-angle" / "4p-c2.avi"),
-        str(BASE_DIR / "videos" / "multi-angle" / "4p-c3.avi")
+        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c2.avi"),
+        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c3.avi")
     ]
-    # VIDEO_SOURCES = [0, 1]  # Uncomment for multi-webcam
+
+    # --- Logging Configuration ---
+    import logging
+    LOG_LEVEL = logging.DEBUG # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+    LOG_TO_FILE = True
+    LOG_DIR = BASE_DIR / "logs"
+    LOG_FILE_NAME = "system_events.log"
 
     # --- TTA Settings ---
     USE_TTA_DEFAULT = False
@@ -148,16 +153,16 @@ class Config:
         if not Config.FAISS_COLLECTION:
             raise ValueError("FAISS_COLLECTION environment variable is not set!")
 
-        print("✓ Configuration validated successfully.")
-
     @staticmethod
     def print_config():
         """Prints current configuration (for debugging)."""
-        print("\n--- CONFIGURATION ---")
-        print(f"Database: {Config.DB_NAME}")
-        print(f"Collection: {Config.COLLECTION}")
-        print(f"Detection Threshold: {Config.DETECTION_SCORE_THRESHOLD}")
-        print(f"Match Threshold: {Config.MATCH_SIMILARITY_THRESHOLD}")
-        print(f"Min Enroll Frames: {Config.MIN_ENROLL_FRAMES}")
-        print(f"TTA: {'Enabled' if Config.USE_TTA_DEFAULT else 'Disabled'}")
-        print("--------------------\n")
+        # Deferred import to avoid circular dependency
+        from utils.logger import get_logger
+        logger = get_logger()
+
+        logger.info(f"Database: {Config.DB_NAME}")
+        logger.info(f"Collection: {Config.COLLECTION}")
+        logger.info(f"Detection Threshold: {Config.DETECTION_SCORE_THRESHOLD}")
+        logger.info(f"Match Threshold: {Config.MATCH_SIMILARITY_THRESHOLD}")
+        logger.info(f"Min Enroll Frames: {Config.MIN_ENROLL_FRAMES}")
+        logger.info(f"TTA: {'Enabled' if Config.USE_TTA_DEFAULT else 'Disabled'}")
