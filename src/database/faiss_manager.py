@@ -11,7 +11,9 @@ import numpy as np
 from datetime import datetime
 from bson.binary import Binary
 from utils.config import Config
+from utils.logger import get_logger
 
+logger = get_logger()
 
 class FaissManager:
     """
@@ -41,14 +43,14 @@ class FaissManager:
         self.ef_search = Config.FAISS_EF_SEARCH
         self.faiss_m = Config.FAISS_M
 
-        print("Faiss manager initialized.")
+        logger.info("Faiss manager initialized.")
 
     def build_index(self):
         """
         Builds a new HNSW Faiss index directly from MongoDB vectors.
         Uses atomic swap to minimize disruption to ongoing searches.
         """
-        print("Building new HNSW Faiss index from MongoDB (non-blocking)...")
+        logger.info("Building new HNSW Faiss index from MongoDB (non-blocking)...")
         self.index_build_in_progress = True
 
         try:
@@ -63,7 +65,7 @@ class FaissManager:
             new_index.hnsw.efSearch = self.ef_search
 
             if not vectors:
-                print("No vectors in DB. HNSW index initialized empty.")
+                logger.info("No vectors in DB. HNSW index initialized empty.")
                 with self.faiss_lock:
                     self.faiss_index = new_index
                     self.index_to_pid_map = []
@@ -80,19 +82,19 @@ class FaissManager:
             new_index.train(vector_matrix)
             new_index.add(vector_matrix)
 
-            print(f"New HNSW index built with {new_index.ntotal} vectors. Preparing atomic swap...")
+            logger.info(f"New HNSW index built with {new_index.ntotal} vectors. Preparing atomic swap...")
 
             # 4. ATOMIC SWAP
             with self.faiss_lock:
                 self.faiss_index = new_index
                 self.index_to_pid_map = pids
-                print(f"✓ Index swapped atomically. Active vectors: {self.faiss_index.ntotal}")
+                logger.info(f"✓ Index swapped atomically. Active vectors: {self.faiss_index.ntotal}")
 
             # 5. Persist to MongoDB (in background potentially, but here synchronous is safer to prevent race)
             self._save_index_to_db(new_index)
 
         except Exception as e:
-            print(f"!!!! CRITICAL ERROR during Faiss Rebuild !!!!: {e}")
+            logger.critical(f"CRITICAL ERROR during Faiss Rebuild: {e}")
         finally:
             self.index_build_in_progress = False
 
@@ -123,9 +125,9 @@ class FaissManager:
                 }},
                 upsert=True
             )
-            print(f"✓ HNSW Faiss index persisted to MongoDB.")
+            logger.info("✓ HNSW Faiss index persisted to MongoDB.")
         except Exception as e:
-            print(f"!!!! FAISS SAVE ERROR (non-critical) !!!!: {e}")
+            logger.error(f"FAISS SAVE ERROR (non-critical): {e}")
         finally:
             if temp_filename and os.path.exists(temp_filename):
                 try:
@@ -141,7 +143,7 @@ class FaissManager:
             index_doc = self.mongo_handler.faiss_collection.find_one({"name": Config.FAISS_INDEX_KEY})
 
             if index_doc and 'index_data' in index_doc and 'pids' in index_doc:
-                print("Loading Faiss index from MongoDB...")
+                logger.info("Loading Faiss index from MongoDB...")
                 temp_filename = None
                 
                 try:
@@ -163,13 +165,13 @@ class FaissManager:
 
                     # Quick validation
                     if self.faiss_index.ntotal != len(self.index_to_pid_map):
-                        print("!!!! Index and PID map size mismatch, rebuilding... !!!!")
+                        logger.warning("Index and PID map size mismatch, rebuilding...")
                         self.build_index()
                     else:
-                        print(f"Faiss index with {self.faiss_index.ntotal} vectors loaded successfully.")
+                        logger.info(f"Faiss index with {self.faiss_index.ntotal} vectors loaded successfully.")
 
                 except Exception as e:
-                    print(f"Failed to load Faiss index from MongoDB ({e}), rebuilding...")
+                    logger.warning(f"Failed to load Faiss index from MongoDB ({e}), rebuilding...")
                     self.build_index()
                 finally:
                     if temp_filename and os.path.exists(temp_filename):
@@ -178,10 +180,10 @@ class FaissManager:
                         except OSError:
                             pass
             else:
-                print("No Faiss index found in MongoDB. Building from scratch...")
+                logger.info("No Faiss index found in MongoDB. Building from scratch...")
                 self.build_index()
         except Exception as e:
-            print(f"!!!! Error checking MongoDB for Faiss index: {e}")
+            logger.error(f"Error checking MongoDB for Faiss index: {e}")
             self.build_index()
 
     def search(self, query_vector, threshold):
@@ -215,7 +217,7 @@ class FaissManager:
                     matched_pid = pid_map_ref[matched_index_pos]
                     return matched_pid, best_similarity
         except Exception as e:
-            print(f"!!!! FAISS SEARCH ERROR !!!!: {e}")
+            logger.error(f"FAISS SEARCH ERROR: {e}")
 
         return None, -1.0
 
@@ -244,7 +246,7 @@ class FaissManager:
         )
 
         if should_rebuild:
-            print(f"Triggering index rebuild (force={force}, pending: {pending_count})")
+            logger.debug(f"Triggering index rebuild (force={force}, pending: {pending_count})")
             self.pending_enrollments.clear()
             self.last_index_rebuild = time.time()
             

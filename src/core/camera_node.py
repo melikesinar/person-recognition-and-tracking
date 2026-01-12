@@ -11,6 +11,9 @@ from utils.math_utils import check_occlusions, l2_normalize
 from tracking.buffer_manager import BufferManager
 from tracking.spatial_matcher import SpatialMatcher
 from tracking.identity_verifier import IdentityVerifier
+from utils.logger import get_logger
+
+logger = get_logger()
 
 class CameraNode:
     """
@@ -21,7 +24,7 @@ class CameraNode:
         self.video_source = video_source
         self.resources = global_resources 
         
-        print(f"[{self.__class__.__name__} {camera_id}] Initializing source: {video_source}")
+        logger.info(f"[{self.__class__.__name__} {camera_id}] Initializing source: {video_source}")
         
         self.buffer_manager = BufferManager()
         self.spatial_matcher = SpatialMatcher()
@@ -41,7 +44,7 @@ class CameraNode:
         # Verify source availability and keep it open for main loop
         self.cap = cv2.VideoCapture(self.video_source)
         if not self.cap.isOpened():
-            print(f"!!!! ERROR: Could not open video source for Cam {camera_id}: {video_source}")
+            logger.error(f"Could not open video source for Cam {camera_id}: {video_source}")
         
         self.frame_count = 0
         self.prev_time = time.time()
@@ -265,11 +268,11 @@ class CameraNode:
                 final_pid = None
                 if found_pid:
                     if found_pid in used_pids:
-                        print(f"Enroll Conflict: T{track_id} matches active P{found_pid}. Forcing NEW ID.")
+                        logger.info(f"Enroll Conflict: T{track_id} matches active P{found_pid}. Forcing NEW ID.")
                         # ID is active elsewhere, so this must be a look-alike or duplicate. Treat as new.
                         final_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
                     else:
-                        print(f"Enroll Merge: T{track_id} -> P{found_pid} (accumulated evidence)")
+                        logger.info(f"Enroll Merge: T{track_id} -> P{found_pid} (accumulated evidence)")
                         final_pid = found_pid
                         self.resources['person_manager'].incremental_update(final_pid, avg_vector)
                 else:

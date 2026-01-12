@@ -4,7 +4,9 @@ Asynchronous database writer for non-blocking MongoDB operations.
 import queue
 import threading
 from utils.config import Config
+from utils.logger import get_logger
 
+logger = get_logger()
 
 class AsyncDBWriter:
     """
@@ -29,7 +31,7 @@ class AsyncDBWriter:
         self.writer_thread = threading.Thread(target=self._writer_worker, daemon=True)
         self.writer_thread.start()
 
-        print("Async database writer started.")
+        logger.info("Async database writer started.")
 
     def _safe_put(self, item: dict):
         """
@@ -41,7 +43,7 @@ class AsyncDBWriter:
         except queue.Full:
             # Drop the packet rather than freezing the video feed
             op_type = item.get("type", "unknown")
-            print(f"!!!! WARNING: DB Queue Full! Dropping '{op_type}' operation to maintain FPS !!!!")
+            logger.warning(f"DB Queue Full! Dropping '{op_type}' operation to maintain FPS")
 
     def queue_insert(self, doc: dict):
         """Queue a document for insertion."""
@@ -71,11 +73,11 @@ class AsyncDBWriter:
             self.write_queue.put({"type": "barrier", "event": barrier_event}, timeout=2.0)
             barrier_event.wait()
         except queue.Full:
-            print("!!!! WARNING: Could not flush DB queue, it is completely stuck. !!!!")
+            logger.warning("Could not flush DB queue, it is completely stuck.")
 
     def _writer_worker(self):
         """Background worker thread that processes queued operations."""
-        print("Database writer thread started...")
+        logger.info("Database writer thread started...")
 
         while not self.stop_event.is_set():
             try:
@@ -98,23 +100,23 @@ class AsyncDBWriter:
                 elif op_type == "barrier":
                     operation["event"].set()
                 else:
-                    print(f"!!!! Unknown DB operation type: {op_type} !!!!")
+                    logger.error(f"Unknown DB operation type: {op_type}")
 
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"!!!! [ASYNC] DB writer unexpected error !!!!: {e}")
+                logger.error(f"[ASYNC] DB writer unexpected error: {e}")
 
-        print("Database writer thread exited.")
+        logger.info("Database writer thread exited.")
 
     def _handle_insert(self, doc):
         """Handle INSERT operation."""
         try:
             self.persons_collection.insert_one(doc)
             pid = doc["permanent_id"]
-            print(f"[ASYNC] MongoDB INSERT: P{pid} completed.")
+            logger.info(f"[ASYNC] MongoDB INSERT: P{pid} completed.")
         except Exception as e:
-            print(f"!!!! [ASYNC] MongoDB INSERT ERROR !!!!: {e}")
+            logger.error(f"[ASYNC] MongoDB INSERT ERROR: {e}")
 
     def _handle_update(self, pid, update_doc):
         """Handle UPDATE operation."""
@@ -124,39 +126,39 @@ class AsyncDBWriter:
                 update_doc
             )
         except Exception as e:
-            print(f"!!!! [ASYNC] MongoDB UPDATE ERROR (P{pid}) !!!!: {e}")
+            logger.error(f"[ASYNC] MongoDB UPDATE ERROR (P{pid}): {e}")
 
     def _handle_delete(self, pid):
         """Handle DELETE operation."""
         try:
             self.persons_collection.delete_one({"permanent_id": int(pid)})
-            print(f"[ASYNC] MongoDB DELETE: P{pid} completed.")
+            logger.info(f"[ASYNC] MongoDB DELETE: P{pid} completed.")
         except Exception as e:
-            print(f"!!!! [ASYNC] MongoDB DELETE ERROR (P{pid}) !!!!: {e}")
+            logger.error(f"[ASYNC] MongoDB DELETE ERROR (P{pid}): {e}")
 
     def _handle_reset(self):
         """Handle RESET operation."""
         try:
             self.persons_collection.delete_many({})
             self.faiss_collection.delete_many({})
-            print("[ASYNC] MongoDB RESET completed.")
+            logger.warning("[ASYNC] MongoDB RESET completed.")
         except Exception as e:
-            print(f"!!!! [ASYNC] MongoDB RESET ERROR !!!!: {e}")
+            logger.critical(f"[ASYNC] MongoDB RESET ERROR: {e}")
 
     def shutdown(self, timeout=5.0):
         """
         Gracefully shutdown writer thread.
         """
-        print("Waiting for pending database writes to complete...")
+        logger.info("Waiting for pending database writes to complete...")
         try:
             self.write_queue.put(None, block=True, timeout=1.0)
             self.writer_thread.join(timeout=timeout)
         except queue.Full:
-            print("WARNING: Queue full during shutdown. Forcing exit.")
+            logger.warning("Queue full during shutdown. Forcing exit.")
 
         if self.writer_thread.is_alive():
-            print("WARNING: Database writer thread did not exit cleanly.")
+            logger.warning("Database writer thread did not exit cleanly.")
             return False
         else:
-            print("Database writer thread exited cleanly.")
+            logger.info("Database writer thread exited cleanly.")
             return True

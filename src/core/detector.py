@@ -3,6 +3,9 @@ import numpy as np
 import traceback
 from ultralytics import YOLO
 from utils.config import Config
+from utils.logger import get_logger
+
+logger = get_logger()
 
 class DetectorWorker(multiprocessing.Process):
     """
@@ -41,7 +44,7 @@ class DetectorWorker(multiprocessing.Process):
         self.join()
 
     def run(self):
-        print(f"[{self.__class__.__name__}] Process starting on {self.device_str}...")
+        logger.info(f"[{self.__class__.__name__}] Process starting on {self.device_str}...")
         
         try:
             # Initialize model within the process context
@@ -49,7 +52,7 @@ class DetectorWorker(multiprocessing.Process):
             
             # Warmup is handled implicitly by the first inference, 
             # but we signal ready immediately after load.
-            print(f"[{self.__class__.__name__}] YOLOv8 Loaded Successfully.")
+            logger.info(f"[{self.__class__.__name__}] YOLOv8 Loaded Successfully.")
             self.ready_event.set()
             
             while True:
@@ -62,14 +65,14 @@ class DetectorWorker(multiprocessing.Process):
                     continue
 
                 if item is None:
-                    print(f"[{self.__class__.__name__}] Stopping...")
+                    logger.info(f"[{self.__class__.__name__}] Stopping...")
                     break
                 
                 # Strict Unpacking: (cam_id, frame_id, frame)
                 try:
                     cam_id, frame_id, frame = item
                 except ValueError:
-                    print(f"[{self.__class__.__name__}] Malformed item in queue, skipping.")
+                    logger.warning(f"[{self.__class__.__name__}] Malformed item in queue, skipping.")
                     continue
 
                 # Run Inference
@@ -101,5 +104,5 @@ class DetectorWorker(multiprocessing.Process):
                 self.detection_queue.put((cam_id, frame_id, final_dets))
 
         except Exception as e:
-            print(f"!!!! CRITICAL ERROR in Detector Process !!!!: {e}")
+            logger.critical(f"CRITICAL ERROR in Detector Process: {e}")
             traceback.print_exc()

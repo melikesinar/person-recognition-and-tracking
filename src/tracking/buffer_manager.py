@@ -5,7 +5,9 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Any
 from utils.config import Config
+from utils.logger import get_logger
 
+logger = get_logger()
 
 class BufferManager:
     """
@@ -41,7 +43,7 @@ class BufferManager:
         # Cleanup timer
         self.last_buffer_cleanup = time.time()
 
-        print("Buffer manager initialized.")
+        logger.info("Buffer manager initialized.")
 
     def cleanup_stale_buffers(self, current_time: float, known_persons_db: Dict[int, Any]):
         """
@@ -69,7 +71,7 @@ class BufferManager:
             
             # Note: We do NOT remove them from 'known_persons_db' here.
             # That database is persistent. We only clean runtime caches.
-            print(f"BUFFER CLEANUP: Removed {len(stale_pids)} stale buffer(s) due to inactivity.")
+            logger.debug(f"BUFFER CLEANUP: Removed {len(stale_pids)} stale buffer(s) due to inactivity.")
 
     def cleanup_stale_tracks(self, current_time: float):
         """

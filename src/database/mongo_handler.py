@@ -3,7 +3,9 @@ import pymongo
 import numpy as np
 from typing import Optional, Tuple, List, Dict
 from utils.config import Config
+from utils.logger import get_logger
 
+logger = get_logger()
 
 class MongoHandler:
     """
@@ -22,7 +24,7 @@ class MongoHandler:
         """
         Establishes connection to MongoDB and sets up collections.
         """
-        print("Connecting to MongoDB...")
+        logger.info("Connecting to MongoDB...")
         try:
             self.mongo_client = pymongo.MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=5000)
             self.mongo_client.server_info()  # Trigger connection check
@@ -32,13 +34,13 @@ class MongoHandler:
 
             # Ensure index for faster lookups/uniqueness check
             self.persons_collection.create_index("permanent_id", unique=True)
-            print("Successfully connected to MongoDB and verified collections.")
+            logger.info("Successfully connected to MongoDB and verified collections.")
 
         except pymongo.errors.ServerSelectionTimeoutError as e:
-            print(f"!!!! MongoDB CONNECTION ERROR !!!!: {e}")
+            logger.critical(f"MongoDB CONNECTION ERROR: {e}")
             raise RuntimeError("MongoDB connection failed. Is mongod running?") from e
         except Exception as e:
-            print(f"!!!! UNEXPECTED MONGODB ERROR !!!!: {e}")
+            logger.critical(f"UNEXPECTED MONGODB ERROR: {e}")
             raise RuntimeError("MongoDB initialization failed.") from e
 
     def close(self):
@@ -47,7 +49,7 @@ class MongoHandler:
         """
         if self.mongo_client:
             self.mongo_client.close()
-            print("MongoDB connection closed.")
+            logger.info("MongoDB connection closed.")
 
     def get_person_by_id(self, pid: int) -> Optional[Dict]:
         """
@@ -68,7 +70,7 @@ class MongoHandler:
                 
             return doc
         except Exception as e:
-            print(f"!!!! Error fetching person P{pid} from MongoDB !!!!: {e}")
+            logger.error(f"Error fetching person P{pid} from MongoDB: {e}")
             return None
 
     def load_vectors_for_faiss(self) -> Tuple[List[int], List[np.ndarray], int]:
@@ -79,7 +81,7 @@ class MongoHandler:
         Returns:
             tuple: (list_of_pids, list_of_vectors, next_pid)
         """
-        print("Loading vectors from MongoDB for Faiss index (Multi-Vector)...")
+        logger.info("Loading vectors from MongoDB for Faiss index (Multi-Vector)...")
         try:
             # Projection: Retrieve only necessary fields
             # Using find() is generally faster than aggregate for simple retrieval
@@ -105,11 +107,11 @@ class MongoHandler:
 
             next_pid = max_id + 1
             unique_identities = len(set(pids)) if pids else 0
-            print(f"Successfully loaded {len(vectors)} vectors (from {unique_identities} identities). Next PID: {next_pid}")
+            logger.info(f"Successfully loaded {len(vectors)} vectors (from {unique_identities} identities). Next PID: {next_pid}")
             return pids, vectors, next_pid
 
         except Exception as e:
-            print(f"!!!! Error loading vectors from MongoDB !!!!: {e}")
+            logger.error(f"Error loading vectors from MongoDB: {e}")
             return [], [], 1
 
     def get_next_id(self) -> int:
@@ -125,5 +127,5 @@ class MongoHandler:
             else:
                 return 1  # Database is empty
         except Exception as e:
-            print(f"!!!! Error getting next ID from MongoDB !!!!: {e}")
+            logger.error(f"Error getting next ID from MongoDB: {e}")
             return 1

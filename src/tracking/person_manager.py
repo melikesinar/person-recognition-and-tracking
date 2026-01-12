@@ -7,7 +7,9 @@ from bson.binary import Binary
 from typing import Dict, Any, List, Optional, Tuple
 from utils.config import Config
 from utils.math_utils import l2_normalize
+from utils.logger import get_logger
 
+logger = get_logger()
 
 class PersonManager:
     """
@@ -29,7 +31,7 @@ class PersonManager:
         self.faiss_manager = faiss_manager
 
         self.next_permanent_id = 1
-        print("Person manager initialized (Multi-Vector Gallery Mode).")
+        logger.info("Person manager initialized (Multi-Vector Gallery Mode).")
 
     def set_next_id(self, next_id: int):
         """Set the next available permanent ID."""
@@ -71,7 +73,7 @@ class PersonManager:
 
         # Queue async insert
         self.async_writer.queue_insert(new_person_doc)
-        print(f"MongoDB INSERT: New person (P{new_pid}) queued. Gallery size: 1")
+        logger.info(f"MongoDB INSERT: New person (P{new_pid}) queued. Gallery size: 1")
 
         # Add to local cache
         self.known_persons_db[new_pid] = {
@@ -79,7 +81,7 @@ class PersonManager:
             "created": current_dt
         }
 
-        print(f"CACHE ADD: P{new_pid} added to cache.")
+        logger.info(f"CACHE ADD: P{new_pid} added to cache.")
         self.next_permanent_id += 1
 
         # Trigger index rebuild (Faiss will now index ALL vectors for this ID)
@@ -177,7 +179,7 @@ class PersonManager:
         if keep_pid not in self.known_persons_db or drop_pid not in self.known_persons_db:
             return
 
-        print(f"!!! MERGING IDENTITIES: P{drop_pid} -> INTO -> P{keep_pid} !!!")
+        logger.warning(f"MERGING IDENTITIES: P{drop_pid} -> INTO -> P{keep_pid}")
         
         keep_data = self.known_persons_db[keep_pid]
         drop_data = self.known_persons_db[drop_pid]
@@ -240,4 +242,4 @@ class PersonManager:
         self.async_writer.queue_reset()
         self.known_persons_db.clear()
         self.next_permanent_id = 1
-        print("Person database reset queued.")
+        logger.warning("Person database reset queued.")

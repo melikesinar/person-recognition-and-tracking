@@ -5,7 +5,9 @@ import torch.nn.functional as F
 import numpy as np
 from boxmot import BoostTrack
 from utils.config import Config
+from utils.logger import get_logger
 
+logger = get_logger()
 
 class ReidExtractor:
     """
@@ -41,7 +43,7 @@ class ReidExtractor:
         if self.reid_model is None or not hasattr(self.reid_model, 'model') or not callable(self.reid_model.model):
             raise RuntimeError("Re-ID model failed to load in BoostTrack instance!")
         else:
-            print("ReidExtractor initialized successfully with Re-ID model.")
+            logger.info("ReidExtractor initialized successfully with Re-ID model.")
 
     def set_tta_status(self, status):
         """Updates the Test-Time Augmentation (TTA) flag."""

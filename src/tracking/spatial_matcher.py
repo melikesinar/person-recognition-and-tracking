@@ -4,6 +4,9 @@ Spatial matching for re-acquiring lost persons using motion prediction.
 import numpy as np
 from utils.config import Config
 from typing import Tuple, List, Dict, Optional, Any
+from utils.logger import get_logger
+
+logger = get_logger()
 
 class SpatialMatcher:
     """
@@ -14,7 +17,7 @@ class SpatialMatcher:
     def __init__(self):
         """Initialize spatial matcher."""
         self.short_term_memory_ttl = Config.SHORT_TERM_MEMORY_TTL
-        print("Spatial matcher initialized.")
+        logger.info("Spatial matcher initialized.")
 
     def get_box_center(self, box: List[float]) -> Tuple[float, float]:
         """

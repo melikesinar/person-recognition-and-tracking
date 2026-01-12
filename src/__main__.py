@@ -11,6 +11,7 @@ from boxmot import BoostTrack
 
 # Import modular components
 from utils.config import Config
+from utils.logger import get_logger
 from core.camera_node import CameraNode
 from core.detector import DetectorWorker
 from core.reid_extractor import ReidExtractor
@@ -21,6 +22,8 @@ from database.mongo_handler import MongoHandler
 from tracking.person_manager import PersonManager
 from tracking.identity_verifier import IdentityVerifier
 
+logger = get_logger()
+
 Config.validate()
 Config.print_config()
 
@@ -30,7 +33,7 @@ class MultiCameraSystem:
     Manages global resources (Database, Detector, ReID) and coordinates CameraNodes.
     """
     def __init__(self):
-        print("System initializing (Multi-Camera Mode)...")
+        logger.info("System initializing (Multi-Camera Mode)...")
         self.stop_event = threading.Event()
         self.paused = False
 
@@ -43,6 +46,7 @@ class MultiCameraSystem:
         try:
             self.mongo_handler = MongoHandler()
         except RuntimeError as e:
+            logger.critical(f"MongoDB Init Failed: {e}")
             raise RuntimeError(f"MongoDB Init Failed: {e}")
 
         self.faiss_manager = FaissManager(self.mongo_handler)
@@ -63,9 +67,9 @@ class MultiCameraSystem:
         # --- AI Models ---
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         device_str = 0 if self.device.type == 'cuda' else 'cpu'
-        print(f"Using device: {self.device}")
+        logger.info(f"Using device: {self.device}")
 
-        print("Loading Re-ID Model...")
+        logger.info("Loading Re-ID Model...")
         self.master_tracker = BoostTrack(
             reid_weights=Path(Config.REID_MODEL_PATH),
             device=device_str,
@@ -109,17 +113,17 @@ class MultiCameraSystem:
             self.faiss_manager.load_index_from_db()
             next_id = self.mongo_handler.get_next_id()
             self.person_manager.set_next_id(next_id)
-            print("System ready. DB loaded.")
+            logger.info("System ready. DB loaded.")
         except Exception as e:
-            print(f"DB Load Error: {e}")
+            logger.error(f"DB Load Error: {e}")
             self.faiss_manager.build_index()
             self.person_manager.set_next_id(1)
 
     def run(self):
         self.detector_worker.start()
-        print("Waiting for Detector...")
+        logger.info("Waiting for Detector...")
         self.detector_ready.wait()
-        print("Detector Ready. Starting Streams...")
+        logger.info("Detector Ready. Starting Streams...")
         
         pause_overlay = None
         
@@ -237,7 +241,7 @@ class MultiCameraSystem:
             self.use_tta = not self.use_tta
             self.reid_extractor.set_tta_status(self.use_tta)
         if key == ord('r'):
-            print("RESET DB...")
+            logger.warning("RESET DB TRIGGERED BY USER...")
             self.person_manager.reset_all()
             self.faiss_manager.build_index()
             for node in self.camera_nodes:
@@ -245,6 +249,7 @@ class MultiCameraSystem:
         return key
 
     def cleanup(self):
+        logger.info("System shutting down...")
         self.stop_event.set()
         self.detector_worker.stop()
         self.async_writer.shutdown()
@@ -259,6 +264,6 @@ if __name__ == "__main__":
         app = MultiCameraSystem()
         app.run()
     except Exception as e:
-        print(f"CRITICAL: {e}")
+        logger.critical(f"CRITICAL SYSTEM FAILURE: {e}")
         import traceback
         traceback.print_exc()

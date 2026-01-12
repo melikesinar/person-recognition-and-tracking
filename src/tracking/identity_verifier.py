@@ -7,6 +7,9 @@ import numpy as np
 from datetime import datetime
 from utils.config import Config
 from typing import Dict, Any, List, Optional, Tuple
+from utils.logger import get_logger
+
+logger = get_logger()
 
 class IdentityVerifier:
     """
@@ -22,7 +25,7 @@ class IdentityVerifier:
         self.REDUNDANCY_CHECK_INTERVAL = 2.0 # Check every 2 seconds
         self.AUTO_MERGE_THRESHOLD = 0.85 # Very high similarity required to auto-merge
         
-        print("Identity Verifier initialized.")
+        logger.info("Identity Verifier initialized.")
 
     def clear_state_for_track(self, track_id: int):
         """Resets verification state for a specific track ID."""
@@ -120,7 +123,7 @@ class IdentityVerifier:
         self.verification_state[track_id] = state
         
         if state["count"] >= Config.ID_SWITCH_CONFIRMATION_THRESHOLD:
-            print(f"REVOCATION: T{track_id} dropped from P{pid} (Sim: {current_sim:.2f} < {Config.ID_DROP_THRESHOLD}). Now Unknown.")
+            logger.warning(f"REVOCATION: T{track_id} dropped from P{pid} (Sim: {current_sim:.2f} < {Config.ID_DROP_THRESHOLD}). Now Unknown.")
             del buffer_manager.track_id_to_permanent_id_map[track_id]
             # Reset state but keep the cooldown? Usually for revocation we just clear.
             self.clear_state_for_track(track_id)
@@ -134,19 +137,19 @@ class IdentityVerifier:
             # Confirmation of same candidate
             state["count"] = state.get("count", 0) + 1
             state["last_seen"] = current_time
-            print(f"CONFIRMATION: T{track_id} (P{current_pid}:{current_sim:.2f}) -> P{new_pid}:{new_score:.2f}. Count: {state['count']}/{Config.ID_SWITCH_CONFIRMATION_THRESHOLD}")
+            logger.debug(f"CONFIRMATION: T{track_id} (P{current_pid}:{current_sim:.2f}) -> P{new_pid}:{new_score:.2f}. Count: {state['count']}/{Config.ID_SWITCH_CONFIRMATION_THRESHOLD}")
         else:
             # New candidate detected
             state["candidate_pid"] = new_pid
             state["count"] = 1
             state["last_seen"] = current_time
-            print(f"CANDIDATE: T{track_id} (P{current_pid}:{current_sim:.2f}) might be P{new_pid}:{new_score:.2f}. Starting count.")
+            logger.debug(f"CANDIDATE: T{track_id} (P{current_pid}:{current_sim:.2f}) might be P{new_pid}:{new_score:.2f}. Starting count.")
 
         self.verification_state[track_id] = state
 
         # Check if confirmed
         if state["count"] >= Config.ID_SWITCH_CONFIRMATION_THRESHOLD:
-            print(f"SWITCH CONFIRMED: T{track_id} switched from P{current_pid} -> P{new_pid}.")
+            logger.warning(f"SWITCH CONFIRMED: T{track_id} switched from P{current_pid} -> P{new_pid}.")
             buffer_manager.track_id_to_permanent_id_map[track_id] = new_pid
             
             # Apply Cooldown
@@ -250,7 +253,7 @@ class IdentityVerifier:
             if pid_keep > pid_drop:
                 pid_keep, pid_drop = pid_drop, pid_keep
                 
-            print(f"AUTO-MERGE: Detected P{pid_keep} and P{pid_drop} are the same (Sim: {best_sim:.2f}). Merging...")
+            logger.info(f"AUTO-MERGE: Detected P{pid_keep} and P{pid_drop} are the same (Sim: {best_sim:.2f}). Merging...")
             
             # A. Merge in Database
             person_manager.merge_identities(keep_pid=pid_keep, drop_pid=pid_drop)
@@ -265,4 +268,4 @@ class IdentityVerifier:
                         if pid_drop in bm.last_known_box_for_pid:
                              bm.last_known_box_for_pid[pid_keep] = bm.last_known_box_for_pid.pop(pid_drop)
                         
-                        print(f"  -> [Cam {node.camera_id}] Track T{tid} redirected from P{pid_drop} to P{pid_keep}")
+                        logger.info(f"  -> [Cam {node.camera_id}] Track T{tid} redirected from P{pid_drop} to P{pid_keep}")
