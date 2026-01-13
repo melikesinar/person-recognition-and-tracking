@@ -28,15 +28,15 @@ class Config:
     MATCH_SIMILARITY_THRESHOLD = 0.83
     
     # --- Enrollment Parameters ---
-    MIN_ENROLL_FRAMES = 50
+    MIN_ENROLL_FRAMES = 30
     MIN_BBOX_AREA_ENROLL = 5000
     MIN_SHARPNESS_ENROLL = 35
     
     # --- Multi-Vector Gallery Settings ---
-    GALLERY_SIZE = 20  # Max number of diverse vectors per person (Front, Back, Side, etc.)
+    GALLERY_SIZE = 60  # Max number of diverse vectors per person (Front, Back, Side, etc.)
     # Only add to gallery if similarity to existing vectors is LESS than this.
-    # If a new vector is > 0.75 similar to an existing one, we assume we already have that "pose".
-    GALLERY_UPDATE_THRESHOLD = 0.75
+    # If a new vector is > 0.90 similar to an existing one, we assume we already have that "pose".
+    GALLERY_UPDATE_THRESHOLD = 0.90
 
     # --- Buffer & Timing Settings ---
     UPDATE_INTERVAL = 1.0
@@ -48,11 +48,11 @@ class Config:
     VECTOR_DIMENSION = 512
 
     # --- Identity Verification / Self-Correction ---
-    ID_VERIFICATION_INTERVAL = 10  # Check every 10 frames
-    ID_SWITCH_THRESHOLD_MARGIN = 0.07  # Lowered: Easier to switch ID
-    ID_SWITCH_CONFIRMATION_THRESHOLD = 7  # Number of consistent matches required to switch ID
-    ID_SWITCH_COUNTER_TTL_SECONDS = 5.0  # Reset counter if no confirmation within this duration
-    ID_SWITCH_COOLDOWN = 10.0 # Seconds to lock ID after a switch
+    ID_VERIFICATION_INTERVAL = 2  # Check every 2 frames
+    ID_SWITCH_THRESHOLD_MARGIN = 0.05
+    ID_SWITCH_CONFIRMATION_THRESHOLD = 3  # Number of consistent matches required to switch ID
+    ID_SWITCH_COUNTER_TTL_SECONDS = 10.0  # Reset counter if no confirmation within this duration
+    ID_SWITCH_COOLDOWN = 5.0 # Seconds to lock ID after a switch
     ID_DROP_THRESHOLD = 0.55 # Revocation logic
 
     # Threshold for merging during enrollment (High = Strict, only merge if very sure)
@@ -76,6 +76,24 @@ class Config:
     SPATIAL_DIST_WEIGHT = 0.4
     SPATIAL_TIME_WEIGHT = 0.2
     SPATIAL_MATCH_MIN_SCORE = 0.2
+
+    # --- Cross-Camera Spatial Matching (Homography) ---
+    SPATIAL_MERGE_ENABLED = True
+    # Maximum pixel distance between "projected point" and "actual point" to consider a spatial match
+    SPATIAL_MERGE_DISTANCE_THRESHOLD = 100.0 
+    # Weight of spatial score vs visual ReID score (e.g., 0.3 means 30% spatial, 70% visual)
+    # If spatial match is perfect, it adds a boost.
+    SPATIAL_MERGE_SCORE_WEIGHT = 0.3
+    
+    # Homography Matrices: Perspective transform between cameras.
+    # Key format: "source_cam_id-target_cam_id" (e.g., "0-1")
+    # Value: 3x3 List of Lists [[h11, h12, h13], [h21, h22, h23], [h31, h32, h33]]
+    # Use a tool like 'opencv_calibration' to find these. 
+    # Below is a PLACEHOLDER example (Identity matrix = no transform).
+    CAMERA_HOMOGRAPHIES = {
+        '0-1': [[-3.37740978, -13.69568251, 1636.08526081], [-0.38661487, -2.99709581, -418.04782040], [-0.02070525, -0.02173024, 1.00000000]]
+        # '0-1': [[7.27268679, 10.99178752, 9.70421588], [0.83555118, 3.29873005, 83.86414115], [0.00328687, 0.00630426, 1.00000000]],
+    }
 
     # --- Faiss Index Parameters ---
     FAISS_M = 48  # HNSW M parameter
@@ -121,10 +139,10 @@ class Config:
     # --- Video Source ---
     VIDEO_SOURCES = [
         # 0,
-        str(BASE_DIR / "videos" / "3.mp4"),
-        str(BASE_DIR / "videos" / "1.mp4")
-        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
-        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi"),
+        # str(BASE_DIR / "videos" / "3.mp4"),
+        # str(BASE_DIR / "videos" / "1.mp4")
+        str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
+        str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi"),
         # str(BASE_DIR / "videos" / "multi-angle" / "4p-c2.avi"),
         # str(BASE_DIR / "videos" / "multi-angle" / "4p-c3.avi")
     ]

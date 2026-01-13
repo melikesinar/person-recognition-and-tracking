@@ -41,6 +41,7 @@ class MultiCameraSystem:
         self.match_threshold = Config.MATCH_SIMILARITY_THRESHOLD
         self.detection_threshold_value = multiprocessing.Value('d', Config.DETECTION_SCORE_THRESHOLD)
         self.use_tta = Config.USE_TTA_DEFAULT
+        self.debug_spatial = False
         
         # --- Database & Global Components ---
         try:
@@ -187,6 +188,33 @@ class MultiCameraSystem:
                         if hasattr(node, 'last_display_frame') and node.last_display_frame is not None:
                             display_frames.append(node.last_display_frame)
 
+                    # --- SPATIAL DEBUG VISUALIZATION ---
+                    if self.debug_spatial:
+                        matcher = self.global_verifier.cross_camera_matcher
+                        for node_a in self.camera_nodes:
+                            if node_a.camera_id not in detections_map: continue
+                            _, dets_a = detections_map[node_a.camera_id]
+                            
+                            for box_a in dets_a:
+                                rect_a = box_a[:4]
+                                feet_a = matcher.get_feet_point(rect_a)
+                                
+                                for node_b in self.camera_nodes:
+                                    if node_a.camera_id == node_b.camera_id: continue
+                                    
+                                    # Check Matrix A -> B
+                                    key = f"{node_a.camera_id}-{node_b.camera_id}"
+                                    if key in matcher.homography_matrices:
+                                        H = np.array(matcher.homography_matrices[key])
+                                        proj = matcher.project_point(feet_a, H)
+                                        
+                                        if proj:
+                                            px, py = int(proj[0]), int(proj[1])
+                                            # Draw on Node B
+                                            if hasattr(node_b, 'last_display_frame') and node_b.last_display_frame is not None:
+                                                cv2.circle(node_b.last_display_frame, (px, py), 6, (0, 255, 255), -1)
+                                                cv2.circle(node_b.last_display_frame, (px, py), 10, (0, 0, 0), 2)
+
                     # 4. GLOBAL CHECK
                     self.global_verifier.check_redundant_identities(self.person_manager, self.camera_nodes)
 
@@ -237,6 +265,9 @@ class MultiCameraSystem:
         if key == ord('j'): self.detection_threshold_value.value = max(0.0, self.detection_threshold_value.value - 0.05)
         if key == ord('y'): self.match_threshold = min(1.0, self.match_threshold + 0.05)
         if key == ord('h'): self.match_threshold = max(0.0, self.match_threshold - 0.05)
+        if key == ord('d'):
+            self.debug_spatial = not self.debug_spatial
+            print(f"Spatial Debug Mode: {'ON' if self.debug_spatial else 'OFF'}")
         if key == ord('t'): 
             self.use_tta = not self.use_tta
             self.reid_extractor.set_tta_status(self.use_tta)

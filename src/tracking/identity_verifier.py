@@ -8,6 +8,7 @@ from datetime import datetime
 from utils.config import Config
 from typing import Dict, Any, List, Optional, Tuple
 from utils.logger import get_logger
+from tracking.cross_camera_matcher import CrossCameraMatcher
 
 logger = get_logger()
 
@@ -24,6 +25,8 @@ class IdentityVerifier:
         self.last_redundancy_check = time.time()
         self.REDUNDANCY_CHECK_INTERVAL = 2.0 # Check every 2 seconds
         self.AUTO_MERGE_THRESHOLD = 0.85 # Very high similarity required to auto-merge
+        
+        self.cross_camera_matcher = CrossCameraMatcher()
         
         logger.info("Identity Verifier initialized.")
 
@@ -177,7 +180,7 @@ class IdentityVerifier:
     def check_redundant_identities(self, person_manager, camera_nodes):
         """
         Scans ALL currently active PIDs across ALL cameras to see if any two represent the same person.
-        Uses Multi-Vector comparison: If ANY vector of P1 matches ANY vector of P2 > Threshold, merge.
+        Uses Multi-Vector comparison AND Spatial Consistency.
         """
         now = time.time()
         if (now - self.last_redundancy_check) < self.REDUNDANCY_CHECK_INTERVAL:
@@ -185,12 +188,16 @@ class IdentityVerifier:
 
         self.last_redundancy_check = now
         
-        # 1. Collect ALL active PIDs from ALL cameras
-        all_active_pids = set()
+        # 1. Collect ALL active PIDs from ALL cameras AND map them to their source nodes
+        active_pids = []
+        pid_to_node = {} # {pid: CameraNode} - stores the FIRST node seen (sufficient for pair check)
+
         for node in camera_nodes:
-            all_active_pids.update(node.buffer_manager.track_id_to_permanent_id_map.values())
-        
-        active_pids = list(all_active_pids)
+            pids_in_node = list(node.buffer_manager.track_id_to_permanent_id_map.values())
+            for pid in pids_in_node:
+                if pid not in pid_to_node:
+                    pid_to_node[pid] = node
+                    active_pids.append(pid)
         
         # If less than 2 people, no merge possible
         if len(active_pids) < 2:
@@ -199,19 +206,17 @@ class IdentityVerifier:
         # 2. Compare every pair
         merge_pair = None
         best_sim = -1.0
+        reason = ""
 
         for i in range(len(active_pids)):
             pid_a = active_pids[i]
             if pid_a not in person_manager.known_persons_db: continue
             
-            # Skip old identities to avoid processing huge history? 
-            # Or skip if recently created? Config logic: MERGE_MAX_AGE_SECONDS checks if it's "fresh" enough to likely be a dupe.
             data_a = person_manager.known_persons_db[pid_a]
-            if "created" in data_a:
-                age_a = (datetime.now() - data_a["created"]).total_seconds()
-                if age_a > Config.MERGE_MAX_AGE_SECONDS:
-                    continue
-
+            # Age check...
+            if "created" in data_a and (datetime.now() - data_a["created"]).total_seconds() > Config.MERGE_MAX_AGE_SECONDS:
+                continue
+            
             vectors_a = data_a.get("vectors")
             if not vectors_a: continue
 
@@ -220,40 +225,65 @@ class IdentityVerifier:
                 if pid_b not in person_manager.known_persons_db: continue
                 
                 data_b = person_manager.known_persons_db[pid_b]
-                if "created" in data_b:
-                    age_b = (datetime.now() - data_b["created"]).total_seconds()
-                    if age_b > Config.MERGE_MAX_AGE_SECONDS:
-                        continue
+                # Age check...
+                if "created" in data_b and (datetime.now() - data_b["created"]).total_seconds() > Config.MERGE_MAX_AGE_SECONDS:
+                    continue
 
                 vectors_b = data_b.get("vectors")
                 if not vectors_b: continue
 
-                # --- Multi-Vector Similarity Check (Vectorized) ---
-                # Convert lists to numpy arrays for matrix multiplication
-                # Ensure float32 for performance
+                # --- A. Re-ID Similarity ---
                 mat_a = np.array(vectors_a, dtype=np.float32) 
                 mat_b = np.array(vectors_b, dtype=np.float32)
-                
-                # Compute all pairs similarity: (Na, Nb)
                 sim_matrix = np.dot(mat_a, mat_b.T)
+                visual_sim = np.max(sim_matrix)
                 
-                # Find the maximum similarity in the matrix
-                pair_max_sim = np.max(sim_matrix)
+                # --- B. Spatial Similarity ---
+                spatial_score = 0.0
+                node_a = pid_to_node[pid_a]
+                node_b = pid_to_node[pid_b]
                 
-                if pair_max_sim > self.AUTO_MERGE_THRESHOLD:
-                    if pair_max_sim > best_sim:
-                        best_sim = pair_max_sim
+                # Only check spatial if cameras are different
+                if node_a.camera_id != node_b.camera_id:
+                    box_a = node_a.buffer_manager.last_known_box_for_pid.get(pid_a)
+                    box_b = node_b.buffer_manager.last_known_box_for_pid.get(pid_b)
+                    
+                    if box_a and box_b:
+                        spatial_score = self.cross_camera_matcher.calculate_spatial_score(
+                            node_a.camera_id, box_a,
+                            node_b.camera_id, box_b
+                        )
+                
+                # --- C. Combined Score ---
+                # SAFETY: If they look completely different (e.g. < 60% similarity), 
+                # ignore spatial match. This prevents merging people walking behind each other
+                # (where projection might land in box) but wearing different clothes.
+                if visual_sim < 0.60:
+                    spatial_score = 0.0
+
+                final_score = visual_sim
+                current_reason = "Visual"
+                
+                if spatial_score > 0.01:
+                    w = Config.SPATIAL_MERGE_SCORE_WEIGHT
+                    # Weighted blend: ReID is base, Spatial boosts/penalizes
+                    # Actually, if spatial is high, we want to allow merge even if visual is lower.
+                    final_score = (visual_sim * (1.0 - w)) + (spatial_score * w)
+                    current_reason = f"Hybrid (Vis:{visual_sim:.2f}, Spat:{spatial_score:.2f})"
+
+                if final_score > self.AUTO_MERGE_THRESHOLD:
+                    if final_score > best_sim:
+                        best_sim = final_score
                         merge_pair = (pid_a, pid_b)
+                        reason = current_reason
 
         # 3. Execute Merge if found
         if merge_pair:
             pid_keep, pid_drop = merge_pair
-            # Convention: keep the smaller ID (older one) usually, or merge into the more robust one.
-            # Here keeping smaller ID for stability.
             if pid_keep > pid_drop:
                 pid_keep, pid_drop = pid_drop, pid_keep
                 
-            logger.info(f"AUTO-MERGE: Detected P{pid_keep} and P{pid_drop} are the same (Sim: {best_sim:.2f}). Merging...")
+            logger.info(f"AUTO-MERGE: P{pid_keep} & P{pid_drop} merged. Score: {best_sim:.2f} [{reason}]")
             
             # A. Merge in Database
             person_manager.merge_identities(keep_pid=pid_keep, drop_pid=pid_drop)
@@ -264,7 +294,6 @@ class IdentityVerifier:
                 for tid, pid in list(bm.track_id_to_permanent_id_map.items()):
                     if pid == pid_drop:
                         bm.track_id_to_permanent_id_map[tid] = pid_keep
-                        # Also update locks if any
                         if pid_drop in bm.last_known_box_for_pid:
                              bm.last_known_box_for_pid[pid_keep] = bm.last_known_box_for_pid.pop(pid_drop)
                         
