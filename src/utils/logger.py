@@ -1,5 +1,6 @@
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from utils.config import Config
@@ -40,7 +41,17 @@ class Logger:
             log_dir = Config.LOG_DIR
             log_dir.mkdir(parents=True, exist_ok=True)
             
-            file_path = log_dir / Config.LOG_FILE_NAME
+            # Generate unique filename with timestamp
+            base_name = Config.LOG_FILE_NAME
+            if "." in base_name:
+                stem, ext = base_name.rsplit(".", 1)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                new_name = f"{stem}_{timestamp}.{ext}"
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                new_name = f"{base_name}_{timestamp}.log"
+
+            file_path = log_dir / new_name
             
             # Max 5MB per file, keep last 3 backups
             file_handler = RotatingFileHandler(
