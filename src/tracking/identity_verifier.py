@@ -255,19 +255,29 @@ class IdentityVerifier:
                         )
                 
                 # --- C. Combined Score ---
-                # SAFETY: If they look completely different (e.g. < 60% similarity), 
-                # ignore spatial match. This prevents merging people walking behind each other
-                # (where projection might land in box) but wearing different clothes.
-                if visual_sim < 0.60:
-                    spatial_score = 0.0
-
+                
                 final_score = visual_sim
                 current_reason = "Visual"
                 
-                if spatial_score > 0.01:
+                # --- STRATEGY: Spatial Dominance ---
+                # Use the powerful homography projection from CrossCameraMatcher.
+                # If spatial_score is high (>0.8), it means the person is physically at the EXACT same location.
+                
+                if spatial_score > 0.80 and visual_sim > 0.60:
+                    # STRONG SPATIAL MATCH
+                    # Even if visual similarity is mediocre (e.g. 0.60 due to lighting/pose),
+                    # we trust the physics (homography).
+                    final_score = 0.96 # Force above AUTO_MERGE_THRESHOLD (0.85)
+                    current_reason = f"Spatial-Dominant (Vis:{visual_sim:.2f}, Spat:{spatial_score:.2f})"
+                
+                elif spatial_score > 0.01:
+                    # Standard Weighted Blend
+                    # If visual is very low (<0.50), ignore spatial to prevent merging unrelated people 
+                    # who just happen to overlap in 2D projection (occlusion).
+                    if visual_sim < 0.50:
+                        spatial_score = 0.0
+                    
                     w = Config.SPATIAL_MERGE_SCORE_WEIGHT
-                    # Weighted blend: ReID is base, Spatial boosts/penalizes
-                    # Actually, if spatial is high, we want to allow merge even if visual is lower.
                     final_score = (visual_sim * (1.0 - w)) + (spatial_score * w)
                     current_reason = f"Hybrid (Vis:{visual_sim:.2f}, Spat:{spatial_score:.2f})"
 
@@ -285,6 +295,35 @@ class IdentityVerifier:
                 
             logger.info(f"AUTO-MERGE: P{pid_keep} & P{pid_drop} merged. Score: {best_sim:.2f} [{reason}]")
             
+            # --- PRE-MERGE CONFLICT RESOLUTION ---
+            # Scenario: We matched P3 (Cam A) with P4 (Cam B) spatially. So P4 is the REAL P3.
+            # But what if Cam B already has a "P3" (Imposter/Error)?
+            # If we just convert P4->P3, Cam B will have TWO P3s.
+            # We must REVOKE the ID of the 'existing' P3 in any camera that also holds P4.
+            
+            for node in camera_nodes:
+                bm = node.buffer_manager
+                
+                # Check if this camera holds the ID we are about to change (pid_drop)
+                has_drop_id = False
+                active_pids = list(bm.track_id_to_permanent_id_map.values())
+                if pid_drop in active_pids:
+                    has_drop_id = True
+                
+                if has_drop_id:
+                    # If this camera holds pid_drop, it MUST NOT also hold pid_keep.
+                    # If it does, that pid_keep is an imposter.
+                    imposter_tracks = []
+                    for tid, pid in bm.track_id_to_permanent_id_map.items():
+                        if pid == pid_keep:
+                            imposter_tracks.append(tid)
+                    
+                    for tid in imposter_tracks:
+                        logger.warning(f"CONFLICT RESOLUTION: [Cam {node.camera_id}] Track T{tid} was labeled P{pid_keep}, but P{pid_drop} is verified as P{pid_keep}. Revoking T{tid} (Imposter).")
+                        del bm.track_id_to_permanent_id_map[tid]
+                        # Force re-verification logic to reset for this track
+                        self.clear_state_for_track(tid)
+
             # A. Merge in Database
             person_manager.merge_identities(keep_pid=pid_keep, drop_pid=pid_drop)
             
