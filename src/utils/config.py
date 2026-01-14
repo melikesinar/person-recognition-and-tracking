@@ -25,7 +25,7 @@ class Config:
 
     # --- Detection & Matching Thresholds ---
     DETECTION_SCORE_THRESHOLD = 0.55
-    MATCH_SIMILARITY_THRESHOLD = 0.83
+    MATCH_SIMILARITY_THRESHOLD = 0.85
     
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 30
@@ -49,17 +49,14 @@ class Config:
 
     # --- Identity Verification / Self-Correction ---
     ID_VERIFICATION_INTERVAL = 2  # Check every 2 frames
-    ID_SWITCH_THRESHOLD_MARGIN = 0.05
+    ID_SWITCH_THRESHOLD_MARGIN = 0.04
     ID_SWITCH_CONFIRMATION_THRESHOLD = 3  # Number of consistent matches required to switch ID
     ID_SWITCH_COUNTER_TTL_SECONDS = 10.0  # Reset counter if no confirmation within this duration
     ID_SWITCH_COOLDOWN = 5.0 # Seconds to lock ID after a switch
     ID_DROP_THRESHOLD = 0.55 # Revocation logic
 
-    # Threshold for merging during enrollment (High = Strict, only merge if very sure)
-    ENROLLMENT_MERGE_THRESHOLD = 0.85
-    
     # Maximum age (in seconds) of an ID to be considered for Auto-Merge.
-    MERGE_MAX_AGE_SECONDS = 10.0
+    MERGE_MAX_AGE_SECONDS = 20.0
 
     # ImageNet normalization (for pretrained models)
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -91,8 +88,12 @@ class Config:
     # Use a tool like 'opencv_calibration' to find these. 
     # Below is a PLACEHOLDER example (Identity matrix = no transform).
     CAMERA_HOMOGRAPHIES = {
-        '0-1': [[-3.37740978, -13.69568251, 1636.08526081], [-0.38661487, -2.99709581, -418.04782040], [-0.02070525, -0.02173024, 1.00000000]]
-        # '0-1': [[7.27268679, 10.99178752, 9.70421588], [0.83555118, 3.29873005, 83.86414115], [0.00328687, 0.00630426, 1.00000000]],
+        # '0-1': [[8.67880128, 45.28411211, -5167.53237445], [-2.20867665, 7.96352372, 2044.28289896], [0.04583942, 0.05740988, 1.00000000]],
+        # room videos
+        # '0-1': [[-0.78447575, -10.85648451, 1760.79567792], [-0.26645472, -1.73492810, 81.34685166], [-0.00401496, -0.01035841, 1.00000000]],
+        # campus videos
+        '0-1': [[3.26182811, 6.25747138, 574.22413335], [0.33626874, 1.86404089, 155.63783026], [0.00122571, 0.00351370, 1.00000000]],
+        # corridor
     }
 
     # --- Faiss Index Parameters ---
@@ -139,12 +140,15 @@ class Config:
     # --- Video Source ---
     VIDEO_SOURCES = [
         # 0,
-        # str(BASE_DIR / "videos" / "3.mp4"),
-        # str(BASE_DIR / "videos" / "1.mp4")
-        str(BASE_DIR / "videos" / "multi-angle" / "4p-c0.avi"),
-        str(BASE_DIR / "videos" / "multi-angle" / "4p-c1.avi"),
-        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c2.avi"),
-        # str(BASE_DIR / "videos" / "multi-angle" / "4p-c3.avi")
+
+        str(BASE_DIR / "videos" / "3.mp4"),
+        str(BASE_DIR / "videos" / "1.mp4")
+
+        # str(BASE_DIR / "videos" / "room" / "4p-c0.avi"),
+        # str(BASE_DIR / "videos" / "room" / "4p-c1.avi")
+
+        # str(BASE_DIR / "videos" / "campus" / "campus4-c0.avi"),
+        # str(BASE_DIR / "videos" / "campus" / "campus4-c1.avi")
     ]
 
     # --- Logging Configuration ---
