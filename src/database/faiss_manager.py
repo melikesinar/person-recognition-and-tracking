@@ -188,7 +188,8 @@ class FaissManager:
 
     def search(self, query_vector, threshold):
         """
-        Performs thread-safe similarity search.
+        Performs thread-safe similarity search using Voting (k-NN) strategy.
+        Fetches Top-5 matches and votes for the most frequent PID.
 
         Args:
             query_vector (np.ndarray): Query feature vector
@@ -206,16 +207,54 @@ class FaissManager:
             return None, -1.0
 
         try:
-            # Faiss search releases the GIL internally, so this part is parallel-friendly
+            # Faiss search releases the GIL internally
             query_vector_2d = query_vector.reshape(1, -1).astype('float32')
-            distances, indices = index_ref.search(query_vector_2d, k=1)
-            best_similarity = distances[0][0]
+            
+            # Retrieve Top-5 candidates for robustness
+            k_neighbors = 5
+            distances, indices = index_ref.search(query_vector_2d, k=k_neighbors)
+            
+            candidates = {} # {pid: {'votes': 0, 'max_score': 0.0}}
 
-            if best_similarity >= threshold:
-                matched_index_pos = indices[0][0]
-                if 0 <= matched_index_pos < len(pid_map_ref):
-                    matched_pid = pid_map_ref[matched_index_pos]
-                    return matched_pid, best_similarity
+            # Iterate through the k results
+            for i in range(k_neighbors):
+                score = distances[0][i]
+                idx = indices[0][i]
+                
+                # Basic threshold filter
+                if score < threshold:
+                    continue
+                
+                # Map index to PID
+                if 0 <= idx < len(pid_map_ref):
+                    pid = pid_map_ref[idx]
+                    
+                    if pid not in candidates:
+                        candidates[pid] = {'votes': 0, 'max_score': -1.0}
+                    
+                    candidates[pid]['votes'] += 1
+                    if score > candidates[pid]['max_score']:
+                        candidates[pid]['max_score'] = score
+
+            if not candidates:
+                return None, -1.0
+
+            # Sort candidates: 
+            # 1. By Votes (Descending) - Safety in numbers
+            # 2. By Max Score (Descending) - Tie-breaker
+            sorted_candidates = sorted(
+                candidates.items(), 
+                key=lambda item: (item[1]['votes'], item[1]['max_score']), 
+                reverse=True
+            )
+
+            winner_pid, stats = sorted_candidates[0]
+            
+            # Optional: Require strictly > 1 vote if the gallery is large? 
+            # For now, strict voting sort is sufficient.
+            
+            return winner_pid, stats['max_score']
+
         except Exception as e:
             logger.error(f"FAISS SEARCH ERROR: {e}")
 
