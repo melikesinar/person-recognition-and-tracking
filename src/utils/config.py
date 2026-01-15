@@ -27,6 +27,14 @@ class Config:
     DETECTION_SCORE_THRESHOLD = 0.55
     MATCH_SIMILARITY_THRESHOLD = 0.85
     
+    # --- Strict Re-Entry Logic (To prevent Imposters) ---
+    REENTRY_SIMILARITY_THRESHOLD = 0.88 
+    
+    # --- Visual Guard (Identity Theft Prevention) ---
+    # If a tracked person suddenly stops looking like themselves (e.g. crossing another person),
+    # drop the ID immediately.
+    TRACK_VALIDATION_THRESHOLD = 0.60
+    
     # --- Enrollment Parameters ---
     MIN_ENROLL_FRAMES = 30
     MIN_BBOX_AREA_ENROLL = 5000
@@ -88,12 +96,12 @@ class Config:
     # Use a tool like 'opencv_calibration' to find these. 
     # Below is a PLACEHOLDER example (Identity matrix = no transform).
     CAMERA_HOMOGRAPHIES = {
-        # '0-1': [[8.67880128, 45.28411211, -5167.53237445], [-2.20867665, 7.96352372, 2044.28289896], [0.04583942, 0.05740988, 1.00000000]],
+        '0-1': [[8.67880128, 45.28411211, -5167.53237445], [-2.20867665, 7.96352372, 2044.28289896], [0.04583942, 0.05740988, 1.00000000]],
         # room videos
         # '0-1': [[-0.78447575, -10.85648451, 1760.79567792], [-0.26645472, -1.73492810, 81.34685166], [-0.00401496, -0.01035841, 1.00000000]],
-        # campus videos
-        '0-1': [[3.26182811, 6.25747138, 574.22413335], [0.33626874, 1.86404089, 155.63783026], [0.00122571, 0.00351370, 1.00000000]],
-        # corridor
+        # # campus videos
+        # '0-1': [[3.26182811, 6.25747138, 574.22413335], [0.33626874, 1.86404089, 155.63783026], [0.00122571, 0.00351370, 1.00000000]],
+        # # corridor
     }
 
     # --- Faiss Index Parameters ---
@@ -141,11 +149,11 @@ class Config:
     VIDEO_SOURCES = [
         # 0,
 
-        str(BASE_DIR / "videos" / "3.mp4"),
-        str(BASE_DIR / "videos" / "1.mp4")
+        # str(BASE_DIR / "videos" / "3.mp4"),
+        # str(BASE_DIR / "videos" / "1.mp4")
 
-        # str(BASE_DIR / "videos" / "room" / "4p-c0.avi"),
-        # str(BASE_DIR / "videos" / "room" / "4p-c1.avi")
+        str(BASE_DIR / "videos" / "room" / "4p-c0.avi"),
+        str(BASE_DIR / "videos" / "room" / "4p-c1.avi")
 
         # str(BASE_DIR / "videos" / "campus" / "campus4-c0.avi"),
         # str(BASE_DIR / "videos" / "campus" / "campus4-c1.avi")
