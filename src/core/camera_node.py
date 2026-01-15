@@ -143,13 +143,36 @@ class CameraNode:
             
             # --- Logic Branching ---
             if pid:
-                # Case A: Already Assigned
-                self._handle_existing_track(pid, vector, is_occluded)
-                if vector is None:
-                    label, color = f"P{pid} (Low Q)", (100, 255, 100)
-                else:
-                    label, color = f"P{pid}", (0, 255, 0)
-            else:
+                # Case A: Already Assigned -> Verify Validity First! (Visual Guard)
+                is_valid_assignment = True
+                
+                if vector is not None:
+                    person_data = self.resources['person_manager'].known_persons_db.get(pid)
+                    if person_data and "vectors" in person_data:
+                        # Check similarity against known gallery
+                        gallery = person_data["vectors"]
+                        if gallery:
+                            # Stack for fast dot product
+                            gallery_mat = np.stack(gallery, axis=0)
+                            sims = np.dot(gallery_mat, vector)
+                            max_sim = np.max(sims)
+                            
+                            # If similarity drops too low, the tracker likely switched targets (ID Theft)
+                            if max_sim < Config.TRACK_VALIDATION_THRESHOLD:
+                                logger.warning(f"VISUAL GUARD: T{track_id} revoked from P{pid}. Sim ({max_sim:.2f}) < Threshold. Possible ID Theft/Swap.")
+                                del self.buffer_manager.track_id_to_permanent_id_map[track_id]
+                                pid = None # Treat as unknown
+                                is_valid_assignment = False
+
+                if is_valid_assignment:
+                    self._handle_existing_track(pid, vector, is_occluded)
+                    if vector is None:
+                        label, color = f"P{pid} (Low Q)", (100, 255, 100)
+                    else:
+                        label, color = f"P{pid}", (0, 255, 0)
+            
+            # Note: We use 'if not pid' here so that if the guard revoked it above, we fall into Case B immediately.
+            if not pid:
                 # Case B: Unassigned -> Try Match or Enroll
                 pid, source = self._attempt_match_or_enroll(
                     track_id, box, vector, crop, is_occluded, used_pids, frame.shape
@@ -223,10 +246,15 @@ class CameraNode:
 
         # 2. ReID Match (Global search)
         if vector is not None:
-            match_id, _ = self.resources['faiss_manager'].search(
-                vector, self.resources['match_threshold']
+            # STRICTER threshold for Re-Entry/New Tracks to prevent False Positives
+            reentry_threshold = Config.REENTRY_SIMILARITY_THRESHOLD
+            
+            match_id, score = self.resources['faiss_manager'].search(
+                vector, reentry_threshold
             )
+            
             if match_id and match_id not in used_pids:
+                # logger.debug(f"ReID Match: T{track_id} -> P{match_id} (Score: {score:.2f} > {reentry_threshold})")
                 return match_id, "reid"
             
             # 3. Enrollment (New Identity)
