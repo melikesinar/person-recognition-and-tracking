@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from utils.config import Config
 from utils.math_utils import l2_normalize
 from utils.logger import get_logger
+from core.appearance_cues import PART_NAMES, PartCues
 
 logger = get_logger()
 
@@ -37,13 +38,14 @@ class PersonManager:
         """Set the next available permanent ID."""
         self.next_permanent_id = next_id
 
-    def enroll_person(self, vectors: List[np.ndarray]) -> int:
+    def enroll_person(self, vectors: List[np.ndarray], cues: Optional[List[PartCues]] = None) -> int:
         """
         Enrolls a new person with a unique Permanent ID.
         Initializes the gallery with a representative vector from the batch.
 
         Args:
             vectors (list): List of feature vectors for the person
+            cues (list): Part colour cues observed during enrollment (optional)
 
         Returns:
             int: Newly assigned Permanent ID (P-ID)
@@ -78,8 +80,11 @@ class PersonManager:
         # Add to local cache
         self.known_persons_db[new_pid] = {
             "vectors": gallery_vectors,
+            "cues": [],
             "created": current_dt
         }
+        for c in cues or []:
+            self.add_cues(new_pid, c)
 
         logger.info(f"CACHE ADD: P{new_pid} added to cache.")
         self.next_permanent_id += 1
@@ -172,6 +177,40 @@ class PersonManager:
 
         self.vector_index.set_person(perm_id, gallery)
 
+    # ------------------------------------------------------------------ colour cue gallery
+
+    def add_cues(self, pid: int, cues: Optional[PartCues]):
+        """
+        Stores one observation's part colour cues for a person (memory only).
+        Kept as a rolling window of the most recent CUE_GALLERY_SIZE samples: clothing
+        colour under different cameras/lighting is captured as the person moves.
+        """
+        entry = self.known_persons_db.get(pid)
+        if entry is None or cues is None or not cues.available():
+            return
+        gallery = entry.setdefault("cues", [])
+        gallery.append(cues)
+        if len(gallery) > Config.CUE_GALLERY_SIZE:
+            gallery.pop(0)
+
+    def part_similarities(self, pid: int, query: List[PartCues]) -> Dict[str, float]:
+        """
+        Best colour similarity per body part between any of the query observations
+        and any stored observation of the person. Parts never seen on both sides
+        are absent from the result (and therefore ignored by the fusion).
+        """
+        entry = self.known_persons_db.get(pid)
+        stored = entry.get("cues") if entry else None
+        if not stored or not query:
+            return {}
+        best: Dict[str, float] = {}
+        for name in PART_NAMES:
+            q = [c.parts[name] for c in query if c.parts.get(name) is not None]
+            g = [c.parts[name] for c in stored if c.parts.get(name) is not None]
+            if q and g:
+                best[name] = float(np.max(np.stack(q) @ np.stack(g).T))
+        return best
+
     def merge_identities(self, keep_pid: int, drop_pid: int):
         """
         Merges two identities. Combines their galleries.
@@ -212,6 +251,7 @@ class PersonManager:
         
         # Update keep_pid
         keep_data["vectors"] = combined_gallery
+        keep_data["cues"] = (keep_data.get("cues", []) + drop_data.get("cues", []))[-Config.CUE_GALLERY_SIZE:]
         
         mongo_update_doc = {
             "$set": {

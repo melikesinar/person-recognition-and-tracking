@@ -140,7 +140,7 @@ class HomographyCalibrator:
                 print("\n" + "="*40)
                 print("SUCCESS! Calculated Homography Matrix:")
                 print("="*40)
-                print("\nCopy the following block into src/utils/config.py inside CAMERA_HOMOGRAPHIES:\n")
+                print("\nCopy the following line under the `homographies:` key of your cameras YAML file (config/cameras*.yaml):\n")
                 
                 # Format as Python List of Lists
                 matrix_str = "["
@@ -149,7 +149,7 @@ class HomographyCalibrator:
                     if i < 2: matrix_str += ", "
                 matrix_str += "]"
                 
-                print(f"'{self.id1}-{self.id2}': {matrix_str},")
+                print(f'  "{self.id1}-{self.id2}": {matrix_str}')
                 print("\n" + "="*40 + "\n")
                 
                 # Visualize Verification (Warp Image 1 to Image 2)
