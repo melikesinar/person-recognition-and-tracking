@@ -1,19 +1,22 @@
 # Çoklu Kamera Kişi Tanıma ve Takip Sistemi (Multi-Camera Person Recognition & Tracking System)
 
-Bu proje, birden fazla kamera akışını kullanarak kişileri tespit eden, takip eden ve kimliklerini (Re-Identification) veritabanında saklayan gelişmiş bir bilgisayarlı görü sistemidir. YOLOv8, OSNet ve Faiss gibi modern teknolojileri kullanarak gerçek zamanlıya yakın performans sunar.
+Bu proje, birden fazla kamera akışında kişileri tespit eden, takip eden ve bir kameradan çıkıp başka bir kamerada görünen kişiyi **aynı kişi olarak yeniden tanıyan** (Re-Identification) bir bilgisayarlı görü sistemidir. Amaç kişinin kim olduğunu bulmak değil, anonim bir numara (P1, P2, ...) ile kameralar arasında takip etmektir. YOLOv8 ve OSNet kullanır; GPU olmadan, CPU üzerinde çalışacak şekilde optimize edilmiştir.
+
+> Bu proje, Mustafa Aykut'un geliştirdiği [person-recognition-and-tracking](https://github.com/MustafaAykut77/person-recognition-and-tracking) çalışmasının üzerine geliştirilmektedir.
 
 ## Temel Özellikler
 
-*   **Çoklu Kamera Desteği:** Birden fazla video kaynağından (IP kamera, video dosyası vb.) eş zamanlı görüntü işleme.
+*   **Çoklu Kamera Desteği:** Kamera sayısı sınırsızdır; kameralar `config/cameras.yaml` dosyasından okunur (webcam, video dosyası, IP/RTSP akışı). Her kamera kendi thread'inde okunur.
 *   **Gelişmiş Tespit (Detection):** `YOLOv8` modeli ile yüksek doğrulukta insan tespiti.
-*   **Kişi Takibi (Tracking):** `BoxMOT` (BoostTrack) kütüphanesi ile kararlı nesne takibi.
+*   **Kişi Takibi (Tracking):** `BoxMOT` (BoostTrack) ile hareket tabanlı (Kalman + IoU) kare kare takip.
 *   **Kimlik Yeniden Tanımlama (Re-ID):** `OSNet` mimarisi ile kişilerin farklı kameralarda veya zamanlarda tekrar görüldüğünde tanınması.
-*   **Vektör Arama:** `Faiss` (Facebook AI Similarity Search) kütüphanesi ile milyonlarca vektör arasında milisaniyeler içinde benzerlik araması.
-*   **Kalıcı Veritabanı:** Tespit edilen kişilerin özellikleri ve kimlik bilgileri `MongoDB` üzerinde saklanır.
+*   **Vektör Arama:** Bellekte tutulan, her değişiklikte anında güncellenen tam (exact) benzerlik araması (`VectorIndex`).
+*   **İsteğe Bağlı Veritabanı:** `MONGO_URI` tanımlıysa kimlik vektörleri `MongoDB`'de saklanır; tanımlı değilse veya MongoDB'ye ulaşılamazsa sistem bellek modunda çalışır.
 *   **Akıllı Galeri Yönetimi:** Her kişi için birden fazla açıdan (ön, arka, yan) özellik vektörü saklayarak tanıma başarımını artırır (Multi-Vector Gallery).
 *   **Test-Time Augmentation (TTA):** Re-ID çıkarımı sırasında görüntü iyileştirme teknikleri ile daha sağlam özellik vektörleri.
 *   **Mekansal Eşleştirme (Spatial Matching):** Homografi matrisleri kullanarak kameralar arası geçişlerde fiziksel konuma dayalı doğrulama.
-*   **Asenkron Mimari:** Tespit, veritabanı yazma ve görselleştirme işlemlerinin ayrıştırılmasıyla yüksek FPS.
+*   **CPU Optimizasyonu:** Kamera başına ayarlanabilir işleme hızı, tek paylaşılan ReID modeli, ihtiyaç halinde ReID hesaplama, TorchScript ve denormal düzeltmesi.
+*   **Değerlendirme Aracı:** `tools/eval_reid.py` ile Market-1501 üzerinde Rank-1 / mAP ölçümü.
 
 ## Sistem Mimarisi
 
@@ -21,7 +24,7 @@ Sistem modüler bir yapıya sahiptir:
 1.  **Detector Worker (Process):** Ana işlemden bağımsız çalışır. Görüntü karelerini alır ve YOLOv8 ile insanları tespit eder.
 2.  **Camera Nodes:** Her bir kamera akışını yönetir, görüntüleri okur ve takip (tracking) işlemini başlatır.
 3.  **ReID Extractor:** Tespit edilen kişilerin görüntülerini alır, ön işlemden geçirir (CLAHE, Resize) ve OSNet modeli ile 512 boyutlu öznitelik vektörüne çevirir.
-4.  **Person Manager & Faiss:** Çıkarılan vektörleri veritabanındaki mevcut kişilerle karşılaştırır. Eşleşme varsa kimliği doğrular, yoksa yeni bir kişi kaydı oluşturur.
+4.  **Person Manager & VectorIndex:** Çıkarılan vektörleri veritabanındaki mevcut kişilerle karşılaştırır. Eşleşme varsa kimliği doğrular, yoksa yeni bir kişi kaydı oluşturur.
 5.  **MongoDB & Async Writer:** Veri yazma işlemleri ana döngüyü bloklamamak için arka planda asenkron olarak yapılır.
 
 ## Gereksinimler
@@ -31,7 +34,7 @@ Sistem modüler bir yapıya sahiptir:
 *   **Donanım:**
     *   CUDA destekli NVIDIA GPU (Önerilen: 6GB+ VRAM)
     *   CPU (Yalnızca CPU modunda çalışabilir ancak yavaştır)
-*   **Veritabanı:** MongoDB (Yerel veya Bulut)
+*   **Veritabanı (isteğe bağlı):** MongoDB (Yerel veya Bulut)
 
 ## Kurulum
 
@@ -68,14 +71,23 @@ Sistem modüler bir yapıya sahiptir:
     MONGO_URI=mongodb://localhost:27017/
     DB_NAME=person_tracking_db
     COLLECTION=persons
-    FAISS_COLLECTION=faiss_index
     ```
+    `MONGO_URI` boş bırakılırsa sistem veritabanı olmadan (bellek modunda) çalışır.
 
 ## Yapılandırma
 
-Tüm ayarlar `src/utils/config.py` dosyasında bulunur. Önemli parametreler:
+Kameralar `config/cameras.yaml` dosyasında tanımlanır (örnek: `config/cameras.epfl-room.yaml`):
 
-*   **VIDEO_SOURCES:** İzlenecek video dosyalarının yolları veya kamera ID'leri (0, 1...).
+```yaml
+process_fps: 6          # her kamera saniyede kaç kare işlensin
+cameras:
+  - {id: 0, name: laptop,  source: 0}
+  - {id: 1, name: telefon, source: http://192.168.1.20:8080/video}
+  - {id: 2, name: koridor, source: videos/koridor.mp4}
+```
+
+Diğer ayarlar `src/utils/config.py` dosyasındadır. Önemli parametreler:
+
 *   **DETECTION_SCORE_THRESHOLD:** Tespit için minimum güven skoru (Örn: 0.55).
 *   **MATCH_SIMILARITY_THRESHOLD:** İki kişinin aynı sayılması için gereken minimum benzerlik (Örn: 0.85).
 *   **REID_MODEL_PATH:** Kullanılacak ReID modelinin yolu.
@@ -86,7 +98,15 @@ Tüm ayarlar `src/utils/config.py` dosyasında bulunur. Önemli parametreler:
 Sistemi başlatmak için ana modülü çalıştırın:
 
 ```bash
-python src/__main__.py
+python src/__main__.py                                             # config/cameras.yaml
+python src/__main__.py --cameras config/cameras.epfl-room.yaml     # başka bir kamera dosyası
+python src/__main__.py --headless --max-seconds 60                 # ekransız test çalıştırması
+```
+
+ReID doğruluğunu ölçmek için (Market-1501 veri seti gerekir):
+
+```bash
+python tools/eval_reid.py --data <Market-1501 klasörü> --num-ids 200
 ```
 
 ### Klavye Kısayolları (Çalışma Esnasında)
@@ -107,13 +127,14 @@ person_recognition_and_tracking/
 ├── src/
 │   ├── __main__.py          # Ana giriş noktası (Orchestrator)
 │   ├── core/                # Çekirdek Yapay Zeka Modülleri
+│   │   ├── camera_stream.py # Kamera okuyucu (kamera başına thread)
 │   │   ├── detector.py      # YOLOv8 Worker Process
-│   │   ├── reid_extractor.py# OSNet Özellik Çıkarıcı
+│   │   ├── reid_extractor.py# OSNet Özellik Çıkarıcı (tek, paylaşılan)
 │   │   ├── camera_node.py   # Tekil Kamera İşleyicisi
 │   │   └── quality_checker.py # Görüntü Kalite Kontrolü
 │   ├── database/            # Veri Katmanı
-│   │   ├── mongo_handler.py # MongoDB Bağlantısı
-│   │   ├── faiss_manager.py # Faiss Vektör İndeksi Yönetimi
+│   │   ├── vector_index.py  # Bellek içi vektör arama
+│   │   ├── mongo_handler.py # MongoDB Bağlantısı (isteğe bağlı)
 │   │   └── async_writer.py  # Arka Plan Yazma Kuyruğu
 │   ├── tracking/            # Takip ve Mantık Katmanı
 │   │   ├── person_manager.py # Kişi Yönetimi ve Eşleştirme Mantığı
@@ -122,8 +143,11 @@ person_recognition_and_tracking/
 │   └── utils/               # Yardımcı Araçlar
 │       ├── config.py        # Merkezi Konfigürasyon
 │       └── logger.py        # Loglama Yapısı
+├── config/
+│   └── cameras.yaml         # Kamera tanımları
 └── tools/
-    └── calibrate_homography.py # Kamera kalibrasyon aracı
+    ├── calibrate_homography.py # Kamera kalibrasyon aracı
+    └── eval_reid.py         # ReID doğruluk ölçümü (Market-1501)
 ```
 
 ## Modül Detayları
@@ -133,11 +157,11 @@ person_recognition_and_tracking/
 *   **ReidExtractor:** `BoxMOT` kütüphanesinin sağladığı modelleri kullanarak, algılanan kişilerden 512 boyutlu vektörler üretir. Parlaklık dengeleme (CLAHE) ve kırpma işlemleri burada yapılır.
 
 ### Database (Veritabanı)
-*   **FaissManager:** `HNSW` (Hierarchical Navigable Small World) indeksi kullanır. Bu, büyük veri setlerinde bile çok hızlı "en yakın komşu" araması sağlar. İndeks bellekte tutulur ve periyodik olarak diske/DB'ye yedeklenir.
+*   **VectorIndex:** Tüm kişilerin galeri vektörlerini bellekte tutar ve tam (exact) kosinüs benzerliği ile k-NN oylamalı arama yapar. Her kayıt/güncelleme bir sonraki aramada hemen görünür.
 *   **AsyncWriter:** Veritabanına yazma işlemleri disk I/O gerektirdiği için yavaştır. Bu modül, yazılacak verileri bir kuyruğa alır ve ayrı bir thread'de işleyerek FPS düşüşünü engeller.
 
 ### Tracking (Takip)
-*   **PersonManager:** Sistemin beynidir. Yeni gelen tespitlerin veritabanındaki kişilerle eşleşip eşleşmediğine karar verir. `Faiss`'ten gelen adayları ve mekansal bilgileri birleştirir.
+*   **PersonManager:** Sistemin beynidir. Yeni gelen tespitlerin veritabanındaki kişilerle eşleşip eşleşmediğine karar verir. `VectorIndex`'ten gelen adayları ve mekansal bilgileri birleştirir.
 *   **SpatialMatcher:** Kameralar arasındaki perspektif farkını (Homography) kullanarak, bir kameradaki kişinin diğer kamerada nerede olması gerektiğini tahmin eder. Görsel benzerlik yetersiz kaldığında (örn. kıyafet değişimi zor, ışık kötü) konumsal doğrulama sağlar.
 
 ## Sorun Giderme

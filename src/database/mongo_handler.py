@@ -1,7 +1,7 @@
 # mongo_handler.py
 import pymongo
 import numpy as np
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Dict
 from utils.config import Config
 from utils.logger import get_logger
 
@@ -17,7 +17,6 @@ class MongoHandler:
         self.mongo_client = None
         self.db = None
         self.persons_collection = None
-        self.faiss_collection = None
         self._connect()
 
     def _connect(self):
@@ -30,7 +29,6 @@ class MongoHandler:
             self.mongo_client.server_info()  # Trigger connection check
             self.db = self.mongo_client[Config.DB_NAME]
             self.persons_collection = self.db[Config.COLLECTION]
-            self.faiss_collection = self.db[Config.FAISS_COLLECTION]
 
             # Ensure index for faster lookups/uniqueness check
             self.persons_collection.create_index("permanent_id", unique=True)
@@ -73,46 +71,29 @@ class MongoHandler:
             logger.error(f"Error fetching person P{pid} from MongoDB: {e}")
             return None
 
-    def load_vectors_for_faiss(self) -> Tuple[List[int], List[np.ndarray], int]:
+    def load_all_persons(self) -> Dict[int, Dict]:
         """
-        Loads ALL vectors from the gallery of EVERY person to build a dense Faiss index.
-        Flattens the structure: 1 Person with 5 vectors -> 5 Faiss entries pointing to same PID.
+        Loads every stored person into memory.
 
         Returns:
-            tuple: (list_of_pids, list_of_vectors, next_pid)
+            dict: {permanent_id: {"vectors": [np.ndarray, ...], "created": datetime}}
         """
-        logger.info("Loading vectors from MongoDB for Faiss index (Multi-Vector)...")
+        persons = {}
         try:
-            # Projection: Retrieve only necessary fields
-            # Using find() is generally faster than aggregate for simple retrieval
-            cursor = self.persons_collection.find({}, {"permanent_id": 1, "vectors": 1, "_id": 0})
-
-            pids = []
-            vectors = []
-            max_id = 0
-
-            # Pre-allocating lists isn't feasible here as count is dynamic, 
-            # but extending is usually efficient enough in Python.
+            cursor = self.persons_collection.find(
+                {}, {"permanent_id": 1, "vectors": 1, "created": 1, "_id": 0}
+            )
             for doc in cursor:
-                pid = doc.get('permanent_id', 0)
-                if pid > max_id:
-                    max_id = pid
-                
-                # Handle Multi-Vector Gallery
-                doc_vectors = doc.get("vectors")
-                if doc_vectors:
-                    for v_blob in doc_vectors:
-                        pids.append(pid)
-                        vectors.append(np.frombuffer(v_blob, dtype=np.float32))
-
-            next_pid = max_id + 1
-            unique_identities = len(set(pids)) if pids else 0
-            logger.info(f"Successfully loaded {len(vectors)} vectors (from {unique_identities} identities). Next PID: {next_pid}")
-            return pids, vectors, next_pid
-
+                vectors = [np.frombuffer(v, dtype=np.float32) for v in doc.get("vectors") or []]
+                if vectors:
+                    persons[int(doc["permanent_id"])] = {
+                        "vectors": vectors,
+                        "created": doc.get("created"),
+                    }
+            logger.info(f"Loaded {len(persons)} persons from MongoDB.")
         except Exception as e:
-            logger.error(f"Error loading vectors from MongoDB: {e}")
-            return [], [], 1
+            logger.error(f"Error loading persons from MongoDB: {e}")
+        return persons
 
     def get_next_id(self) -> int:
         """

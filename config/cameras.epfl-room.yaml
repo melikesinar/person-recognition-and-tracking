@@ -1,0 +1,14 @@
+# EPFL "room" test kaydı: aynı odayı iki farklı açıdan gören 2 kamera, 4 kişi.
+# İndirme: https://documents.epfl.ch/groups/c/cv/cvlab-pom-video1/www/4p-c0.avi (ve 4p-c1.avi)
+# Dosyaları videos/room/ altına koyun, sonra:
+#   python src/__main__.py --cameras config/cameras.epfl-room.yaml
+
+process_fps: 6
+
+cameras:
+  - id: 0
+    name: room-c0
+    source: videos/room/4p-c0.avi
+  - id: 1
+    name: room-c1
+    source: videos/room/4p-c1.avi

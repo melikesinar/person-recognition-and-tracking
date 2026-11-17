@@ -1,0 +1,30 @@
+# Kamera tanımları / Camera definitions
+#
+# Kamera eklemek için listeye yeni bir öğe eklemeniz yeterli, kod değişikliği gerekmez.
+# To add a camera, append an entry below; no code change is required.
+#
+#   id          : Benzersiz tam sayı. Kayıtlarda ve kameralar arası ayarlarda bu kullanılır.
+#   name        : Ekranda ve loglarda görünen ad.
+#   source      : Webcam numarası (0, 1, ...), video dosyası yolu (proje köküne göre)
+#                 ya da ağ akışı adresi (rtsp://..., http://...).
+#   process_fps : (İsteğe bağlı) Bu kamera saniyede kaç kare işlensin.
+#                 Belirtilmezse aşağıdaki varsayılan kullanılır.
+#
+# Telefonu ikinci kamera olarak kullanmak için örnek:
+#   "IP Webcam" (Android) ya da "DroidCam" uygulamasını açın, gösterdiği adresi
+#   source olarak yazın, örn: http://192.168.1.20:8080/video
+
+process_fps: 6
+
+cameras:
+  - id: 0
+    name: laptop
+    source: 0
+
+  # - id: 1
+  #   name: telefon
+  #   source: http://192.168.1.20:8080/video
+
+  # - id: 2
+  #   name: koridor
+  #   source: videos/koridor.mp4
