@@ -16,12 +16,13 @@ class Config:
     # Resolve project root: src/utils/config.py -> src/utils -> src -> root
     BASE_DIR = Path(__file__).resolve().parent.parent.parent
     
-    # --- Database Configuration ---
+    # --- Database Configuration (optional) ---
+    # If MONGO_URI is empty, or MongoDB is unreachable, the system runs in
+    # memory-only mode: identities live for the session and nothing is persisted.
     MONGO_URI = os.getenv("MONGO_URI")
     DB_NAME = os.getenv("DB_NAME")
     COLLECTION = os.getenv("COLLECTION")
-    FAISS_COLLECTION = os.getenv("FAISS_COLLECTION")
-    FAISS_INDEX_KEY = "primary_person_index"
+    USE_DATABASE = bool(MONGO_URI)
 
     # --- Detection & Matching Thresholds ---
     DETECTION_SCORE_THRESHOLD = 0.55
@@ -36,7 +37,9 @@ class Config:
     TRACK_VALIDATION_THRESHOLD = 0.60
     
     # --- Enrollment Parameters ---
-    MIN_ENROLL_FRAMES = 30
+    # Number of good-quality appearance samples needed before a new identity is created.
+    # (Was 30 when every camera ran at ~30 FPS; at 6 FPS processing, 10 ≈ 1.7 seconds.)
+    MIN_ENROLL_FRAMES = 10
     MIN_BBOX_AREA_ENROLL = 5000
     MIN_SHARPNESS_ENROLL = 35
     
@@ -104,12 +107,9 @@ class Config:
         # # corridor
     }
 
-    # --- Faiss Index Parameters ---
-    FAISS_M = 48  # HNSW M parameter
-    FAISS_EF_CONSTRUCTION = 200
-    FAISS_EF_SEARCH = 64
-    MIN_REBUILD_INTERVAL = 30  # seconds
-    BATCH_SIZE_TRIGGER = 5  # enrollments
+    # --- Vector Search ---
+    # Number of nearest gallery vectors that vote in a search (k-NN voting).
+    SEARCH_K_NEIGHBORS = 5
 
     # --- Async DB Writer ---
 
@@ -142,22 +142,41 @@ class Config:
 
     # --- Model Paths ---
     # Use dynamic paths based on project root
-    YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8l.pt")
+    YOLO_MODEL_PATH = str(BASE_DIR / "models" / "yolov8n.pt")
     REID_MODEL_PATH = str(BASE_DIR / "models" / "osnet_x1_0_msmt17.pt")
 
-    # --- Video Source ---
-    VIDEO_SOURCES = [
-        # 0,
+    # --- Cameras ---
+    # Cameras are defined in a YAML file so that any number of them can be added
+    # without touching code. See config/cameras.yaml for the format.
+    CAMERAS_CONFIG_PATH = Path(os.getenv("CAMERAS_CONFIG", BASE_DIR / "config" / "cameras.yaml"))
+    # How many frames per second each camera is processed at. A CPU cannot run
+    # detection + ReID at 30 FPS for several cameras; 5-8 FPS is enough to follow walking people.
+    DEFAULT_PROCESS_FPS = 6.0
 
-        # str(BASE_DIR / "videos" / "3.mp4"),
-        # str(BASE_DIR / "videos" / "1.mp4")
+    # --- Tracker ---
+    # A lost track is kept alive for this long (converted to frames using the processing FPS).
+    TRACK_MAX_AGE_SECONDS = 4.0
 
-        str(BASE_DIR / "videos" / "room" / "4p-c0.avi"),
-        str(BASE_DIR / "videos" / "room" / "4p-c1.avi")
+    # --- ReID preprocessing ---
+    # Contrast equalisation (CLAHE) on the crop before ReID.
+    REID_USE_CLAHE = True
+    # A track that already has an identity is re-embedded at most this often (seconds).
+    # Tracks without an identity are embedded on every processed frame.
+    REID_INTERVAL_ASSIGNED = 1.0
+    # On CPU, compile the ReID network with TorchScript (≈2x faster, identical output).
+    REID_JIT_OPTIMIZE = True
 
-        # str(BASE_DIR / "videos" / "campus" / "campus4-c0.avi"),
-        # str(BASE_DIR / "videos" / "campus" / "campus4-c1.avi")
-    ]
+    # --- Detector ---
+    # YOLO input size. Ultralytics' default (640) upscales small camera frames,
+    # which costs CPU time without finding more people. Use 640 for high-resolution
+    # cameras where people appear small.
+    DETECTION_IMG_SIZE = 416
+
+    # --- CPU threading ---
+    # Detector and ReID run in separate processes and compete for the same cores.
+    # Many-thread PyTorch is *slower* on small batches (measured), so keep these modest.
+    DETECTOR_NUM_THREADS = 4
+    REID_NUM_THREADS = 4
 
     # --- Logging Configuration ---
     import logging
@@ -174,14 +193,57 @@ class Config:
     @staticmethod
     def validate():
         """Validates critical configuration parameters."""
-        if not Config.MONGO_URI:
-            raise ValueError("MONGO_URI environment variable is not set!")
-        if not Config.DB_NAME:
-            raise ValueError("DB_NAME environment variable is not set!")
-        if not Config.COLLECTION:
-            raise ValueError("COLLECTION environment variable is not set!")
-        if not Config.FAISS_COLLECTION:
-            raise ValueError("FAISS_COLLECTION environment variable is not set!")
+        if Config.USE_DATABASE:
+            if not Config.DB_NAME:
+                raise ValueError("MONGO_URI is set but DB_NAME is not!")
+            if not Config.COLLECTION:
+                raise ValueError("MONGO_URI is set but COLLECTION is not!")
+
+    @staticmethod
+    def load_cameras() -> list:
+        """
+        Reads the camera list from CAMERAS_CONFIG_PATH.
+
+        Returns:
+            list of dicts: {"id": int, "name": str, "source": int|str, "process_fps": float}
+        """
+        import yaml
+
+        path = Config.CAMERAS_CONFIG_PATH
+        if not path.is_file():
+            raise FileNotFoundError(f"Camera config not found: {path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+
+        default_fps = float(data.get("process_fps", Config.DEFAULT_PROCESS_FPS))
+        cameras = []
+        seen_ids = set()
+        for i, cam in enumerate(data.get("cameras") or []):
+            cam_id = int(cam.get("id", i))
+            if cam_id in seen_ids:
+                raise ValueError(f"Duplicate camera id {cam_id} in {path}")
+            seen_ids.add(cam_id)
+
+            source = cam["source"]
+            if isinstance(source, str):
+                if source.isdigit():
+                    source = int(source)  # webcam index given as a string
+                elif "://" not in source:
+                    # Local video file: resolve relative paths from the project root
+                    p = Path(source)
+                    source = str(p if p.is_absolute() else Config.BASE_DIR / p)
+
+            cameras.append({
+                "id": cam_id,
+                "name": str(cam.get("name", f"cam{cam_id}")),
+                "source": source,
+                "process_fps": float(cam.get("process_fps", default_fps)),
+            })
+
+        if not cameras:
+            raise ValueError(f"No cameras defined in {path}")
+        return cameras
 
     @staticmethod
     def print_config():
@@ -190,8 +252,10 @@ class Config:
         from utils.logger import get_logger
         logger = get_logger()
 
-        logger.info(f"Database: {Config.DB_NAME}")
-        logger.info(f"Collection: {Config.COLLECTION}")
+        if Config.USE_DATABASE:
+            logger.info(f"Database: {Config.DB_NAME} / {Config.COLLECTION}")
+        else:
+            logger.info("Database: disabled (memory-only mode)")
         logger.info(f"Detection Threshold: {Config.DETECTION_SCORE_THRESHOLD}")
         logger.info(f"Match Threshold: {Config.MATCH_SIMILARITY_THRESHOLD}")
         logger.info(f"Min Enroll Frames: {Config.MIN_ENROLL_FRAMES}")

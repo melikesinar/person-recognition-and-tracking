@@ -19,36 +19,64 @@ class CameraNode:
     """
     Manages the tracking, ReID, and identity association pipeline for a single camera source.
     """
-    def __init__(self, camera_id: int, video_source: Any, global_resources: Dict[str, Any]):
+    def __init__(self, camera_id: int, name: str, process_fps: float, global_resources: Dict[str, Any]):
         self.camera_id = camera_id
-        self.video_source = video_source
-        self.resources = global_resources 
-        
-        logger.info(f"[{self.__class__.__name__} {camera_id}] Initializing source: {video_source}")
-        
+        self.name = name
+        self.process_fps = process_fps
+        self.resources = global_resources
+
+        logger.info(f"[{self.__class__.__name__} {camera_id}] Initializing '{name}' @ {process_fps:g} FPS")
+
         self.buffer_manager = BufferManager()
         self.spatial_matcher = SpatialMatcher()
         self.visualizer = Visualizer()
         self.identity_verifier = IdentityVerifier()
-        
-        # Initialize Tracker
-        self.tracker = BoostTrack(
-            reid_weights=Path(Config.REID_MODEL_PATH),
-            device=(0 if self.resources['device'].type == 'cuda' else 'cpu'),
-            half=False,
-            with_reid=True,
-            max_age=60,
-            max_obs=100
-        )
-        
-        # Verify source availability and keep it open for main loop
-        self.cap = cv2.VideoCapture(self.video_source)
-        if not self.cap.isOpened():
-            logger.error(f"Could not open video source for Cam {camera_id}: {video_source}")
-        
+
+        self.tracker = self._create_tracker(process_fps)
+        self.last_embed_time: Dict[int, float] = {}  # track_id -> time of last ReID embedding
+
         self.frame_count = 0
         self.prev_time = time.time()
         self.fps = 0.0
+        self.last_display_frame: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _create_tracker(process_fps: float) -> BoostTrack:
+        """
+        Creates the per-camera BoostTrack tracker in motion-only mode (no ReID network).
+
+        Frame-to-frame association on a fixed camera works well with motion + box
+        overlap (Kalman filter + IoU). Running the ReID network on every detection of
+        every frame for the tracker was the single largest CPU cost, and each camera
+        also loaded its own copy of the network. Appearance is now only computed by
+        the shared ReidExtractor, and only when an identity decision needs it
+        (see _needs_embedding).
+        """
+        return BoostTrack(
+            reid_weights=Path(Config.REID_MODEL_PATH),
+            device="cpu",
+            half=False,
+            with_reid=False,
+            det_thresh=Config.DETECTION_SCORE_THRESHOLD,
+            max_age=max(1, int(round(Config.TRACK_MAX_AGE_SECONDS * process_fps))),
+            max_obs=100,
+            # Camera-motion compensation (ECC) is only needed for moving cameras.
+            # Fixed CCTV cameras do not move, and ECC is expensive on a CPU.
+            use_ecc=False,
+        )
+
+    def _needs_embedding(self, track_id: int, now: float) -> bool:
+        """
+        Decides whether this track's crop should go through the ReID network this frame.
+
+        * Track without an identity yet: every processed frame, so that a match or
+          enrollment decision can be made quickly.
+        * Track with an identity: at most once per REID_INTERVAL_ASSIGNED seconds,
+          which is enough for gallery updates and identity-swap checks.
+        """
+        if track_id not in self.buffer_manager.track_id_to_permanent_id_map:
+            return True
+        return (now - self.last_embed_time.get(track_id, 0.0)) >= Config.REID_INTERVAL_ASSIGNED
 
     def process_frame(self, frame: np.ndarray, detections: np.ndarray) -> np.ndarray:
         """
@@ -79,45 +107,51 @@ class CameraNode:
         return frame
 
     def _process_tracking_and_reid(self, detections: np.ndarray, frame: np.ndarray) -> Tuple[List[Any], Dict[int, np.ndarray]]:
-        """Updates tracker and extracts ReID embeddings for valid crops."""
-        # BoxMot update
+        """
+        Updates the tracker, then embeds (in one batch) only the tracks that need an
+        appearance vector this frame and whose crop passes the quality check.
+
+        Returns:
+            tracker_results: list of (box, track_id, conf, cls, ind, crop)
+            vector_map: {track_id: embedding} for the tracks embedded this frame
+        """
         res = self.tracker.update(detections, frame)
-        
+
         tracker_results = []
-        crops_to_process = []
-        track_ids_for_crops = []
+        crops_to_embed, track_ids_to_embed = [], []
+        now = time.time()
         h, w = frame.shape[:2]
 
         for *box, track_id, conf, cls, ind in res:
             track_id = int(track_id)
             x1, y1, x2, y2 = map(int, box)
-            
+
             # Clip to frame dimensions
             x1 = max(0, min(w, x1))
             y1 = max(0, min(h, y1))
             x2 = max(0, min(w, x2))
             y2 = max(0, min(h, y2))
-            
+
             # Invalid box check
             if x2 <= x1 or y2 <= y1:
                 continue
-            
+
             crop = frame[y1:y2, x1:x2]
             tracker_results.append((box, track_id, conf, cls, ind, crop))
 
-            # Quality check before ReID
-            if crop.size > 0:
+            if self._needs_embedding(track_id, now):
                 is_good, _, _ = self.resources['quality_checker'].assess_quality(crop, box, (h, w, 3))
                 if is_good:
-                    crops_to_process.append(crop)
-                    track_ids_for_crops.append(track_id)
+                    crops_to_embed.append(crop)
+                    track_ids_to_embed.append(track_id)
 
-        # Batch ReID extraction
         vector_map = {}
-        if crops_to_process:
-            embeddings = self.resources['reid_extractor'].extract_embeddings_from_crops(crops_to_process)
-            vector_map = {tid: emb for tid, emb in zip(track_ids_for_crops, embeddings)}
-        
+        if crops_to_embed:
+            embeddings = self.resources['reid_extractor'].extract_embeddings_from_crops(crops_to_embed)
+            for tid, emb in zip(track_ids_to_embed, embeddings):
+                vector_map[tid] = emb
+                self.last_embed_time[tid] = now
+
         return tracker_results, vector_map
 
     def _resolve_identities(self, frame: np.ndarray, tracker_results: List[Any], 
@@ -249,7 +283,7 @@ class CameraNode:
             # STRICTER threshold for Re-Entry/New Tracks to prevent False Positives
             reentry_threshold = Config.REENTRY_SIMILARITY_THRESHOLD
             
-            match_id, score = self.resources['faiss_manager'].search(
+            match_id, score = self.resources['vector_index'].search(
                 vector, reentry_threshold
             )
             
@@ -289,7 +323,7 @@ class CameraNode:
                 avg_vector = l2_normalize(np.mean(buf["vectors"], axis=0))
 
                 # Final Safety Check: Is this person actually known but missed by single-frame ReID?
-                found_pid, _ = self.resources['faiss_manager'].search(
+                found_pid, _ = self.resources['vector_index'].search(
                     avg_vector, threshold=self.resources['match_threshold']
                 )
                 
@@ -317,20 +351,15 @@ class CameraNode:
     def _update_pid_state(self, pid: int, box: Any):
         """Updates last known location and timestamp for a PID."""
         self.buffer_manager.last_known_box_for_pid[pid] = box
-        
-        # Sync with PersonManager if needed (e.g., first time seeing this PID on this node)
-        if pid not in self.resources['person_manager'].known_persons_db:
-            p_doc = self.resources['mongo_handler'].get_person_by_id(pid)
-            if p_doc:
-                self.resources['person_manager'].known_persons_db[pid] = p_doc
-        
+
+        # All persons are loaded into memory at startup, so no DB lookup is needed here.
         if pid in self.resources['person_manager'].known_persons_db:
             self.resources['person_manager'].known_persons_db[pid]['last_seen_timestamp'] = time.time()
 
     def _verify_and_correct_identities(self):
         self.identity_verifier.verify_and_correct(
             self.buffer_manager,
-            self.resources['faiss_manager'],
+            self.resources['vector_index'],
             self.resources['match_threshold'],
             self.resources['person_manager']
         )
@@ -345,6 +374,9 @@ class CameraNode:
             if tid not in current_track_ids
         ]
         
+        for tid in [t for t in self.last_embed_time if t not in current_track_ids]:
+            del self.last_embed_time[tid]
+
         for tid in disappeared:
             pid = self.buffer_manager.track_id_to_permanent_id_map.pop(tid, None)
             self.identity_verifier.clear_state_for_track(tid)
@@ -369,5 +401,5 @@ class CameraNode:
             len(self.resources['person_manager'].known_persons_db), 
             self.resources['use_tta']
         )
-        cv2.putText(frame, f"CAM {self.camera_id}", (10, 150), 
+        cv2.putText(frame, f"CAM {self.camera_id}: {self.name}", (10, 150),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)

@@ -17,18 +17,18 @@ class PersonManager:
     Implements a 'Multi-Vector Gallery' strategy to handle varying poses/angles.
     """
 
-    def __init__(self, known_persons_db: Dict[int, Any], async_writer, faiss_manager):
+    def __init__(self, known_persons_db: Dict[int, Any], async_writer, vector_index):
         """
         Initialize person manager.
 
         Args:
             known_persons_db (dict): Reference to main person database
-            async_writer (AsyncDBWriter): Database writer
-            faiss_manager (FaissManager): Faiss index manager
+            async_writer (AsyncDBWriter | NullDBWriter): Database writer
+            vector_index (VectorIndex): Search index, kept in sync with every gallery change
         """
         self.known_persons_db = known_persons_db
         self.async_writer = async_writer
-        self.faiss_manager = faiss_manager
+        self.vector_index = vector_index
 
         self.next_permanent_id = 1
         logger.info("Person manager initialized (Multi-Vector Gallery Mode).")
@@ -73,7 +73,7 @@ class PersonManager:
 
         # Queue async insert
         self.async_writer.queue_insert(new_person_doc)
-        logger.info(f"MongoDB INSERT: New person (P{new_pid}) queued. Gallery size: 1")
+        logger.info(f"ENROLL: New person P{new_pid} created. Gallery size: 1")
 
         # Add to local cache
         self.known_persons_db[new_pid] = {
@@ -84,8 +84,8 @@ class PersonManager:
         logger.info(f"CACHE ADD: P{new_pid} added to cache.")
         self.next_permanent_id += 1
 
-        # Trigger index rebuild (Faiss will now index ALL vectors for this ID)
-        self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True)
+        # Searchable immediately
+        self.vector_index.set_person(new_pid, gallery_vectors)
 
         return new_pid
 
@@ -169,8 +169,8 @@ class PersonManager:
         mongo_update_doc["$set"]["vectors"] = [Binary(v.tobytes()) for v in gallery]
         
         self.async_writer.queue_update(perm_id, mongo_update_doc)
-        
-        self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True)
+
+        self.vector_index.set_person(perm_id, gallery)
 
     def merge_identities(self, keep_pid: int, drop_pid: int):
         """
@@ -220,7 +220,8 @@ class PersonManager:
             }
         }
         self.async_writer.queue_update(keep_pid, mongo_update_doc)
-        
+        self.vector_index.set_person(keep_pid, combined_gallery)
+
         # Delete drop_pid
         self.delete_person(drop_pid)
 
@@ -231,15 +232,12 @@ class PersonManager:
         self.async_writer.queue_delete(pid)
         if pid in self.known_persons_db:
             del self.known_persons_db[pid]
-        
-        # We don't necessarily need to flush immediately if load is high, 
-        # but flushing ensures consistency before rebuild.
-        # self.async_writer.flush() 
-        self.faiss_manager.trigger_rebuild_if_needed(new_enrollment=True, force=True)
+        self.vector_index.remove_person(pid)
 
     def reset_all(self):
         """Resets entire database and cache."""
         self.async_writer.queue_reset()
         self.known_persons_db.clear()
+        self.vector_index.clear()
         self.next_permanent_id = 1
         logger.warning("Person database reset queued.")

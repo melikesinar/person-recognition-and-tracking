@@ -1,3 +1,4 @@
+import time
 import multiprocessing
 import numpy as np
 import traceback
@@ -48,13 +49,19 @@ class DetectorWorker(multiprocessing.Process):
         
         try:
             # Initialize model within the process context
+            if self.device_str == 'cpu':
+                from utils.torch_utils import configure_cpu_inference
+                configure_cpu_inference(Config.DETECTOR_NUM_THREADS)
             detector = YOLO(Config.YOLO_MODEL_PATH)
             
             # Warmup is handled implicitly by the first inference, 
             # but we signal ready immediately after load.
             logger.info(f"[{self.__class__.__name__}] YOLOv8 Loaded Successfully.")
             self.ready_event.set()
-            
+
+            # Timing statistics, logged periodically so CPU overload is visible
+            stat_n, stat_busy, stat_t0 = 0, 0.0, time.time()
+
             while True:
                 try:
                     # Blocking get
@@ -80,12 +87,14 @@ class DetectorWorker(multiprocessing.Process):
                 # This lets the internal NMS engine filter low-confidence boxes on the GPU (if available),
                 # avoiding unnecessary memory transfer and CPU filtering.
                 current_thresh = self.shared_threshold.value
-                
+                t_start = time.time()
+
                 results = detector(
                     frame, 
                     classes=0, 
-                    conf=current_thresh, 
-                    verbose=False, 
+                    conf=current_thresh,
+                    imgsz=Config.DETECTION_IMG_SIZE,
+                    verbose=False,
                     device=self.device_str
                 )
 
@@ -102,6 +111,14 @@ class DetectorWorker(multiprocessing.Process):
 
                 # Push result: (cam_id, frame_id, detections)
                 self.detection_queue.put((cam_id, frame_id, final_dets))
+
+                stat_n += 1
+                stat_busy += time.time() - t_start
+                if time.time() - stat_t0 >= 10.0:
+                    elapsed = time.time() - stat_t0
+                    logger.info(f"[{self.__class__.__name__}] {stat_n / elapsed:.1f} frames/s, "
+                                f"{stat_busy / stat_n * 1000:.0f} ms/frame, busy {stat_busy / elapsed:.0%}")
+                    stat_n, stat_busy, stat_t0 = 0, 0.0, time.time()
 
         except Exception as e:
             logger.critical(f"CRITICAL ERROR in Detector Process: {e}")

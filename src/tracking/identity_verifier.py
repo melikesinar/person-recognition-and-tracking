@@ -35,14 +35,14 @@ class IdentityVerifier:
         if track_id in self.verification_state:
             del self.verification_state[track_id]
 
-    def verify_and_correct(self, buffer_manager, faiss_manager, current_match_threshold: float, person_manager):
+    def verify_and_correct(self, buffer_manager, vector_index, current_match_threshold: float, person_manager):
         """
         Periodically checks identities and manages a multi-stage confirmation
         process before switching a person's ID.
 
         Args:
             buffer_manager (BufferManager): The main buffer manager instance.
-            faiss_manager (FaissManager): The main Faiss manager instance.
+            vector_index (VectorIndex): The shared vector search index.
             current_match_threshold (float): The current similarity threshold for matching.
             person_manager (PersonManager): The person manager to access current identity vectors.
         """
@@ -92,7 +92,7 @@ class IdentityVerifier:
 
             # --- CHECK FOR ID SWITCHING ---
             # 2. Find the best possible match in the database (Global Search)
-            best_pid, best_score = faiss_manager.search(avg_vector, threshold=0.0)
+            best_pid, best_score = vector_index.search(avg_vector, threshold=0.0)
 
             if best_pid is not None and best_pid != pid:
                 # Condition to consider a switch: new match is significantly better than CURRENT match

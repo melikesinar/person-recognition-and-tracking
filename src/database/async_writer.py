@@ -14,17 +14,15 @@ class AsyncDBWriter:
     Prevents main thread blocking during MongoDB I/O.
     """
 
-    def __init__(self, persons_collection, faiss_collection, stop_event):
+    def __init__(self, persons_collection, stop_event):
         """
         Initialize async writer.
 
         Args:
             persons_collection: MongoDB persons collection
-            faiss_collection: MongoDB Faiss index collection
             stop_event: Threading event for shutdown signal
         """
         self.persons_collection = persons_collection
-        self.faiss_collection = faiss_collection
         self.stop_event = stop_event
 
         self.write_queue = queue.Queue(maxsize=Config.ASYNC_DB_WRITER_QUEUE_SIZE)
@@ -140,7 +138,6 @@ class AsyncDBWriter:
         """Handle RESET operation."""
         try:
             self.persons_collection.delete_many({})
-            self.faiss_collection.delete_many({})
             logger.warning("[ASYNC] MongoDB RESET completed.")
         except Exception as e:
             logger.critical(f"[ASYNC] MongoDB RESET ERROR: {e}")
@@ -162,3 +159,17 @@ class AsyncDBWriter:
         else:
             logger.info("Database writer thread exited cleanly.")
             return True
+
+
+class NullDBWriter:
+    """
+    Drop-in replacement for AsyncDBWriter used in memory-only mode
+    (no MongoDB configured or reachable). Every operation is a no-op.
+    """
+
+    def queue_insert(self, doc: dict): pass
+    def queue_update(self, pid: int, update_doc: dict): pass
+    def queue_delete(self, pid: int): pass
+    def queue_reset(self): pass
+    def flush(self): pass
+    def shutdown(self, timeout=5.0): return True
