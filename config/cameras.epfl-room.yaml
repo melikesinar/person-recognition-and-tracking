@@ -22,3 +22,9 @@ homographies:
   "0-1": [[8.67880128, 45.28411211, -5167.53237445],
           [-2.20867665, 7.96352372, 2044.28289896],
           [0.04583942, 0.05740988, 1.00000000]]
+
+# Kamera topolojisi (Faz 2): bu iki kamera aynı odayı görüyor, yani bir kişi
+# ikisinde aynı anda görünebilir. Bu satır olmasaydı sistem "aynı kişi iki yerde
+# olamaz" kuralını uygular ve odadaki herkesi iki kişi sayardı.
+topology:
+  overlapping: [[0, 1]]

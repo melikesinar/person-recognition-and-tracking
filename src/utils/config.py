@@ -184,6 +184,35 @@ class Config:
     MATCH_CANDIDATES = 5
     CANDIDATE_MIN_REID_SIM = 0.55
 
+    # --- Space-time rules & "not sure" (Faz 2) ---
+    # A match must beat every other plausible person by at least this much (fused
+    # scale); otherwise the system says "not sure" and waits for more evidence.
+    AMBIGUITY_MARGIN = 0.03
+    # While a new track is "not sure" (or looks like someone who cannot be here),
+    # creating a new identity is postponed for up to this many seconds.
+    ENROLL_MAX_DEFER_SECONDS = 6.0
+    # Sightings in two non-overlapping cameras closer than this (s) count as "at
+    # the same time" (impossible for one person).
+    SIMULTANEOUS_WINDOW_SECONDS = 1.0
+    # Overlapping cameras with a homography: a person visible in both must stand on
+    # the same floor spot. Max distance (px, after mapping) still counted as "same".
+    SPATIAL_GATE_PX = 60.0
+    # Short-term re-acquisition by location (someone lost near this spot a moment
+    # ago) is only accepted if appearance also agrees: fused score at least this,
+    # and no other possible person looks clearly more similar. Lower than the
+    # re-entry threshold because the location is evidence too.
+    SPATIAL_REACQ_MIN_SCORE = 0.70
+    # Location-based re-acquisition on/off. Off by default: on EPFL (4 similar-looking
+    # people) it was the largest source of wrong identities, even with the
+    # appearance check (cross-camera consistency 78% off vs 57% on; FAZ2_RAPOR.md).
+    SPATIAL_REACQ_ENABLED = False
+    # Unseen in a camera for longer than this (s) = the visit to that camera ended.
+    VISIT_GAP_SECONDS = 5.0
+    # Routes / dwell times are written here as CSV when the program exits.
+    OUTPUT_DIR = BASE_DIR / "output"
+    # Camera topology (overlaps, walking times). Set from the cameras YAML file.
+    CAMERA_TOPOLOGY = {}
+
     # --- Detector ---
     # YOLO input size. Ultralytics' default (640) upscales small camera frames,
     # which costs CPU time without finding more people. Use 640 for high-resolution
@@ -267,6 +296,7 @@ class Config:
         # confident but wrong "same location" matches.
         homographies = data.get("homographies") or {}
         Config.CAMERA_HOMOGRAPHIES = {str(k): v for k, v in homographies.items()}
+        Config.CAMERA_TOPOLOGY = data.get("topology") or {}
         return cameras
 
     @staticmethod
