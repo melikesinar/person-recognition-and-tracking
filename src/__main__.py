@@ -23,6 +23,7 @@ from database.vector_index import VectorIndex
 from database.async_writer import AsyncDBWriter, NullDBWriter
 from tracking.person_manager import PersonManager
 from tracking.identity_verifier import IdentityVerifier
+from tracking.identity_matcher import IdentityMatcher
 
 logger = get_logger()
 
@@ -64,6 +65,7 @@ class MultiCameraSystem:
         self.vector_index = VectorIndex()
         self.known_persons_db: Dict[int, dict] = {}
         self.person_manager = PersonManager(self.known_persons_db, self.async_writer, self.vector_index)
+        self.identity_matcher = IdentityMatcher(self.person_manager, self.vector_index)
         self.quality_checker = QualityChecker()
         self.global_verifier = IdentityVerifier()
 
@@ -88,6 +90,7 @@ class MultiCameraSystem:
         self.global_resources = {
             'person_manager': self.person_manager,
             'vector_index': self.vector_index,
+            'identity_matcher': self.identity_matcher,
             'reid_extractor': self.reid_extractor,
             'quality_checker': self.quality_checker,
             'detection_threshold': self.detection_threshold_value,

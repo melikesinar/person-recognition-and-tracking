@@ -26,10 +26,15 @@ class Config:
 
     # --- Detection & Matching Thresholds ---
     DETECTION_SCORE_THRESHOLD = 0.55
-    MATCH_SIMILARITY_THRESHOLD = 0.85
-    
+    # Both thresholds below apply to the FUSED score (OSNet + clothing colours,
+    # see core/appearance_cues.fuse_scores), not to raw OSNet similarity.
+    # Chosen at ~0.5-1% false-match rate on EPFL pairs (docs/FAZ1_RAPOR.md).
+    # Enrollment safety check, using ~1.7 s of accumulated evidence:
+    MATCH_SIMILARITY_THRESHOLD = 0.82
+
     # --- Strict Re-Entry Logic (To prevent Imposters) ---
-    REENTRY_SIMILARITY_THRESHOLD = 0.88 
+    # A new track matched from a single observation needs a stricter score:
+    REENTRY_SIMILARITY_THRESHOLD = 0.84
     
     # --- Visual Guard (Identity Theft Prevention) ---
     # If a tracked person suddenly stops looking like themselves (e.g. crossing another person),
@@ -98,14 +103,10 @@ class Config:
     # Value: 3x3 List of Lists [[h11, h12, h13], [h21, h22, h23], [h31, h32, h33]]
     # Use a tool like 'opencv_calibration' to find these. 
     # Below is a PLACEHOLDER example (Identity matrix = no transform).
-    CAMERA_HOMOGRAPHIES = {
-        '0-1': [[8.67880128, 45.28411211, -5167.53237445], [-2.20867665, 7.96352372, 2044.28289896], [0.04583942, 0.05740988, 1.00000000]],
-        # room videos
-        # '0-1': [[-0.78447575, -10.85648451, 1760.79567792], [-0.26645472, -1.73492810, 81.34685166], [-0.00401496, -0.01035841, 1.00000000]],
-        # # campus videos
-        # '0-1': [[3.26182811, 6.25747138, 574.22413335], [0.33626874, 1.86404089, 155.63783026], [0.00122571, 0.00351370, 1.00000000]],
-        # # corridor
-    }
+    # Default: none. Each camera file (config/cameras*.yaml) carries the matrices
+    # for its own installation under a `homographies:` key; see
+    # config/cameras.epfl-room.yaml and tools/calibrate_homography.py.
+    CAMERA_HOMOGRAPHIES = {}
 
     # --- Vector Search ---
     # Number of nearest gallery vectors that vote in a search (k-NN voting).
@@ -165,6 +166,23 @@ class Config:
     REID_INTERVAL_ASSIGNED = 1.0
     # On CPU, compile the ReID network with TorchScript (≈2x faster, identical output).
     REID_JIT_OPTIMIZE = True
+
+    # --- Multi-cue identity (Faz 1) ---
+    # Weight of each cue in the fused similarity. A cue that is not visible in
+    # an observation drops out and the remaining weights are renormalised.
+    # Measured on EPFL (docs/FAZ1_RAPOR.md): lower-body colour is almost as
+    # discriminative as OSNet; the head region is close to chance at low resolution,
+    # so it is off by default (raise it for high-resolution cameras).
+    CUE_WEIGHTS = {"reid": 0.50, "upper": 0.20, "lower": 0.30, "head": 0.0}
+    # Reject a match when BOTH top and bottom clothing colour similarities are
+    # below this, however similar the OSNet vectors are.
+    COLOR_VETO_THRESHOLD = 0.35
+    # Colour observations kept per person (rolling window, memory only).
+    CUE_GALLERY_SIZE = 30
+    # Candidates shortlisted by OSNet before colour re-scoring, and the minimum
+    # OSNet similarity to be shortlisted at all.
+    MATCH_CANDIDATES = 5
+    CANDIDATE_MIN_REID_SIM = 0.55
 
     # --- Detector ---
     # YOLO input size. Ultralytics' default (640) upscales small camera frames,
@@ -243,6 +261,12 @@ class Config:
 
         if not cameras:
             raise ValueError(f"No cameras defined in {path}")
+
+        # Homographies belong to a specific camera installation, so they live in the
+        # same file as the cameras. A matrix from another installation would produce
+        # confident but wrong "same location" matches.
+        homographies = data.get("homographies") or {}
+        Config.CAMERA_HOMOGRAPHIES = {str(k): v for k, v in homographies.items()}
         return cameras
 
     @staticmethod

@@ -12,3 +12,13 @@ cameras:
   - id: 1
     name: room-c1
     source: videos/room/4p-c1.avi
+
+# Kameralar arası zemin eşlemesi (homografi): "kaynak-hedef" kamera id'leri.
+# Bu iki kamera aynı odayı gördüğü için, Kamera 0'daki bir kişinin ayak noktası
+# bu matrisle Kamera 1'deki görüntü koordinatına çevrilebilir.
+# Doğrulama: izdüşürülen noktaların %61'i gerçek bir ayağa 30 px'ten yakın düşüyor.
+# Yeni kurulum için: python tools/calibrate_homography.py
+homographies:
+  "0-1": [[8.67880128, 45.28411211, -5167.53237445],
+          [-2.20867665, 7.96352372, 2044.28289896],
+          [0.04583942, 0.05740988, 1.00000000]]

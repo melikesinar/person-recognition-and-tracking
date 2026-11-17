@@ -27,7 +27,11 @@ class IdentityVerifier:
         self.AUTO_MERGE_THRESHOLD = 0.85 # Very high similarity required to auto-merge
         
         self.cross_camera_matcher = CrossCameraMatcher()
-        
+
+        # Pairs of PIDs (low, high) that were visible in the same camera at the same
+        # time, i.e. proven to be different people. Never merged.
+        self.cannot_link = set()
+
         logger.info("Identity Verifier initialized.")
 
     def clear_state_for_track(self, track_id: int):
@@ -203,6 +207,19 @@ class IdentityVerifier:
         if len(active_pids) < 2:
             return
 
+        # Two identities visible in the SAME camera at the same time are, physically,
+        # two different people, however alike they look (e.g. same uniform). Such
+        # pairs must never be merged.
+        # The pairs are remembered ("cannot-link"), so they stay unmergeable later too.
+        for node in camera_nodes:
+            visible = sorted(set(node.buffer_manager.track_id_to_permanent_id_map.values()))
+            for x in range(len(visible)):
+                for y in range(x + 1, len(visible)):
+                    self.cannot_link.add((visible[x], visible[y]))
+
+        def seen_together(a, b):
+            return (min(a, b), max(a, b)) in self.cannot_link
+
         # 2. Compare every pair
         merge_pair = None
         best_sim = -1.0
@@ -223,6 +240,7 @@ class IdentityVerifier:
             for j in range(i + 1, len(active_pids)):
                 pid_b = active_pids[j]
                 if pid_b not in person_manager.known_persons_db: continue
+                if seen_together(pid_a, pid_b): continue
                 
                 data_b = person_manager.known_persons_db[pid_b]
                 # Age check...
@@ -326,6 +344,12 @@ class IdentityVerifier:
 
             # A. Merge in Database
             person_manager.merge_identities(keep_pid=pid_keep, drop_pid=pid_drop)
+            # Whoever was proven different from pid_drop is now proven different from pid_keep
+            for a, b in [p for p in self.cannot_link if pid_drop in p]:
+                self.cannot_link.discard((a, b))
+                other = b if a == pid_drop else a
+                if other != pid_keep:
+                    self.cannot_link.add((min(other, pid_keep), max(other, pid_keep)))
             
             # B. Update Live Tracks ACROSS ALL CAMERAS
             for node in camera_nodes:

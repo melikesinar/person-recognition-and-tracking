@@ -12,6 +12,7 @@ from tracking.buffer_manager import BufferManager
 from tracking.spatial_matcher import SpatialMatcher
 from tracking.identity_verifier import IdentityVerifier
 from utils.logger import get_logger
+from core.appearance_cues import PartCues, extract_part_cues
 
 logger = get_logger()
 
@@ -83,42 +84,45 @@ class CameraNode:
         Main processing pipeline: Tracking -> ReID -> Association -> Visualization.
         """
         self.frame_count += 1
-        
+
         # 1. Update Tracker & Extract Features
-        tracker_results, vector_map = self._process_tracking_and_reid(detections, frame)
-        
+        tracker_results, vector_map, cue_map = self._process_tracking_and_reid(detections, frame)
+
         # 2. Analyze Scene (Occlusions)
         occlusion_map = check_occlusions(tracker_results)
-        
+
         # 3. Associate Identities
-        current_track_ids = self._resolve_identities(frame, tracker_results, vector_map, occlusion_map)
-        
+        current_track_ids = self._resolve_identities(frame, tracker_results, vector_map, cue_map, occlusion_map)
+
         # 4. Periodic Verification
         if self.frame_count % Config.ID_VERIFICATION_INTERVAL == 0:
             self._verify_and_correct_identities()
-            
+
         # 5. Cleanup
         self._perform_cleanup(current_track_ids)
-        
+
         # 6. Visualization & Metrics
         self._update_metrics()
         self._draw_interface(frame)
-        
+
         return frame
 
-    def _process_tracking_and_reid(self, detections: np.ndarray, frame: np.ndarray) -> Tuple[List[Any], Dict[int, np.ndarray]]:
+    def _process_tracking_and_reid(self, detections: np.ndarray, frame: np.ndarray
+                                   ) -> Tuple[List[Any], Dict[int, np.ndarray], Dict[int, PartCues]]:
         """
         Updates the tracker, then embeds (in one batch) only the tracks that need an
-        appearance vector this frame and whose crop passes the quality check.
+        appearance vector this frame and whose crop passes the quality check. The
+        same crops also get part colour cues (cheap: a few histograms).
 
         Returns:
             tracker_results: list of (box, track_id, conf, cls, ind, crop)
             vector_map: {track_id: embedding} for the tracks embedded this frame
+            cue_map: {track_id: PartCues} for the same tracks
         """
         res = self.tracker.update(detections, frame)
 
         tracker_results = []
-        crops_to_embed, track_ids_to_embed = [], []
+        crops_to_embed, track_ids_to_embed, cue_map = [], [], {}
         now = time.time()
         h, w = frame.shape[:2]
 
@@ -144,6 +148,7 @@ class CameraNode:
                 if is_good:
                     crops_to_embed.append(crop)
                     track_ids_to_embed.append(track_id)
+                    cue_map[track_id] = extract_part_cues(crop, (x1, y1, x2, y2), frame.shape)
 
         vector_map = {}
         if crops_to_embed:
@@ -152,34 +157,36 @@ class CameraNode:
                 vector_map[tid] = emb
                 self.last_embed_time[tid] = now
 
-        return tracker_results, vector_map
+        return tracker_results, vector_map, cue_map
 
-    def _resolve_identities(self, frame: np.ndarray, tracker_results: List[Any], 
-                          vector_map: Dict[int, np.ndarray], occlusion_map: Dict[int, bool]) -> Set[int]:
+    def _resolve_identities(self, frame: np.ndarray, tracker_results: List[Any],
+                          vector_map: Dict[int, np.ndarray], cue_map: Dict[int, PartCues],
+                          occlusion_map: Dict[int, bool]) -> Set[int]:
         """
         Maps tracker IDs to Permanent IDs (PIDs) using Persistence > Spatial > ReID > Enrollment.
         """
         current_track_ids = set()
-        
+
         # Phase 1: Reserve PIDs for existing consistent tracks
         used_pids = self._reserve_active_identities(tracker_results)
 
         # Phase 2: Process each track
         for (box, track_id, conf, cls, ind, crop) in tracker_results:
             current_track_ids.add(track_id)
-            
+
             vector = vector_map.get(track_id)
+            cues = cue_map.get(track_id)
             is_occluded = occlusion_map.get(track_id, False)
             pid = self.buffer_manager.track_id_to_permanent_id_map.get(track_id)
-            
+
             label = ""
             color = (0, 0, 0)
-            
+
             # --- Logic Branching ---
             if pid:
                 # Case A: Already Assigned -> Verify Validity First! (Visual Guard)
                 is_valid_assignment = True
-                
+
                 if vector is not None:
                     person_data = self.resources['person_manager'].known_persons_db.get(pid)
                     if person_data and "vectors" in person_data:
@@ -190,7 +197,7 @@ class CameraNode:
                             gallery_mat = np.stack(gallery, axis=0)
                             sims = np.dot(gallery_mat, vector)
                             max_sim = np.max(sims)
-                            
+
                             # If similarity drops too low, the tracker likely switched targets (ID Theft)
                             if max_sim < Config.TRACK_VALIDATION_THRESHOLD:
                                 logger.warning(f"VISUAL GUARD: T{track_id} revoked from P{pid}. Sim ({max_sim:.2f}) < Threshold. Possible ID Theft/Swap.")
@@ -199,23 +206,23 @@ class CameraNode:
                                 is_valid_assignment = False
 
                 if is_valid_assignment:
-                    self._handle_existing_track(pid, vector, is_occluded)
+                    self._handle_existing_track(pid, vector, cues, is_occluded)
                     if vector is None:
                         label, color = f"P{pid} (Low Q)", (100, 255, 100)
                     else:
                         label, color = f"P{pid}", (0, 255, 0)
-            
+
             # Note: We use 'if not pid' here so that if the guard revoked it above, we fall into Case B immediately.
             if not pid:
                 # Case B: Unassigned -> Try Match or Enroll
                 pid, source = self._attempt_match_or_enroll(
-                    track_id, box, vector, crop, is_occluded, used_pids, frame.shape
+                    track_id, box, vector, cues, crop, is_occluded, used_pids, frame.shape
                 )
-                
+
                 if pid:
                     self.buffer_manager.track_id_to_permanent_id_map[track_id] = pid
                     used_pids.add(pid)
-                    
+
                     if source == "spatial":
                         label, color = f"P{pid} (RA)", (0, 255, 128)
                         self.buffer_manager.lost_pid_buffer.pop(pid, None)
@@ -230,47 +237,50 @@ class CameraNode:
                     else:
                         buf_len = len(self.buffer_manager.active_track_buffers.get(track_id, {}).get("vectors", []))
                         label, color = f"T{track_id} ({buf_len})", (0, 165, 255)
-            
+
             # Update Visuals & DB State
             if pid:
                 self._update_pid_state(pid, box)
-            
+
             if is_occluded:
                 label += " (!)"
                 color = (0, 0, 255)
 
             x1, y1, x2, y2 = map(int, box)
             self.visualizer.draw_person_bbox(frame, (x1, y1, x2, y2), label, color)
-            
+
         return current_track_ids
 
     def _reserve_active_identities(self, tracker_results: List[Any]) -> Set[int]:
         """Identifies PIDs that are currently claimed by valid tracks to prevent duplicate assignment."""
         used_pids = set()
         active_track_ids = {t[1] for t in tracker_results}
-        
+
         for tid, pid in self.buffer_manager.track_id_to_permanent_id_map.items():
             if tid in active_track_ids:
                 used_pids.add(pid)
         return used_pids
 
-    def _handle_existing_track(self, pid: int, vector: Optional[np.ndarray], is_occluded: bool):
+    def _handle_existing_track(self, pid: int, vector: Optional[np.ndarray], cues: Optional[PartCues],
+                               is_occluded: bool):
         """Updates known person with new data if conditions are met."""
         if vector is not None:
             last_update = self.buffer_manager.last_update_time_for_pid.get(pid, 0)
             if (time.time() - last_update) > Config.UPDATE_INTERVAL and not is_occluded:
                 self.resources['person_manager'].incremental_update(pid, vector, is_occluded=is_occluded)
+                # Overlapping people mix their colours, so cues are only learned when not occluded
+                self.resources['person_manager'].add_cues(pid, cues)
                 self.buffer_manager.last_update_time_for_pid[pid] = time.time()
 
-    def _attempt_match_or_enroll(self, track_id: int, box: Any, vector: Optional[np.ndarray], 
-                               crop: np.ndarray, is_occluded: bool, used_pids: Set[int], 
+    def _attempt_match_or_enroll(self, track_id: int, box: Any, vector: Optional[np.ndarray],
+                               cues: Optional[PartCues], crop: np.ndarray, is_occluded: bool, used_pids: Set[int],
                                img_shape: Tuple[int, ...]) -> Tuple[Optional[int], Optional[str]]:
         """
         Tries to associate a track with a PID using Spatial -> ReID -> Enrollment chain.
         Returns: (pid, source_type) or (None, None)
         """
         now = time.time()
-        
+
         # 1. Spatial Match (Fast, recovers short-term lost tracks)
         spatial_pid, _ = self.spatial_matcher.find_spatial_match(
             box, self.buffer_manager.lost_pid_buffer, now
@@ -280,72 +290,82 @@ class CameraNode:
 
         # 2. ReID Match (Global search)
         if vector is not None:
-            # STRICTER threshold for Re-Entry/New Tracks to prevent False Positives
-            reentry_threshold = Config.REENTRY_SIMILARITY_THRESHOLD
-            
-            match_id, score = self.resources['vector_index'].search(
-                vector, reentry_threshold
+            # Stricter threshold for a single-frame match, to prevent false positives.
+            # Colour cues are not trusted while the person overlaps someone else.
+            query_cues = [cues] if (cues is not None and not is_occluded) else []
+            result = self.resources['identity_matcher'].match(
+                vector, query_cues, Config.REENTRY_SIMILARITY_THRESHOLD
             )
-            
-            if match_id and match_id not in used_pids:
-                # logger.debug(f"ReID Match: T{track_id} -> P{match_id} (Score: {score:.2f} > {reentry_threshold})")
-                return match_id, "reid"
-            
+
+            if result.pid and result.pid not in used_pids:
+                logger.info(f"[Cam {self.camera_id}] ReID match: T{track_id} -> P{result.pid} {result.describe()}")
+                return result.pid, "reid"
+
             # 3. Enrollment (New Identity)
             if not is_occluded:
-                return self._process_enrollment(track_id, vector, crop, box, img_shape, used_pids)
-        
+                return self._process_enrollment(track_id, vector, cues, crop, box, img_shape, used_pids)
+
         return None, None
 
-    def _process_enrollment(self, track_id: int, vector: np.ndarray, crop: np.ndarray, 
+    def _process_enrollment(self, track_id: int, vector: np.ndarray, cues: Optional[PartCues], crop: np.ndarray,
                           box: Any, img_shape: Tuple[int, ...], used_pids: Set[int]) -> Tuple[Optional[int], Optional[str]]:
         """Accumulates evidence and enrolls a new person if quality/count thresholds are met."""
         # Quality Check
         is_good, _, q_score = self.resources['quality_checker'].assess_quality(crop, box, img_shape)
-        
+
         buf = self.buffer_manager.active_track_buffers[track_id]
         buf["vectors"].append(vector)
         buf.setdefault("quality_scores", []).append(q_score)
+        buf.setdefault("cues", []).append(cues)
         buf["last_seen"] = time.time()
-        
+
         # Maintain rolling window
         if len(buf["vectors"]) > Config.MIN_ENROLL_FRAMES:
             buf["vectors"].pop(0)
             buf["quality_scores"].pop(0)
-            
+            buf["cues"].pop(0)
+
         # Check Enrollment Criteria
         if len(buf["vectors"]) >= Config.MIN_ENROLL_FRAMES:
             avg_q = np.mean(buf.get("quality_scores", [0.5]))
-            
+
             # Relaxed quality threshold for enrollment
             if avg_q >= 0.40:
                 # Use robust normalization
                 avg_vector = l2_normalize(np.mean(buf["vectors"], axis=0))
 
+                buf_cues = [c for c in buf["cues"] if c is not None]
+                pm = self.resources['person_manager']
+
                 # Final Safety Check: Is this person actually known but missed by single-frame ReID?
-                found_pid, _ = self.resources['vector_index'].search(
-                    avg_vector, threshold=self.resources['match_threshold']
+                # Uses the averaged vector and all colour observations collected so far.
+                result = self.resources['identity_matcher'].match(
+                    avg_vector, buf_cues, self.resources['match_threshold']
                 )
-                
+                found_pid = result.pid
+
                 final_pid = None
                 if found_pid:
                     if found_pid in used_pids:
-                        logger.info(f"Enroll Conflict: T{track_id} matches active P{found_pid}. Forcing NEW ID.")
+                        logger.info(f"[Cam {self.camera_id}] Enroll Conflict: T{track_id} matches active P{found_pid} "
+                                    f"{result.describe()}. Forcing NEW ID.")
                         # ID is active elsewhere, so this must be a look-alike or duplicate. Treat as new.
-                        final_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
+                        final_pid = pm.enroll_person(buf["vectors"], buf_cues)
                     else:
-                        logger.info(f"Enroll Merge: T{track_id} -> P{found_pid} (accumulated evidence)")
+                        logger.info(f"[Cam {self.camera_id}] Enroll Merge: T{track_id} -> P{found_pid} {result.describe()}")
                         final_pid = found_pid
-                        self.resources['person_manager'].incremental_update(final_pid, avg_vector)
+                        pm.incremental_update(final_pid, avg_vector)
+                        for c in buf_cues:
+                            pm.add_cues(final_pid, c)
                 else:
-                    final_pid = self.resources['person_manager'].enroll_person(buf["vectors"])
-                
+                    final_pid = pm.enroll_person(buf["vectors"], buf_cues)
+
                 # Clear buffer after decision
                 if track_id in self.buffer_manager.active_track_buffers:
                     del self.buffer_manager.active_track_buffers[track_id]
-                    
+
                 return final_pid, "enroll"
-                
+
         return None, None
 
     def _update_pid_state(self, pid: int, box: Any):
@@ -367,13 +387,13 @@ class CameraNode:
     def _perform_cleanup(self, current_track_ids: Set[int]):
         now = time.time()
         self.buffer_manager.cleanup_stale_tracks(now)
-        
+
         # Detect disappeared tracks
         disappeared = [
-            tid for tid in self.buffer_manager.track_id_to_permanent_id_map 
+            tid for tid in self.buffer_manager.track_id_to_permanent_id_map
             if tid not in current_track_ids
         ]
-        
+
         for tid in [t for t in self.last_embed_time if t not in current_track_ids]:
             del self.last_embed_time[tid]
 
@@ -397,8 +417,8 @@ class CameraNode:
     def _draw_interface(self, frame: np.ndarray):
         self.visualizer.draw_hud(
             frame, self.fps, self.resources['detection_threshold'].value,
-            self.resources['match_threshold'], 
-            len(self.resources['person_manager'].known_persons_db), 
+            self.resources['match_threshold'],
+            len(self.resources['person_manager'].known_persons_db),
             self.resources['use_tta']
         )
         cv2.putText(frame, f"CAM {self.camera_id}: {self.name}", (10, 150),

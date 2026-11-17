@@ -17,7 +17,7 @@ If the gallery ever grows to millions of vectors, an approximate index (e.g.
 Faiss) can be dropped in behind the same search() interface.
 """
 import threading
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -81,6 +81,23 @@ class VectorIndex:
                     [np.full(len(self._galleries[p]), p, dtype=np.int64) for p in pids]
                 )
             return self._matrix, self._row_pids
+
+    def top_persons(self, query_vector: np.ndarray, k: int, min_sim: float = -1.0) -> List[Tuple[int, float]]:
+        """
+        Returns up to k (pid, similarity) pairs, best first, where a person's
+        similarity is the best match over all vectors in their gallery.
+        Used to shortlist candidates that are then re-scored with other cues.
+        """
+        matrix, row_pids = self._snapshot()
+        if matrix is None:
+            return []
+        sims = matrix @ query_vector.astype(np.float32).ravel()
+        # Rows of one person are contiguous, so a segmented max gives per-person scores
+        starts = np.flatnonzero(np.r_[True, row_pids[1:] != row_pids[:-1]])
+        person_sims = np.maximum.reduceat(sims, starts)
+        person_ids = row_pids[starts]
+        order = np.argsort(-person_sims)[:k]
+        return [(int(person_ids[i]), float(person_sims[i])) for i in order if person_sims[i] >= min_sim]
 
     def search(self, query_vector: np.ndarray, threshold: float) -> Tuple[Optional[int], float]:
         """
