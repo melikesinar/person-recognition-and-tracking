@@ -28,3 +28,21 @@ cameras:
   # - id: 2
   #   name: koridor
   #   source: videos/koridor.mp4
+
+# Kamera yerleşimi / topoloji (Faz 2, isteğe bağlı)
+#
+# Kural 1: Bir kişi aynı anda iki farklı yerde olamaz. Aynı alanı gören kameraları
+#          `overlapping` altında belirtin, onlar bu kuraldan muaf olur.
+# Kural 2: Bir kameradan diğerine yürümek en az `min_seconds` sürer. Daha hızlı
+#          "geçiş" yapan bir eşleşme imkânsız sayılır. Doğrudan bağlı olmayan
+#          kameralar için yol üzerindeki süreler toplanır (0->1->2 = 3+5 = 8 s).
+#          `max_seconds` sadece raporlama içindir (kişi arada oyalanmış olabilir).
+# Süreleri bilmiyorsanız önce boş bırakıp çalıştırın: program kapanırken ve
+# loglarda "TRANSITION" satırlarında gözlenen geçiş süreleri yazılır.
+#
+# topology:
+#   overlapping: [[3, 4]]
+#   default_min_seconds: 0
+#   transitions:
+#     - {cameras: [0, 1], min_seconds: 3, max_seconds: 60}   # kapı <-> koridor
+#     - {cameras: [1, 2], min_seconds: 5, max_seconds: 120}  # koridor <-> ofis

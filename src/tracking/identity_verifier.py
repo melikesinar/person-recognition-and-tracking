@@ -98,7 +98,9 @@ class IdentityVerifier:
             # 2. Find the best possible match in the database (Global Search)
             best_pid, best_score = vector_index.search(avg_vector, threshold=0.0)
 
-            if best_pid is not None and best_pid != pid:
+            # Never switch to an identity another person holds in this camera right now
+            held_here = set(buffer_manager.track_id_to_permanent_id_map.values())
+            if best_pid is not None and best_pid != pid and best_pid not in held_here:
                 # Condition to consider a switch: new match is significantly better than CURRENT match
                 is_candidate = best_score > (current_pid_sim + Config.ID_SWITCH_THRESHOLD_MARGIN)
 
@@ -217,8 +219,22 @@ class IdentityVerifier:
                 for y in range(x + 1, len(visible)):
                     self.cannot_link.add((visible[x], visible[y]))
 
+        # Space-time rule (Faz 2): two identities seen in non-overlapping cameras too
+        # close in time (closer than walking between them takes) are different people.
+        resources = camera_nodes[0].resources if camera_nodes else {}
+        topology, presence = resources.get('topology'), resources.get('presence')
+
         def seen_together(a, b):
-            return (min(a, b), max(a, b)) in self.cannot_link
+            if (min(a, b), max(a, b)) in self.cannot_link:
+                return True
+            if topology is None or presence is None:
+                return False
+            sa = presence.sightings(a)
+            for cam_b, t_b in presence.sightings(b).items():
+                if topology.impossible_reason(sa, cam_b, t_b) is not None:
+                    self.cannot_link.add((min(a, b), max(a, b)))
+                    return True
+            return False
 
         # 2. Compare every pair
         merge_pair = None
@@ -344,6 +360,8 @@ class IdentityVerifier:
 
             # A. Merge in Database
             person_manager.merge_identities(keep_pid=pid_keep, drop_pid=pid_drop)
+            if presence is not None:
+                presence.merge(pid_keep, pid_drop)
             # Whoever was proven different from pid_drop is now proven different from pid_keep
             for a, b in [p for p in self.cannot_link if pid_drop in p]:
                 self.cannot_link.discard((a, b))

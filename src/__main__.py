@@ -24,6 +24,8 @@ from database.async_writer import AsyncDBWriter, NullDBWriter
 from tracking.person_manager import PersonManager
 from tracking.identity_verifier import IdentityVerifier
 from tracking.identity_matcher import IdentityMatcher
+from tracking.topology import CameraTopology
+from tracking.presence import PresenceRegistry
 
 logger = get_logger()
 
@@ -65,7 +67,15 @@ class MultiCameraSystem:
         self.vector_index = VectorIndex()
         self.known_persons_db: Dict[int, dict] = {}
         self.person_manager = PersonManager(self.known_persons_db, self.async_writer, self.vector_index)
-        self.identity_matcher = IdentityMatcher(self.person_manager, self.vector_index)
+        # Faz 2: where cameras are relative to each other, and where everyone has been
+        self.topology = CameraTopology([c["id"] for c in cameras], Config.CAMERA_TOPOLOGY,
+                                       Config.SIMULTANEOUS_WINDOW_SECONDS,
+                                       Config.CAMERA_HOMOGRAPHIES, Config.SPATIAL_GATE_PX)
+        self.presence = PresenceRegistry(self.topology, {c["id"]: c["name"] for c in cameras},
+                                         Config.VISIT_GAP_SECONDS)
+        logger.info(f"Camera topology: {self.topology.describe()}")
+        self.identity_matcher = IdentityMatcher(self.person_manager, self.vector_index,
+                                                self.topology, self.presence)
         self.quality_checker = QualityChecker()
         self.global_verifier = IdentityVerifier()
 
@@ -91,6 +101,8 @@ class MultiCameraSystem:
             'person_manager': self.person_manager,
             'vector_index': self.vector_index,
             'identity_matcher': self.identity_matcher,
+            'topology': self.topology,
+            'presence': self.presence,
             'reid_extractor': self.reid_extractor,
             'quality_checker': self.quality_checker,
             'detection_threshold': self.detection_threshold_value,
@@ -338,6 +350,16 @@ class MultiCameraSystem:
             self.mongo_handler.close()
         logger.info(f"Frames processed per camera: {self.frames_processed if hasattr(self, 'frames_processed') else {}}; "
                     f"identities: {len(self.known_persons_db)}")
+        self._write_routes()
+
+    def _write_routes(self):
+        """Saves every person's route (camera visits and dwell times) as CSV."""
+        from datetime import datetime
+        path = Config.OUTPUT_DIR / f"routes_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        n = self.presence.export_csv(path)
+        logger.info(f"Routes: {n} visits written to {path}")
+        for line in self.presence.summary_lines():
+            logger.info(f"  {line}")
 
 
 def parse_args():

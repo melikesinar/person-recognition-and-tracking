@@ -35,6 +35,15 @@ class CameraNode:
 
         self.tracker = self._create_tracker(process_fps)
         self.last_embed_time: Dict[int, float] = {}  # track_id -> time of last ReID embedding
+        # track_id -> time the track first appeared. Space-time rules use this, not
+        # "now": waiting longer must not make an impossible match possible.
+        self.track_first_seen: Dict[int, float] = {}
+        # track_id -> why the system is not sure who this is (shown as "?")
+        self.uncertain: Dict[int, str] = {}
+        # track_id -> identities held by OTHER people visible in this camera at the
+        # same time as this track. Seen together = proven different people, so the
+        # track can never become one of them (even after they leave the frame).
+        self.seen_with: Dict[int, Set[int]] = {}
 
         self.frame_count = 0
         self.prev_time = time.time()
@@ -142,6 +151,7 @@ class CameraNode:
 
             crop = frame[y1:y2, x1:x2]
             tracker_results.append((box, track_id, conf, cls, ind, crop))
+            self.track_first_seen.setdefault(track_id, now)
 
             if self._needs_embedding(track_id, now):
                 is_good, _, _ = self.resources['quality_checker'].assess_quality(crop, box, (h, w, 3))
@@ -169,6 +179,10 @@ class CameraNode:
 
         # Phase 1: Reserve PIDs for existing consistent tracks
         used_pids = self._reserve_active_identities(tracker_results)
+        id_map = self.buffer_manager.track_id_to_permanent_id_map
+        for t in tracker_results:
+            own = id_map.get(t[1])
+            self.seen_with.setdefault(t[1], set()).update(p for p in used_pids if p != own)
 
         # Phase 2: Process each track
         for (box, track_id, conf, cls, ind, crop) in tracker_results:
@@ -230,6 +244,9 @@ class CameraNode:
                         label, color = f"P{pid} (ReID)", (0, 255, 0)
                     else: # enrollment
                         label, color = f"New P{pid}", (255, 200, 0)
+                elif track_id in self.uncertain:
+                    # Close call between people, or looks like someone who cannot be here
+                    label, color = f"T{track_id} (?)", (0, 215, 255)
                 else:
                     # Still unknown
                     if vector is None:
@@ -281,23 +298,36 @@ class CameraNode:
         """
         now = time.time()
 
-        # 1. Spatial Match (Fast, recovers short-term lost tracks)
-        spatial_pid, _ = self.spatial_matcher.find_spatial_match(
-            box, self.buffer_manager.lost_pid_buffer, now
-        )
-        if spatial_pid and spatial_pid not in used_pids:
-            return spatial_pid, "spatial"
+        # 1. Spatial guess: someone who was lost near this spot a moment ago.
+        # A location alone is not enough: in a busy room, a different person often
+        # appears where someone else just disappeared (measured on EPFL: this rule
+        # without an appearance check was the largest source of wrong identities).
+        # So the guess is only accepted if appearance confirms it (below).
+        spatial_pid = None
+        if Config.SPATIAL_REACQ_ENABLED:
+            spatial_pid, _ = self.spatial_matcher.find_spatial_match(
+                box, self.buffer_manager.lost_pid_buffer, now
+            )
+        if spatial_pid in used_pids or spatial_pid in self.seen_with.get(track_id, ()):
+            spatial_pid = None
 
         # 2. ReID Match (Global search)
         if vector is not None:
             # Stricter threshold for a single-frame match, to prevent false positives.
             # Colour cues are not trusted while the person overlaps someone else.
             query_cues = [cues] if (cues is not None and not is_occluded) else []
-            result = self.resources['identity_matcher'].match(
-                vector, query_cues, Config.REENTRY_SIMILARITY_THRESHOLD
+            matcher = self.resources['identity_matcher']
+            result = matcher.match(
+                vector, query_cues, Config.REENTRY_SIMILARITY_THRESHOLD,
+                camera_id=self.camera_id, t=self.track_first_seen.get(track_id, now),
+                unavailable=used_pids | self.seen_with.get(track_id, set()),
+                foot=self._foot(box), now=now,
             )
 
-            if result.pid and result.pid not in used_pids:
+            if spatial_pid and matcher.confirms(result, spatial_pid, Config.SPATIAL_REACQ_MIN_SCORE):
+                return spatial_pid, "spatial"
+
+            if result.pid:
                 logger.info(f"[Cam {self.camera_id}] ReID match: T{track_id} -> P{result.pid} {result.describe()}")
                 return result.pid, "reid"
 
@@ -339,28 +369,45 @@ class CameraNode:
 
                 # Final Safety Check: Is this person actually known but missed by single-frame ReID?
                 # Uses the averaged vector and all colour observations collected so far.
+                now = time.time()
                 result = self.resources['identity_matcher'].match(
-                    avg_vector, buf_cues, self.resources['match_threshold']
+                    avg_vector, buf_cues, self.resources['match_threshold'],
+                    camera_id=self.camera_id, t=self.track_first_seen.get(track_id, now),
+                    unavailable=used_pids | self.seen_with.get(track_id, set()),
+                    foot=self._foot(box), now=now,
                 )
-                found_pid = result.pid
+
+                # Only a close call is a reason to wait. "Looks like P3 but P3 is
+                # elsewhere / was seen next to this person" is a proof, not doubt.
+                undecided = result.ambiguous
+                if result.pid is None and undecided:
+                    # "Not sure": wait for more evidence instead of guessing or creating
+                    # a duplicate identity. The rolling buffer keeps the newest frames.
+                    since = buf.setdefault("defer_since", now)
+                    if track_id not in self.uncertain:
+                        logger.info(f"[Cam {self.camera_id}] NOT SURE: T{track_id} {result.explain()}. Waiting.")
+                    self.uncertain[track_id] = result.explain()
+                    if now - since < Config.ENROLL_MAX_DEFER_SECONDS:
+                        return None, None
 
                 final_pid = None
-                if found_pid:
-                    if found_pid in used_pids:
-                        logger.info(f"[Cam {self.camera_id}] Enroll Conflict: T{track_id} matches active P{found_pid} "
-                                    f"{result.describe()}. Forcing NEW ID.")
-                        # ID is active elsewhere, so this must be a look-alike or duplicate. Treat as new.
-                        final_pid = pm.enroll_person(buf["vectors"], buf_cues)
-                    else:
-                        logger.info(f"[Cam {self.camera_id}] Enroll Merge: T{track_id} -> P{found_pid} {result.describe()}")
-                        final_pid = found_pid
-                        pm.incremental_update(final_pid, avg_vector)
-                        for c in buf_cues:
-                            pm.add_cues(final_pid, c)
+                if result.pid:
+                    logger.info(f"[Cam {self.camera_id}] Enroll Merge: T{track_id} -> P{result.pid} {result.describe()}")
+                    final_pid = result.pid
+                    pm.incremental_update(final_pid, avg_vector)
+                    for c in buf_cues:
+                        pm.add_cues(final_pid, c)
                 else:
                     final_pid = pm.enroll_person(buf["vectors"], buf_cues)
+                    if result.blocked_by is not None and not undecided:
+                        logger.info(f"[Cam {self.camera_id}] NEW PERSON: T{track_id} -> P{final_pid}, "
+                                    f"{result.explain()}")
+                    if undecided:
+                        logger.info(f"[Cam {self.camera_id}] Still not sure after {now - buf['defer_since']:.0f}s "
+                                    f"({result.explain()}): T{track_id} gets new P{final_pid}")
 
                 # Clear buffer after decision
+                self.uncertain.pop(track_id, None)
                 if track_id in self.buffer_manager.active_track_buffers:
                     del self.buffer_manager.active_track_buffers[track_id]
 
@@ -375,6 +422,15 @@ class CameraNode:
         # All persons are loaded into memory at startup, so no DB lookup is needed here.
         if pid in self.resources['person_manager'].known_persons_db:
             self.resources['person_manager'].known_persons_db[pid]['last_seen_timestamp'] = time.time()
+
+        presence = self.resources.get('presence')
+        if presence is not None:
+            presence.observe(pid, self.camera_id, time.time(), self._foot(box))
+
+    @staticmethod
+    def _foot(box) -> tuple:
+        """Floor contact point of a person box: bottom centre."""
+        return ((float(box[0]) + float(box[2])) / 2.0, float(box[3]))
 
     def _verify_and_correct_identities(self):
         self.identity_verifier.verify_and_correct(
@@ -396,6 +452,9 @@ class CameraNode:
 
         for tid in [t for t in self.last_embed_time if t not in current_track_ids]:
             del self.last_embed_time[tid]
+        for d in (self.track_first_seen, self.uncertain, self.seen_with):
+            for tid in [t for t in d if t not in current_track_ids]:
+                del d[tid]
 
         for tid in disappeared:
             pid = self.buffer_manager.track_id_to_permanent_id_map.pop(tid, None)

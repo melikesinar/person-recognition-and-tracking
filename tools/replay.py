@@ -43,7 +43,9 @@ class EventCounter(logging.Handler):
     KEYS = {"ENROLL: New person": "new_identity", "ReID match": "reid_match",
             "Enroll Merge": "enroll_merge", "Enroll Conflict": "enroll_conflict",
             "AUTO-MERGE": "auto_merge", "SWITCH CONFIRMED": "id_switch",
-            "REVOCATION": "revocation", "VISUAL GUARD": "visual_guard"}
+            "REVOCATION": "revocation", "VISUAL GUARD": "visual_guard",
+            "NOT SURE": "not_sure", "Still not sure": "not_sure_timeout",
+            "TRANSITION": "transition", "NEW PERSON": "new_lookalike"}
 
     def __init__(self):
         super().__init__(level=logging.INFO)
@@ -66,9 +68,13 @@ def main():
     ap.add_argument("--start", type=float, default=0.0, help="Start offset in seconds")
     ap.add_argument("--fps", type=float, default=None, help="Processing FPS (default: from cameras file)")
     ap.add_argument("--snapshots", help="Folder to save annotated frames at identity events")
+    ap.add_argument("--routes", help="CSV file to write every person's camera visits to")
+    ap.add_argument("--margin", type=float, help="Override AMBIGUITY_MARGIN (0 disables 'not sure')")
     args = ap.parse_args()
 
     apply_mode(args.mode)
+    if args.margin is not None:
+        Config.AMBIGUITY_MARGIN = args.margin
     Config.CAMERAS_CONFIG_PATH = Path(args.cameras).resolve()
 
     # The pipeline's timing rules (update intervals, short-term memory, ID locks...)
@@ -88,6 +94,8 @@ def main():
     from tracking.person_manager import PersonManager
     from tracking.identity_matcher import IdentityMatcher
     from tracking.identity_verifier import IdentityVerifier
+    from tracking.topology import CameraTopology
+    from tracking.presence import PresenceRegistry
     from utils.torch_utils import configure_cpu_inference
 
     # Identity ages (auto-merge window) use datetime.now(); route those to the video clock too
@@ -115,9 +123,15 @@ def main():
     db = {}
     index = VectorIndex()
     pm = PersonManager(db, NullDBWriter(), index)
+    topology = CameraTopology([c["id"] for c in cams], Config.CAMERA_TOPOLOGY,
+                              Config.SIMULTANEOUS_WINDOW_SECONDS,
+                              Config.CAMERA_HOMOGRAPHIES, Config.SPATIAL_GATE_PX)
+    presence = PresenceRegistry(topology, {c["id"]: c["name"] for c in cams}, Config.VISIT_GAP_SECONDS)
+    print(f"topology: {topology.describe()}")
     resources = {
         "person_manager": pm, "vector_index": index,
-        "identity_matcher": IdentityMatcher(pm, index),
+        "identity_matcher": IdentityMatcher(pm, index, topology, presence),
+        "topology": topology, "presence": presence,
         "reid_extractor": ReidExtractor(device), "quality_checker": QualityChecker(),
         "detection_threshold": multiprocessing.Value("d", Config.DETECTION_SCORE_THRESHOLD),
         "match_threshold": Config.MATCH_SIMILARITY_THRESHOLD, "use_tta": False, "device": device,
@@ -177,6 +191,15 @@ def main():
     print(f"identities alive at end: {len(db)}   (created: {counter.counts['new_identity']})")
     for k, v in counter.counts.items():
         print(f"  {k:16s} {v}")
+
+    origin = 1_000_000.0  # video clock starts here, so route times are video seconds
+    presence.close_stale(video_clock["now"] + Config.VISIT_GAP_SECONDS + 1)
+    print("\nroutes (visits >= 1 s):")
+    for line in presence.summary_lines(origin=origin):
+        print("  " + line)
+    if args.routes:
+        n = presence.export_csv(Path(args.routes), origin=origin)
+        print(f"{n} visits written to {args.routes}")
 
 
 if __name__ == "__main__":
