@@ -52,20 +52,16 @@ def load_annotations(root: Path, views, max_frames=None):
 
 
 def _read_matrix(path: Path, name: str):
-    """Reads a matrix from an OpenCV XML file (either opencv-matrix or plain text)."""
-    fs = cv2.FileStorage(str(path), cv2.FILE_STORAGE_READ)
-    node = fs.getNode(name)
-    m = None
-    if not node.empty():
-        m = node.mat()
-        if m is None and node.isString():
-            m = np.array(node.string().split(), dtype=float)
-    fs.release()
-    if m is None:
-        el = ET.parse(path).getroot().find(name)
-        if el is not None and el.text:
-            m = np.array(el.text.split(), dtype=float)
-    return None if m is None else np.asarray(m, dtype=float)
+    """
+    Reads numbers from an OpenCV XML file. Two styles occur in WILDTRACK:
+    <rvec> 1.7 0.4 -0.3 </rvec>  and  <camera_matrix type_id="opencv-matrix">...<data>...</data>.
+    """
+    el = ET.parse(path).getroot().find(name)
+    if el is None:
+        raise ValueError(f"{name} not found in {path}")
+    data = el.find("data")
+    text = data.text if data is not None else el.text
+    return np.array(text.split(), dtype=float)
 
 
 def ground_homographies(root: Path, views):
@@ -102,6 +98,10 @@ def main():
     ap.add_argument("--frames", type=int, default=0, help="Use only the first N annotated frames (0 = all 400)")
     ap.add_argument("--imgsz", type=int, default=960, help="Detector input size (HD cameras need > 416)")
     ap.add_argument("--gate", type=float, default=150.0, help="Same-spot tolerance in pixels (HD)")
+    ap.add_argument("--iou", type=float, default=0.3,
+                    help="Box overlap needed to pair a system box with a labelled person. WILDTRACK's "
+                         "labels are wide fixed-shape boxes projected from floor positions, not tight "
+                         "boxes, so 0.3 (not the usual 0.5) is used: 89%% of people pair at 0.3, 52%% at 0.5")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                     help="Override a Config value for this run (Python literal), repeatable")
     ap.add_argument("--save", help="Write per-box results (JSON lines) here for later analysis")
@@ -160,14 +160,14 @@ def main():
     for line in pipe.summary(time.perf_counter() - wall, len(frames)):
         print(line)
     print()
-    for line in format_report(evaluate(gt, pred)):
+    for line in format_report(evaluate(gt, pred, iou_min=args.iou)):
         print(line)
     print()
-    for line in consolidation_diagnostics(pipe, gt, pred):
+    for line in consolidation_diagnostics(pipe, gt, pred, iou_min=args.iou):
         print(line)
 
 
-def consolidation_diagnostics(pipe, gt, pred, min_purity: float = 0.7):
+def consolidation_diagnostics(pipe, gt, pred, iou_min: float, min_purity: float = 0.7):
     """
     For tuning CONSOLIDATE_MIN_SCORE with ground truth: every pair of surviving
     identities is labelled "same person" / "different people" using the ground
@@ -180,7 +180,7 @@ def consolidation_diagnostics(pipe, gt, pred, min_purity: float = 0.7):
     from collections import Counter, defaultdict
     from id_metrics import match_detections
 
-    pairs, _, _ = match_detections(gt, pred)
+    pairs, _, _ = match_detections(gt, pred, iou_min)
     per_pid = defaultdict(Counter)
     for _, gid, pid in pairs:
         if pid is not None:
