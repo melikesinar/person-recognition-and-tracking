@@ -188,6 +188,8 @@ class IdentityVerifier:
         Scans ALL currently active PIDs across ALL cameras to see if any two represent the same person.
         Uses Multi-Vector comparison AND Spatial Consistency.
         """
+        if not Config.LEGACY_AUTO_MERGE_ENABLED:
+            return
         now = time.time()
         if (now - self.last_redundancy_check) < self.REDUNDANCY_CHECK_INTERVAL:
             return
@@ -229,6 +231,8 @@ class IdentityVerifier:
                 return True
             if topology is None or presence is None:
                 return False
+            if presence.proven_different(a, b):
+                return True
             sa = presence.sightings(a)
             for cam_b, t_b in presence.sightings(b).items():
                 if topology.impossible_reason(sa, cam_b, t_b) is not None:

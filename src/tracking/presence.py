@@ -12,6 +12,7 @@ Times are plain floats from time.time(). In tools/replay.py that clock is the
 video clock, so reported times are video seconds.
 """
 import csv
+import numpy as np
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -61,8 +62,55 @@ class PresenceRegistry:
         self._open: Dict[Tuple[int, int], Visit] = {}            # (pid, camera) -> visit
         self._closed: List[Visit] = []
         self.transitions: List[Transition] = []
+        # Pairs (low, high) of identities proven to be different people
+        # ("cannot-link"): seen at the same time in a way one person cannot be.
+        self._different: set = set()
 
     # --- Updates ---------------------------------------------------------------
+
+    def note_simultaneous(self, visible: Dict[int, Dict[int, tuple]], gate_px: float):
+        """
+        Learns "proven different" pairs from one moment.
+
+        Args:
+            visible: {camera: {pid: foot point}} of everyone labelled right now.
+            gate_px: same-spot tolerance used for overlapping cameras.
+
+        Two identities visible at the same moment are different people if they are
+            * in the same camera, or
+            * in two cameras that do not see the same area, or
+            * in two overlapping cameras but clearly on different floor spots
+              (more than twice the same-spot tolerance apart, to be safe).
+        """
+        cams = list(visible.items())
+        with self._lock:
+            for ci, (cam_a, people_a) in enumerate(cams):
+                ids = sorted(people_a)
+                for x in range(len(ids)):
+                    for y in range(x + 1, len(ids)):
+                        self._different.add((ids[x], ids[y]))
+                for cam_b, people_b in cams[ci + 1:]:
+                    overlap = self.topology.overlaps(cam_a, cam_b)
+                    for pa, foot_a in people_a.items():
+                        for pb, foot_b in people_b.items():
+                            if pa == pb:
+                                continue
+                            if overlap:
+                                mapped = self.topology.project(cam_a, cam_b, foot_a)
+                                if mapped is None or foot_b is None:
+                                    continue
+                                if np.hypot(mapped[0] - foot_b[0], mapped[1] - foot_b[1]) <= 2 * gate_px:
+                                    continue
+                            self._different.add((min(pa, pb), max(pa, pb)))
+
+    def proven_different(self, a: int, b: int) -> bool:
+        with self._lock:
+            return (min(a, b), max(a, b)) in self._different
+
+    def add_different(self, a: int, b: int):
+        if a != b:
+            with self._lock:
+                self._different.add((min(a, b), max(a, b)))
 
     def observe(self, pid: int, camera_id: int, t: float, foot: Optional[tuple] = None):
         """Record that `pid` is visible in `camera_id` at time `t` (feet at `foot` in that image)."""
@@ -127,6 +175,12 @@ class PresenceRegistry:
             for tr in self.transitions:
                 if tr.pid == drop_pid:
                     tr.pid = keep_pid
+            # Whoever was proven different from drop_pid is now proven different from keep_pid
+            for pair in [p for p in self._different if drop_pid in p]:
+                self._different.discard(pair)
+                other = pair[1] if pair[0] == drop_pid else pair[0]
+                if other != keep_pid:
+                    self._different.add((min(other, keep_pid), max(other, keep_pid)))
 
     # --- Queries ---------------------------------------------------------------
 
