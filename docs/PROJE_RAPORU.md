@@ -623,4 +623,4 @@ Kamera bazında IDP: C1 %85, C2 %39, C6 %90. C2'de belirgin bir sorun var, incel
 
 **Ayrıntılı faz raporları:** `docs/FAZ0_RAPOR.md`, `docs/FAZ1_RAPOR.md`, `docs/FAZ2_RAPOR.md`, `docs/FAZ4_RAPOR.md`, `docs/KOD_REHBERI.md`.
 
-**Faz 4 (panel):** `.venvScriptsstreamlit.exe run dashboardpp.py` → http://localhost:8501
+**Faz 4 (panel):** `.venv\Scripts\streamlit.exe run dashboard\app.py` → http://localhost:8501
