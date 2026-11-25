@@ -138,6 +138,7 @@ def evaluate(gt, pred, iou_min: float = 0.5, min_share: float = 0.1) -> dict:
     within = _identity_scores(pairs, n_gt, group=lambda key: key[0])
 
     return {
+        "iou_min": iou_min,
         "gt_boxes": n_gt,
         "system_boxes": n_pred,
         "detected": len(pairs) / max(1, n_gt),                 # detection recall
@@ -158,7 +159,7 @@ def format_report(r: dict) -> List[str]:
     lines = [
         f"ground-truth boxes: {r['gt_boxes']}   system boxes: {r['system_boxes']}   "
         f"(on no labelled person: {r['unmatched']})",
-        f"detected people (IoU>=0.5): {pct(r['detected'])}   of those carrying a P number: {pct(r['numbered'])}",
+        f"detected people (IoU>={r['iou_min']:.1f}): {pct(r['detected'])}   of those carrying a P number: {pct(r['numbered'])}",
         f"GLOBAL (across cameras)  IDF1 {pct(r['global']['IDF1'])}   IDR {pct(r['global']['IDR'])}   "
         f"IDP {pct(r['global']['IDP'])}",
         f"within each camera       IDF1 {pct(r['within_camera']['IDF1'])}   IDR {pct(r['within_camera']['IDR'])}   "
