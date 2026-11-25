@@ -13,6 +13,7 @@ from tracking.spatial_matcher import SpatialMatcher
 from tracking.identity_verifier import IdentityVerifier
 from utils.logger import get_logger
 from core.appearance_cues import PartCues, extract_part_cues
+from utils.privacy import pixelate_heads
 
 logger = get_logger()
 
@@ -111,6 +112,11 @@ class CameraNode:
         self._perform_cleanup(current_track_ids)
 
         # 6. Visualization & Metrics
+        if Config.PRIVACY_BLUR_HEADS:
+            # After identities are decided (crops were taken from the clean frame)
+            # Raw detections too: people not (yet) tracked must not be shown either
+            boxes = [t[0] for t in tracker_results] + ([d[:4] for d in detections] if len(detections) else [])
+            pixelate_heads(frame, boxes)
         self._update_metrics()
         self._draw_interface(frame)
 

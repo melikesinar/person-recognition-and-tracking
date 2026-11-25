@@ -228,6 +228,26 @@ class Config:
     # Camera topology (overlaps, walking times). Set from the cameras YAML file.
     CAMERA_TOPOLOGY = {}
 
+    # --- Analytics, privacy, robustness (Faz 4) ---
+    # Record each run to output/sessions/<time>/ for the dashboard (dashboard/app.py).
+    ANALYTICS_ENABLED = True
+    # A person's position is stored at most this often per camera (seconds).
+    ANALYTICS_SAMPLE_SECONDS = 0.5
+    # Empty-scene background per camera for the heat map: median of this many
+    # frames taken this many seconds apart (walking people disappear in the median).
+    ANALYTICS_BG_SAMPLES = 15
+    ANALYTICS_BG_INTERVAL = 2.0
+    # Pixelate heads on everything shown or saved (live window, snapshots, backgrounds).
+    PRIVACY_BLUR_HEADS = True
+    # Head height as a fraction of a full-body person box.
+    PRIVACY_HEAD_FRACTION = 0.22
+    # Analytics sessions older than this many days are deleted at start-up (0 = keep).
+    RETENTION_DAYS = 30
+    # Live cameras (webcam / RTSP): reopen after this many seconds without a frame,
+    # retrying with growing pauses up to STREAM_RECONNECT_MAX_SECONDS.
+    STREAM_STALL_SECONDS = 3.0
+    STREAM_RECONNECT_MAX_SECONDS = 30.0
+
     # --- Detector ---
     # YOLO input size. Ultralytics' default (640) upscales small camera frames,
     # which costs CPU time without finding more people. Use 640 for high-resolution
@@ -301,6 +321,9 @@ class Config:
                 "name": str(cam.get("name", f"cam{cam_id}")),
                 "source": source,
                 "process_fps": float(cam.get("process_fps", default_fps)),
+                # Faz 4: named floor areas (polygons) and counting lines, image pixels
+                "zones": {str(k): [[float(x), float(y)] for x, y in v] for k, v in (cam.get("zones") or {}).items()},
+                "lines": {str(k): [[float(x), float(y)] for x, y in v] for k, v in (cam.get("lines") or {}).items()},
             })
 
         if not cameras:

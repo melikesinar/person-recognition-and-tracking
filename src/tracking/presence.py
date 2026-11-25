@@ -65,6 +65,8 @@ class PresenceRegistry:
         # Pairs (low, high) of identities proven to be different people
         # ("cannot-link"): seen at the same time in a way one person cannot be.
         self._different: set = set()
+        # Faz 4: optional analytics.recorder.SessionRecorder (positions + merges to disk)
+        self.recorder = None
 
     # --- Updates ---------------------------------------------------------------
 
@@ -128,6 +130,8 @@ class PresenceRegistry:
             self._last_seen.setdefault(pid, {})[camera_id] = t
             if foot is not None:
                 self._last_pos.setdefault(pid, {})[camera_id] = foot
+        if self.recorder is not None:
+            self.recorder.position(pid, camera_id, t, foot)
 
     def _record_transition(self, pid: int, camera_id: int, t: float):
         """A new visit starts: if the person came from a non-overlapping camera, log the trip."""
@@ -151,6 +155,8 @@ class PresenceRegistry:
 
     def merge(self, keep_pid: int, drop_pid: int):
         """Two identities turned out to be the same person: move drop_pid's history to keep_pid."""
+        if self.recorder is not None:
+            self.recorder.merge(keep_pid, drop_pid)
         with self._lock:
             drop_seen = self._last_seen.pop(drop_pid, {})
             keep_seen = self._last_seen.setdefault(keep_pid, {})

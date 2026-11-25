@@ -27,6 +27,8 @@ from tracking.identity_matcher import IdentityMatcher
 from tracking.topology import CameraTopology
 from tracking.presence import PresenceRegistry
 from tracking.consolidator import IdentityConsolidator
+from analytics.recorder import SessionRecorder
+from utils.privacy import apply_retention
 
 logger = get_logger()
 
@@ -80,6 +82,12 @@ class MultiCameraSystem:
         self.quality_checker = QualityChecker()
         self.global_verifier = IdentityVerifier()
         self.consolidator = IdentityConsolidator(self.person_manager, self.presence, self.topology)
+        # Faz 4: record the session for the dashboard; delete sessions past retention
+        self.recorder = None
+        if Config.ANALYTICS_ENABLED:
+            apply_retention(Config.OUTPUT_DIR / "sessions", Config.RETENTION_DAYS)
+            self.recorder = SessionRecorder(cameras, clock="wall", topology=Config.CAMERA_TOPOLOGY)
+            self.presence.recorder = self.recorder
 
         # --- AI Models ---
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -260,7 +268,11 @@ class MultiCameraSystem:
                 continue
 
             node = self.camera_nodes[cid]
+            now = time.time()
+            raw = frame.copy() if self.recorder and self.recorder.wants_frame(cid, now) else None
             node.last_display_frame = node.process_frame(frame, dets)
+            if raw is not None:
+                self.recorder.add_background(cid, raw, [d[:4] for d in dets], now)
             node.last_detections = dets
             self.frames_processed[cid] += 1
             processed_any = True
@@ -278,6 +290,16 @@ class MultiCameraSystem:
         rates = {cid: (self.frames_processed[cid] - self._stats_counts[cid]) / elapsed
                  for cid in self.frames_processed}
         target = {cid: n.process_fps for cid, n in self.camera_nodes.items()}
+        status = {}
+        for cid, stream in self.streams.items():
+            st = stream.status
+            if st == "ok" and stream.seconds_since_frame > Config.STREAM_STALL_SECONDS:
+                st = "stalled"
+            status[cid] = st
+            if st != "ok":
+                logger.warning(f"[Cam {cid}] status: {st}")
+            if self.recorder is not None:
+                self.recorder.health(now, cid, rates[cid], target[cid], st)
         logger.info("Processing FPS per camera: " +
                     ", ".join(f"cam{cid}={rates[cid]:.1f}/{target[cid]:g}" for cid in rates) +
                     f" | identities: {len(self.known_persons_db)}")
@@ -355,6 +377,8 @@ class MultiCameraSystem:
         logger.info(f"Frames processed per camera: {self.frames_processed if hasattr(self, 'frames_processed') else {}}; "
                     f"identities: {len(self.known_persons_db)}")
         self._write_routes()
+        if self.recorder is not None:
+            self.recorder.close()
 
     def _write_routes(self):
         """Saves every person's route (camera visits and dwell times) as CSV."""

@@ -105,6 +105,8 @@ def main():
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                     help="Override a Config value for this run (Python literal), repeatable")
     ap.add_argument("--save", help="Write per-box results (JSON lines) here for later analysis")
+    ap.add_argument("--record", metavar="LABEL",
+                    help="Also record an analytics session for the dashboard (output/sessions/<time>_LABEL)")
     args = ap.parse_args()
 
     root = Path(args.data)
@@ -131,7 +133,7 @@ def main():
 
     cams = [{"id": v, "name": f"C{v + 1}", "process_fps": 1.0 / FRAME_PERIOD} for v in views]
     wall = time.perf_counter()
-    pipe = OfflinePipeline(cams)
+    pipe = OfflinePipeline(cams, record=args.record)
 
     pred = {}
     save = open(args.save, "w", encoding="utf-8") if args.save else None
@@ -155,6 +157,7 @@ def main():
             print(f"  frame {k + 1}/{len(frames)}  ({time.perf_counter() - wall:.0f}s)", flush=True)
     if save:
         save.close()
+    pipe.close()
 
     print()
     for line in pipe.summary(time.perf_counter() - wall, len(frames)):

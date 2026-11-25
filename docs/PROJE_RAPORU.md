@@ -503,6 +503,7 @@ Kamera bazında IDP: C1 %85, C2 %39, C6 %90. C2'de belirgin bir sorun var, incel
 | 2 | | Kimlik sayısı (gerçek 4) | 4 | 7 (bedel) |
 | 3 | Toparlama | EPFL kimlik sayısı | 7 | 6 (tutarlılık korunarak) |
 | 3 | İlk etiketli ölçüm (WILDTRACK) | Global IDP / IDF1 | — | %55 / %7 (başlangıç çizgisi) |
+| 4 | Panel, ısı haritası, alanlar, giriş-çıkış, gizlilik, sağlık | Kullanıcıya gösterilen çıktı | Kapanışta CSV | Canlı web paneli (ayrıntı: `docs/FAZ4_RAPOR.md`) |
 
 ---
 
@@ -620,4 +621,6 @@ Kamera bazında IDP: C1 %85, C2 %39, C6 %90. C2'de belirgin bir sorun var, incel
 .venv\Scripts\python.exe tests\test_faz3_consolidation.py
 ```
 
-**Ayrıntılı faz raporları:** `docs/FAZ0_RAPOR.md`, `docs/FAZ1_RAPOR.md`, `docs/FAZ2_RAPOR.md`, `docs/KOD_REHBERI.md`.
+**Ayrıntılı faz raporları:** `docs/FAZ0_RAPOR.md`, `docs/FAZ1_RAPOR.md`, `docs/FAZ2_RAPOR.md`, `docs/FAZ4_RAPOR.md`, `docs/KOD_REHBERI.md`.
+
+**Faz 4 (panel):** `.venv\Scripts\streamlit.exe run dashboardpp.py` → http://localhost:8501

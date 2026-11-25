@@ -12,6 +12,7 @@ Usage (from the project root):
     python tools/replay.py --cameras ... --mode osnet          # Faz 0 decision rule
     python tools/replay.py --cameras ... --snapshots out_dir   # save frames at key events
     python tools/replay.py --cameras ... --routes routes.csv   # every person's camera visits
+    python tools/replay.py --cameras ... --record epfl         # session for the dashboard
 
 Modes:
     multicue : OSNet + clothing colours (Faz 1+, default)
@@ -48,6 +49,8 @@ def main():
     ap.add_argument("--snapshots", help="Folder to save annotated frames at identity events")
     ap.add_argument("--routes", help="CSV file to write every person's camera visits to")
     ap.add_argument("--margin", type=float, help="Override AMBIGUITY_MARGIN (0 disables 'not sure')")
+    ap.add_argument("--record", metavar="LABEL",
+                    help="Record an analytics session (output/sessions/<time>_LABEL) for the dashboard")
     args = ap.parse_args()
 
     apply_mode(args.mode)
@@ -57,7 +60,7 @@ def main():
     cams = Config.load_cameras()
 
     wall_start = time.perf_counter()
-    pipe = OfflinePipeline(cams, process_fps=args.fps)
+    pipe = OfflinePipeline(cams, process_fps=args.fps, record=args.record)
     print(f"topology: {pipe.topology.describe()}")
 
     caps = [cv2.VideoCapture(c["source"]) for c in cams]
@@ -107,6 +110,7 @@ def main():
     if args.routes:
         n = pipe.presence.export_csv(Path(args.routes), origin=CLOCK_ORIGIN)
         print(f"{n} visits written to {args.routes}")
+    pipe.close()
 
 
 if __name__ == "__main__":
