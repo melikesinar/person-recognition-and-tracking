@@ -26,6 +26,7 @@ from tracking.identity_verifier import IdentityVerifier
 from tracking.identity_matcher import IdentityMatcher
 from tracking.topology import CameraTopology
 from tracking.presence import PresenceRegistry
+from tracking.consolidator import IdentityConsolidator
 
 logger = get_logger()
 
@@ -78,6 +79,7 @@ class MultiCameraSystem:
                                                 self.topology, self.presence)
         self.quality_checker = QualityChecker()
         self.global_verifier = IdentityVerifier()
+        self.consolidator = IdentityConsolidator(self.person_manager, self.presence, self.topology)
 
         # --- AI Models ---
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -182,6 +184,8 @@ class MultiCameraSystem:
                     self.global_verifier.check_redundant_identities(
                         self.person_manager, list(self.camera_nodes.values())
                     )
+                    if processed_any:
+                        self.consolidator.step(list(self.camera_nodes.values()), time.time())
 
                     if processed_any and not self.headless:
                         combined = self._compose_display()

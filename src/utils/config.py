@@ -206,6 +206,21 @@ class Config:
     # people) it was the largest source of wrong identities, even with the
     # appearance check (cross-camera consistency 78% off vs 57% on; FAZ2_RAPOR.md).
     SPATIAL_REACQ_ENABLED = False
+
+    # --- Identity consolidation (Faz 3) ---
+    # Periodically merge identities that are really one person split in several
+    # numbers (see src/tracking/consolidator.py).
+    CONSOLIDATION_ENABLED = True
+    CONSOLIDATE_INTERVAL_SECONDS = 5.0
+    # Whole-gallery fused similarity needed to merge (robust average, so lower
+    # than the single-frame matching thresholds).
+    CONSOLIDATE_MIN_SCORE = 0.80
+    # Identities need at least this many gallery vectors before they are compared.
+    CONSOLIDATE_MIN_VECTORS = 3
+    CONSOLIDATE_MAX_MERGES = 1
+    # The older auto-merge (OSNet-only, active identities younger than
+    # MERGE_MAX_AGE_SECONDS, plus homography "spatial dominance").
+    LEGACY_AUTO_MERGE_ENABLED = True
     # Unseen in a camera for longer than this (s) = the visit to that camera ended.
     VISIT_GAP_SECONDS = 5.0
     # Routes / dwell times are written here as CSV when the program exits.
