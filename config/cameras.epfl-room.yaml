@@ -9,9 +9,18 @@ cameras:
   - id: 0
     name: room-c0
     source: videos/room/4p-c0.avi
+    # Faz 4: zemindeki alanlar ve sayaç çizgisi (görüntü pikseli; tools/draw_zones.py ile çizilir)
+    zones:
+      desenli_hali: [[4, 140], [118, 90], [189, 114], [40, 178]]
+      mavi_hali: [[240, 112], [358, 160], [358, 288], [60, 288], [15, 225]]
+    lines:
+      orta_hat: [[180, 110], [180, 288]]
   - id: 1
     name: room-c1
     source: videos/room/4p-c1.avi
+    zones:
+      desenli_hali: [[5, 192], [95, 160], [252, 260], [230, 288], [5, 288]]
+      mavi_hali: [[110, 137], [205, 100], [355, 125], [355, 262], [245, 250], [150, 170]]
 
 # Kameralar arası zemin eşlemesi (homografi): "kaynak-hedef" kamera id'leri.
 # Bu iki kamera aynı odayı gördüğü için, Kamera 0'daki bir kişinin ayak noktası

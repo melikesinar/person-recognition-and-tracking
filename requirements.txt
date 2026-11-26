@@ -19,3 +19,7 @@ python-dotenv==1.2.1
 # General Utilities
 pyyaml
 numpy==2.2.6
+
+# Dashboard (Faz 4)
+streamlit==1.67.0
+pandas

@@ -47,13 +47,14 @@ class EventCounter(logging.Handler):
 
 
 class OfflinePipeline:
-    def __init__(self, cameras: List[dict], process_fps: Optional[float] = None):
+    def __init__(self, cameras: List[dict], process_fps: Optional[float] = None, record: Optional[str] = None):
         """
         Args:
             cameras: list of {"id", "name", "process_fps"} (as from Config.load_cameras()).
                 Config.CAMERA_TOPOLOGY / CAMERA_HOMOGRAPHIES must already be set.
             process_fps: overrides each camera's process_fps (frames per second given
                 to step()); controls tracker memory length.
+            record: if given, record an analytics session (dashboard) with this label.
         """
         self.clock = {"now": CLOCK_ORIGIN}
         time.time = lambda: self.clock["now"]
@@ -109,6 +110,12 @@ class OfflinePipeline:
             "detection_threshold": multiprocessing.Value("d", Config.DETECTION_SCORE_THRESHOLD),
             "match_threshold": Config.MATCH_SIMILARITY_THRESHOLD, "use_tta": False, "device": device,
         }
+        self.recorder = None
+        if record:
+            from analytics.recorder import SessionRecorder
+            self.recorder = SessionRecorder(cameras, label=record, clock="video", origin=CLOCK_ORIGIN,
+                                            topology=Config.CAMERA_TOPOLOGY)
+            self.presence.recorder = self.recorder
         self.verifier = IdentityVerifier()
         self.consolidator = IdentityConsolidator(self.person_manager, self.presence, self.topology)
         self.nodes = [CameraNode(c["id"], c["name"], process_fps or c["process_fps"], self.resources)
@@ -138,7 +145,11 @@ class OfflinePipeline:
                 continue
             dets = self.detector(frame, classes=0, conf=Config.DETECTION_SCORE_THRESHOLD,
                                  imgsz=Config.DETECTION_IMG_SIZE, verbose=False)[0].boxes.data.cpu().numpy()
+            rec = self.recorder
+            raw = frame.copy() if rec and rec.wants_frame(node.camera_id, self.clock["now"]) else None
             annotated.append(node.process_frame(frame, dets))
+            if raw is not None:
+                rec.add_background(node.camera_id, raw, [d[:4] for d in dets], self.clock["now"])
         self.verifier.check_redundant_identities(self.person_manager, self.nodes)
         self.consolidator.step(self.nodes, self.clock["now"])
         return annotated
@@ -152,6 +163,10 @@ class OfflinePipeline:
             x1, y1, x2, y2 = (float(v) for v in box)
             out.append((x1, y1, x2, y2, id_map.get(int(tid))))
         return out
+
+    def close(self):
+        if self.recorder is not None:
+            self.recorder.close()
 
     def summary(self, wall_seconds: float, steps: int) -> List[str]:
         lines = [f"processed steps={steps}  wall={wall_seconds:.0f}s",
